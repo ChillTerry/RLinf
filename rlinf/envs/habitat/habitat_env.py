@@ -29,6 +29,7 @@ from hydra.core.global_hydra import GlobalHydra
 from rlinf.envs.habitat.extensions import measures
 from rlinf.envs.habitat.extensions.utils import (
     observations_to_image,
+    resize_observation_images,
 )
 from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
 from rlinf.envs.utils import (
@@ -49,7 +50,9 @@ class NoOpAction(SimulatorTaskAction):
 
 
 class HabitatEnv(gym.Env):
-    def __init__(self, cfg, num_envs, seed_offset, total_num_processes):
+    def __init__(
+        self, cfg, num_envs, seed_offset, total_num_processes, worker_info=None
+    ):
         self.cfg = cfg
         self.seed_offset = seed_offset
         self.total_num_processes = total_num_processes
@@ -101,8 +104,6 @@ class HabitatEnv(gym.Env):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
 
-        chunk_rewards = []
-
         # Truncate chunk if it contains "stop" and pad with "no_op"
         for env_idx, chunk_action in enumerate(chunk_actions):
             stop_idx = np.where(chunk_action == "stop")[0]
@@ -126,8 +127,9 @@ class HabitatEnv(gym.Env):
                     ]
                 )
 
-        chunk_terminations = []
-        chunk_truncations = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
@@ -135,16 +137,22 @@ class HabitatEnv(gym.Env):
             )
 
             chunk_rewards.append(step_reward)
-            chunk_terminations.append(terminations)
-            chunk_truncations.append(truncations)
+            raw_chunk_terminations.append(terminations)
+            raw_chunk_truncations.append(truncations)
 
-        chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
-        chunk_terminations = torch.stack(
-            chunk_terminations, dim=1
-        )  # [num_envs, chunk_steps]
-        chunk_truncations = torch.stack(
-            chunk_truncations, dim=1
-        )  # [num_envs, chunk_steps]
+        # [num_envs, chunk_steps]
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+        if self.auto_reset or self.ignore_terminations:
+            chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+            chunk_terminations[:, -1] = raw_chunk_terminations.any(dim=1)
+
+            chunk_truncations = torch.zeros_like(raw_chunk_truncations)
+            chunk_truncations[:, -1] = raw_chunk_truncations.any(dim=1)
+        else:
+            chunk_terminations = raw_chunk_terminations.clone()
+            chunk_truncations = raw_chunk_truncations.clone()
 
         return (
             extracted_obs,
@@ -158,28 +166,25 @@ class HabitatEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
-<<<<<<< HEAD
-=======
-
-        for i, action in enumerate(actions):
-            if action != "no_op":
-                self._elapsed_steps[i] += 1
->>>>>>> 85f55c7 (feat(habitat-env): add group_size for GRPO)
 
         for i, action in enumerate(actions):
             if action != "no_op":
                 self._elapsed_steps[i] += 1
 
-        # After excuting "stop" action, habitat env needs reset to process the next action
-        # Replace "stop" with "no_op" before stepping the underlying env
-        # to avoid unable to process the next action.
+        # After excuting "stop" action, habitat env needs reset to process the next action.
+        # Replace "stop" with "no_op" before stepping the underlying env to avoid unable
+        # to process the next action.
+        actions = actions.astype("U12")
         is_stop = actions == "stop"
         actions[is_stop] = "no_op"
 
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+
+        # If some envs execute "no_op", manually normalize depth observations
+        # according to Habitat's depth sensor config.
+        self._normalize_depth(actions, raw_obs)
+
         terminations[is_stop] = True
-<<<<<<< HEAD
-=======
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs)
         infos = list_of_dict_to_dict_of_list(info_lists)
@@ -197,19 +202,14 @@ class HabitatEnv(gym.Env):
         if metric_save_masks.any():
             self._save_metrics(infos, metric_save_masks)
 
->>>>>>> 85f55c7 (feat(habitat-env): add group_size for GRPO)
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs)
-        infos = list_of_dict_to_dict_of_list(info_lists)
-        truncations = self.elapsed_steps >= self.max_episode_steps
 
-        # TODO: what if termination means failure? (e.g. robot falling down)
-        step_reward = self._calc_step_reward(terminations)
-
-        if self.video_cfg is not None and self.video_cfg.save_video:
+        if self.video_cfg.save_video:
             episode_ids = self.env.get_current_episode_ids()
             for i in range(len(raw_obs)):
                 frame = observations_to_image(raw_obs[i], info_lists[i])
+                frame = resize_observation_images(frame, frame["rgb"].shape[0])
                 frame_concat = np.concatenate(
                     (frame["rgb"], frame["depth"], frame["top_down_map"]), axis=1
                 )
@@ -218,15 +218,23 @@ class HabitatEnv(gym.Env):
                     self.render_images[key] = []
                 self.render_images[key].append(frame_concat)
 
+        if self.ignore_terminations:
+            terminations[:] = False
         dones = terminations | truncations
         # GRPO: sync group done — when any env in a group is done, treat the whole group as done and reset together.
         dones, terminations, truncations = self._sync_group_dones(
             dones, terminations, truncations
         )
         if dones.any() and self.auto_reset:
-            if self.video_cfg is not None and self.video_cfg.save_video:
+            if self.video_cfg.save_video:
                 self.flush_video(dones=dones)
-            obs, infos = self._handle_auto_reset(dones, obs, infos)
+
+            final_infos = (
+                self.record_first_done_infos
+                if self.record_first_done_infos is not None
+                else infos
+            )
+            obs, infos = self._handle_auto_reset(dones, obs, final_infos)
 
         return (
             obs,
@@ -245,6 +253,17 @@ class HabitatEnv(gym.Env):
 
         raw_obs = self.env.reset(env_idx)
         self._elapsed_steps[env_idx] = 0
+        self.dones_once[env_idx] = False
+        if (
+            self.record_first_done_infos is not None
+            and "episode" in self.record_first_done_infos
+        ):
+            episode = self.record_first_done_infos["episode"]
+            device = next(iter(episode.values())).device
+            mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+            mask[env_idx] = True
+            for v in episode.values():
+                v[mask] = torch.zeros_like(v)
         infos = {}
 
         if self.current_raw_obs is None:
@@ -256,15 +275,9 @@ class HabitatEnv(gym.Env):
 
         return obs, infos
 
-    def update_reset_state_ids(self):
-        self.reset()
-
     def flush_video(
         self, video_sub_dir: Optional[str] = None, dones: Optional[np.ndarray] = None
     ):
-        if self.video_cfg is None or not getattr(self.video_cfg, "save_video", False):
-            return
-
         output_dir = self.video_cfg.video_base_dir
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
@@ -273,15 +286,20 @@ class HabitatEnv(gym.Env):
             dones_episode_ids = np.array(self.env.get_current_episode_ids())
         else:
             dones_episode_ids = np.array(self.env.get_current_episode_ids())[dones]
+
         for episode_ids in dones_episode_ids:
             video_name = f"episode_{episode_ids}"
-            save_rollout_video(
-                self.render_images[video_name],
-                output_dir=output_dir,
-                video_name=video_name,
-                fps=self.video_cfg.fps,
-            )
-            self.render_images[video_name] = []
+            if video_name in self.render_images:
+                save_rollout_video(
+                    self.render_images[video_name],
+                    output_dir=output_dir,
+                    video_name=video_name,
+                    fps=self.video_cfg.fps,
+                )
+                self.render_images[video_name] = []
+
+    def update_reset_state_ids(self):
+        pass
 
     def _normalize_depth(self, actions, raw_obs):
         """Normalize depth for envs whose action is 'no_op', following
@@ -312,22 +330,29 @@ class HabitatEnv(gym.Env):
 
     def _wrap_obs(self, obs_list):
         image_list = []
+        task_descs = []
+        token_list = []
         for obs in obs_list:
             image_list.append(observations_to_image(obs))
+            inst = str(obs["instruction"].get("text", ""))
+            # token is used for CMA algorithm, please refer to
+            # https://github.com/jacobkrantz/VLN-CE for more details.
+            token = obs["instruction"].get("tokens", [])
+            task_descs.append(inst)
+            token_list.append(token)
 
         image_tensor = to_tensor(list_of_dict_to_dict_of_list(image_list))
+        episode_ids = self.env.get_current_episode_ids()
 
         obs = {}
-        rgb_image_tensor = torch.stack(
-            [value.clone().permute(2, 0, 1) for value in image_tensor["rgb"]]
-        )
-        obs["rgb"] = rgb_image_tensor
+        obs["main_images"] = image_tensor["rgb"].clone()  # [N_ENV, H, W, C]
+        obs["wrist_images"] = token_list  # Temporarily use wrist_images to store tokens
+        obs["task_descriptions"] = task_descs
+        obs["states"] = torch.tensor(episode_ids, dtype=torch.int64)
 
         if "depth" in image_tensor:
-            depth_image_tensor = torch.stack(
-                [value.clone().permute(2, 0, 1) for value in image_tensor["depth"]]
-            )
-            obs["depth"] = depth_image_tensor
+            depth_tensor = image_tensor["depth"].clone()
+            obs["extra_view_images"] = depth_tensor.unsqueeze(1)  # [N_ENV, 1, H, W, C]
 
         return obs
 
