@@ -166,10 +166,7 @@ class HabitatEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
-
-        for i, action in enumerate(actions):
-            if action != "no_op":
-                self._elapsed_steps[i] += 1
+        self._elapsed_steps += 1
 
         # After excuting "stop" action, habitat env needs reset to process the next action.
         # Replace "stop" with "no_op" before stepping the underlying env to avoid unable
@@ -537,19 +534,28 @@ class HabitatEnv(gym.Env):
         episode_ids = self._build_ordered_episodes(habitat_dataset)
 
         num_episodes = len(episode_ids)
-        # GRPO: assign episodes by group; group_size envs per group share the same episode list; num_group episode streams in total.
-        episodes_per_group = num_episodes // self.num_group
+        # 1) Split episodes across processes: this worker (seed_offset) gets a contiguous block.
+        episodes_per_process = num_episodes // self.total_num_processes
+        start_process = self.seed_offset * episodes_per_process
+        end_process = start_process + episodes_per_process
+        if self.seed_offset == self.total_num_processes - 1:
+            end_process = num_episodes  # last process takes remainder
+        process_episode_ids = episode_ids[start_process:end_process]
+        num_episodes_this_process = len(process_episode_ids)
+
+        # 2) Within this process, split by group (GRPO): group_size envs per group share the same episode list; num_group episode streams in total.
+        episodes_per_group = num_episodes_this_process // self.num_group
         episode_ranges = []
         start = 0
         for g in range(self.num_group - 1):
             episode_ranges.append((start, start + episodes_per_group))
             start += episodes_per_group
-        episode_ranges.append((start, num_episodes))
+        episode_ranges.append((start, num_episodes_this_process))
 
         for env_id in range(self.num_envs):
             group_id = env_id // self.group_size
             start, end = episode_ranges[group_id]
-            assigned_ids = episode_ids[start:end]
+            assigned_ids = process_episode_ids[start:end]
 
             env_fn_params.append(
                 {
