@@ -158,6 +158,13 @@ class HabitatEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+<<<<<<< HEAD
+=======
+
+        for i, action in enumerate(actions):
+            if action != "no_op":
+                self._elapsed_steps[i] += 1
+>>>>>>> 85f55c7 (feat(habitat-env): add group_size for GRPO)
 
         for i, action in enumerate(actions):
             if action != "no_op":
@@ -171,6 +178,26 @@ class HabitatEnv(gym.Env):
 
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
         terminations[is_stop] = True
+<<<<<<< HEAD
+=======
+        self.current_raw_obs = raw_obs
+        obs = self._wrap_obs(raw_obs)
+        infos = list_of_dict_to_dict_of_list(info_lists)
+        truncations = self.elapsed_steps >= self.max_episode_steps
+
+        # TODO: what if termination means failure? (e.g. robot falling down)
+        step_reward = self._calc_step_reward(terminations)
+        infos = list_of_dict_to_dict_of_list(info_lists)
+        infos = self._record_metrics(infos)
+
+        truncations = self.elapsed_steps >= self.max_episode_steps
+        dones_for_metric_save = terminations | truncations
+        # Only save episode metrics once: at the first time an env becomes done.
+        metric_save_masks = dones_for_metric_save & (~self.dones_once)
+        if metric_save_masks.any():
+            self._save_metrics(infos, metric_save_masks)
+
+>>>>>>> 85f55c7 (feat(habitat-env): add group_size for GRPO)
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs)
         infos = list_of_dict_to_dict_of_list(info_lists)
