@@ -64,7 +64,9 @@ class HabitatEnv(gym.Env):
 
         self._init_env()
 
-        self.video_cfg = cfg.video_cfg
+        # video_cfg 在 eval 配置中存在，但 train 配置中可能不存在
+        # 这里做成可选字段：如果没有就禁用视频功能，避免 AttributeError
+        self.video_cfg = getattr(cfg, "video_cfg", None)
         self.video_cnt = 0
         self.render_images = {}
         self.current_raw_obs = None
@@ -167,7 +169,7 @@ class HabitatEnv(gym.Env):
         # TODO: what if termination means failure? (e.g. robot falling down)
         step_reward = self._calc_step_reward(terminations)
 
-        if self.video_cfg.save_video:
+        if self.video_cfg is not None and self.video_cfg.save_video:
             episode_ids = self.env.get_current_episode_ids()
             for i in range(len(raw_obs)):
                 frame = observations_to_image(raw_obs[i], info_lists[i])
@@ -180,8 +182,12 @@ class HabitatEnv(gym.Env):
                 self.render_images[key].append(frame_concat)
 
         dones = terminations | truncations
+        # GRPO: sync group done — when any env in a group is done, treat the whole group as done and reset together.
+        dones, terminations, truncations = self._sync_group_dones(
+            dones, terminations, truncations
+        )
         if dones.any() and self.auto_reset:
-            if self.video_cfg.save_video:
+            if self.video_cfg is not None and self.video_cfg.save_video:
                 self.flush_video(dones=dones)
             obs, infos = self._handle_auto_reset(dones, obs, infos)
 
@@ -219,6 +225,10 @@ class HabitatEnv(gym.Env):
     def flush_video(
         self, video_sub_dir: Optional[str] = None, dones: Optional[np.ndarray] = None
     ):
+        # 若未配置 video_cfg 或未开启保存视频，则直接返回
+        if self.video_cfg is None or not getattr(self.video_cfg, "save_video", False):
+            return
+
         output_dir = self.video_cfg.video_base_dir
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
@@ -270,6 +280,25 @@ class HabitatEnv(gym.Env):
         infos["_final_observation"] = dones
         infos["_elapsed_steps"] = dones
         return obs, infos
+
+    def _sync_group_dones(self, dones, terminations, truncations):
+        """GRPO: sync group done. When any env in a group is done, treat the whole group as done; mark unfinished envs as truncation."""
+        if self.group_size <= 1:
+            return dones, terminations, truncations
+        dones = np.asarray(dones).copy()
+        terminations = np.asarray(terminations).copy()
+        truncations = np.asarray(truncations).copy()
+        for g in range(self.num_group):
+            start = g * self.group_size
+            end = start + self.group_size
+            group_dones = dones[start:end]
+            if group_dones.any():
+                dones[start:end] = True
+                for i in range(start, end):
+                    if not (terminations[i] or truncations[i]):
+                        terminations[i] = False
+                        truncations[i] = True
+        return dones, terminations, truncations
 
     def _calc_step_reward(self, terminations):
         reward = self.cfg.reward_coef * terminations
@@ -336,17 +365,18 @@ class HabitatEnv(gym.Env):
         episode_ids = self._build_ordered_episodes(habitat_dataset)
 
         num_episodes = len(episode_ids)
-        episodes_per_env = num_episodes // self.num_envs
-
+        # GRPO: assign episodes by group; group_size envs per group share the same episode list; num_group episode streams in total.
+        episodes_per_group = num_episodes // self.num_group
         episode_ranges = []
         start = 0
-        for i in range(self.num_envs - 1):
-            episode_ranges.append((start, start + episodes_per_env))
-            start += episodes_per_env
+        for g in range(self.num_group - 1):
+            episode_ranges.append((start, start + episodes_per_group))
+            start += episodes_per_group
         episode_ranges.append((start, num_episodes))
 
         for env_id in range(self.num_envs):
-            start, end = episode_ranges[env_id]
+            group_id = env_id // self.group_size
+            start, end = episode_ranges[group_id]
             assigned_ids = episode_ids[start:end]
 
             env_fn_params.append(
