@@ -505,15 +505,13 @@ class HabitatEnv(gym.Env):
 
         episode_ids = self._build_ordered_episodes(habitat_dataset)
 
+        episode_ranges = []
         num_episodes = len(episode_ids)
         episodes_per_env = num_episodes // self.num_envs // self.total_num_processes
-
-        episode_ranges = []
         start = self.seed_offset * episodes_per_env * self.num_envs
-        for i in range(self.num_envs - 1):
+        for i in range(self.num_envs):
             episode_ranges.append((start, start + episodes_per_env))
             start += episodes_per_env
-        episode_ranges.append((start, num_episodes))
 
         for env_id in range(self.num_envs):
             start, end = episode_ranges[env_id]
