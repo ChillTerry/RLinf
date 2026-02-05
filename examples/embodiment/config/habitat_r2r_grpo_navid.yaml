@@ -94,8 +94,8 @@ env:
     total_num_envs: 114
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 400
-    max_steps_per_rollout_epoch: 6402
+    max_episode_steps: 120
+    max_steps_per_rollout_epoch: 1920
     group_size: 1
     video_cfg:
       fps: 5
