@@ -56,7 +56,6 @@ class SupportedModel(Enum):
     GR00T = ("gr00t", "embodied")
     CNN_POLICY = ("cnn_policy", "embodied")
     FLOW_POLICY = ("flow_policy", "embodied")
-    CMA_POLICY = ("cma", "embodied")
     NAVID = ("navid", "embodied")
 
     def __new__(cls, value, category):
@@ -771,6 +770,9 @@ def validate_embodied_cfg(cfg):
         )
 
     with open_dict(cfg):
+        weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
+        assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"
+        cfg.runner.weight_sync_interval = weight_sync_interval
         if (
             SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.MANISKILL
             or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.MANISKILL
