@@ -7,7 +7,7 @@ TARGET=""
 MODEL=""
 ENV_NAME=""
 VENV_DIR=".venv"
-PYTHON_VERSION="3.11.14"
+PYTHON_VERSION="3.9"
 TEST_BUILD=${TEST_BUILD:-0}
 # Absolute path to this script (resolves symlinks)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -533,7 +533,7 @@ install_env_only() {
             ;;
         habitat)
             install_common_embodied_deps
-            install_habitat_env
+            install_habitat_env_0.1.7
             ;;
         *)
             echo "Environment '$ENV_NAME' is not supported for env-only installation." >&2
@@ -746,6 +746,28 @@ install_habitat_env() {
     habitat_lab_dir=$(clone_or_reuse_repo HABITAT_LAB_PATH "$VENV_DIR/habitat-lab" https://github.com/RLinf/habitat-lab.git -b v0.3.3 --recurse-submodules)
     uv pip install -e $habitat_lab_dir/habitat-lab
     uv pip install -e $habitat_lab_dir/habitat-baselines
+}
+
+install_habitat_env_0.1.7() {
+    local habitat_sim_dir
+    habitat_sim_dir=$(clone_or_reuse_repo HABITAT_SIM_PATH "$VENV_DIR/habitat" https://github.com/facebookresearch/habitat-sim.git -b v0.1.7 --recurse-submodules)
+    cd "$habitat_sim_dir"
+    # clean build (important)
+    rm -rf build
+    # install python deps
+    uv pip install -r requirements.txt
+    # build & install (headless)
+    python setup.py install --headless
+
+    local habitat_lab_dir
+    # Use a fork version of habitat-lab that fixes Python 3.11 compatibility issues
+    habitat_lab_dir=$(clone_or_reuse_repo HABITAT_LAB_PATH "$VENV_DIR/habitat-lab" https://github.com/RLinf/habitat-lab.git -b v0.1.7 --recurse-submodules)
+    cd "$habitat_lab_dir"
+    # base requirements
+    uv pip install -r requirements.txt
+    uv pip install "moviepy>=1.0.1" "torch>=1.3.1"
+    uv pip install -r habitat_baselines/rl/ddppo/requirements.txt
+    python setup.py develop --all
 }
 
 install_opensora_world_model() {
