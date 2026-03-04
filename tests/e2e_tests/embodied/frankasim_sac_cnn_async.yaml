@@ -29,7 +29,7 @@ runner:
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 2
+  val_check_interval: -1
   save_interval: -1
   weight_sync_interval: 1
 
@@ -86,7 +86,7 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  enable_offload: False
+
   train:
     obs_format: tensor
     total_num_envs: 1
@@ -105,6 +105,7 @@ env:
 
 rollout:
   enable_torch_compile: True
+  enable_cuda_graph: False
   group_name: "RolloutGroup"
   backend: "huggingface"
   enable_offload: False
