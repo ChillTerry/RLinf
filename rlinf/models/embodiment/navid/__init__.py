@@ -28,5 +28,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         torch_dtype=torch_dtype,
         action_dim=int(cfg.action_dim),
         num_action_chunks=int(cfg.num_action_chunks),
+        add_value_head=cfg.get("add_value_head", False),
+        hidden_size=int(cfg.get("hidden_size", 4096)),
+        max_prompt_length=int(cfg.get("max_prompt_length", 512)),
     )
     return model

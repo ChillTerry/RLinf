@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.models.embodiment.navid.constants import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
@@ -59,6 +60,9 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         image_processor,
         action_dim: int,
         num_action_chunks: int,
+        add_value_head: bool = False,
+        hidden_size: int = 4096,
+        max_prompt_length: int = 1024,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -70,6 +74,21 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         # TODO: initialize max history len from config
         self._max_history_len: int | None = None
 
+        self.hidden_size = hidden_size
+        self.max_prompt_length = max_prompt_length
+
+        if add_value_head:
+            self.value_head = ValueHead(
+                input_dim=hidden_size,
+                hidden_sizes=(512, 128),
+                output_dim=1,
+                activation="gelu",
+                bias_last=False,
+            )
+
+        self._action_token_ids: dict[str, int] = {}
+        self._build_action_token_mapping()
+
     @classmethod
     def from_pretrained(
         cls,
@@ -79,6 +98,9 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         torch_dtype: Optional[torch.dtype] = None,
         action_dim: int,
         num_action_chunks: int,
+        add_value_head: bool = False,
+        hidden_size: int = 4096,
+        max_prompt_length: int = 1024,
     ) -> "NaVidForRLActionPrediction":
         from rlinf.models.embodiment.navid.mm_utils import get_model_name_from_path
         from rlinf.models.embodiment.navid.model.builder import load_pretrained_model
@@ -94,12 +116,18 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         )
         if torch_dtype is not None:
             model.to(torch_dtype)
+
+        hidden_size = int(getattr(model.config, "hidden_size", hidden_size))
+
         return cls(
             tokenizer=tokenizer,
             model=model,
             image_processor=image_processor,
             action_dim=int(action_dim),
             num_action_chunks=int(num_action_chunks),
+            add_value_head=add_value_head,
+            hidden_size=hidden_size,
+            max_prompt_length=max_prompt_length,
         )
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
@@ -107,14 +135,93 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             return self.default_forward(**kwargs)
         raise NotImplementedError
 
-    def default_forward(self, **kwargs):
-        # This wrapper is intended for rollout-time action prediction.
-        raise NotImplementedError(
-            "NaVidForRLActionPrediction does not implement training forward in RLinf yet."
+    def default_forward(
+        self,
+        forward_inputs: Optional[dict[str, Any]] = None,
+        compute_logprobs: bool = False,
+        compute_entropy: bool = False,
+        compute_values: bool = False,
+        **kwargs,
+    ):
+        if forward_inputs is None:
+            raise ValueError("forward_inputs is required for NaVid training forward")
+
+        input_ids = forward_inputs["input_ids"]
+        attention_mask = forward_inputs["attention_mask"]
+        pixel_values = forward_inputs["pixel_values"]
+        action_tokens = forward_inputs.get("action_tokens")
+        if action_tokens is not None:
+            response_length = (
+                action_tokens.shape[1] * action_tokens.shape[2]
+                if action_tokens.ndim == 3
+                else action_tokens.shape[1]
+            )
+        else:
+            response_length = forward_inputs.get(
+                "response_length", input_ids.shape[1] - self.max_prompt_length
+            )
+
+        if pixel_values is not None and isinstance(pixel_values, list):
+            pixel_values = torch.stack(pixel_values, dim=0)
+
+        # # Set dummy prompts for training mode if not already set
+        # if not hasattr(self.model, "prompts") or self.model.prompts is None:
+        #     if pixel_values is not None and pixel_values.shape[0] > 0:
+        #         dummy_prompts = [["dummy prompt"] for _ in range(pixel_values.shape[0])]
+        #         self.model.prompts = dummy_prompts
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            images=pixel_values,
+            output_hidden_states=True,
+            return_dict=True,
         )
 
+        if not compute_logprobs and not compute_values:
+            return outputs
+
+        logits = outputs.logits[:, -response_length - 1 : -1, :]
+
+        logprobs = None
+        entropy = None
+        if compute_logprobs and action_tokens is not None:
+            action_tokens = action_tokens.to(logits.device)
+            if action_tokens.ndim == 3:
+                action_tokens = action_tokens.reshape(action_tokens.shape[0], -1)
+            logits_for_actions = logits[:, : action_tokens.shape[1], :]
+            logprobs = torch.nn.functional.cross_entropy(
+                logits_for_actions.reshape(-1, logits_for_actions.shape[-1]),
+                action_tokens.reshape(-1),
+                reduction="none",
+            ).reshape(action_tokens.shape[0], -1)
+
+        if compute_entropy:
+            entropy = torch.nn.functional.softmax(logits, dim=-1)
+            entropy = -(entropy * torch.log(entropy + 1e-8)).sum(dim=-1)
+
+        values = None
+        if compute_values and hasattr(self, "value_head"):
+            last_hidden_state = outputs.hidden_states[-1]
+            last_hidden = last_hidden_state[:, -1, :]
+            values = self.value_head(last_hidden)
+            values = (
+                values.unsqueeze(1)
+                .unsqueeze(2)
+                .expand(-1, 1, self.num_action_chunks, 1)
+            )
+
+        return {
+            "logprobs": logprobs,
+            "entropy": entropy,
+            "values": values,
+        }
+
     def preprocess_env_obs(self, env_obs):
+        # Keep original main_images tensor for forward_inputs
         out = dict(env_obs)
+        original_main_images = out["main_images"]
+
         images = out["main_images"]
         batch_images_np: list[np.ndarray] = []
         for i in range(int(images.shape[0])):
@@ -123,6 +230,8 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
                 img_np = np.clip(img_np, 0, 255).astype(np.uint8)
             batch_images_np.append(img_np)
         out["main_images"] = batch_images_np
+        # Store original tensor for forward_inputs
+        out["_original_main_images"] = original_main_images
 
         return out
 
@@ -201,16 +310,39 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
 
         chunk_actions = self._parse_actions_from_texts(gen_texts=gen_texts)
 
-        prev_logprobs = torch.zeros(
-            (bsz, self.action_dim), device=device, dtype=torch.float32
+        input_len = input_ids.shape[1]
+        response_len = outputs.shape[1] - input_len
+        logits = (
+            outputs.logits[:, -response_len - 1 : -1, :]
+            if hasattr(outputs, "logits")
+            else None
         )
-        prev_values = torch.zeros((bsz, 1), device=device, dtype=torch.float32)
+
+        action_token_ids, action_logprobs = self._compute_action_logprobs(
+            gen_texts=gen_texts,
+            logits=logits,
+            device=device,
+        )
+
+        prev_logprobs = action_logprobs
+
+        if hasattr(self, "value_head"):
+            if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+                last_hidden = outputs.hidden_states[-1][:, -1, :]
+                prev_values = self.value_head(last_hidden)
+            else:
+                prev_values = torch.zeros((bsz, 1), device=device, dtype=torch.float32)
+        else:
+            prev_values = torch.zeros((bsz, 1), device=device, dtype=torch.float32)
 
         forward_inputs: dict[str, Any] = {}
         if return_obs:
-            forward_inputs["main_images"] = env_obs["main_images"]
-            forward_inputs["task_descriptions"] = env_obs["task_descriptions"]
-            forward_inputs["generated_text"] = gen_texts
+            forward_inputs["main_images"] = env_obs["_original_main_images"]
+
+        forward_inputs["input_ids"] = input_ids
+        forward_inputs["attention_mask"] = attention_mask
+        forward_inputs["pixel_values"] = images_for_model
+        forward_inputs["action_tokens"] = action_token_ids
 
         result = {
             "prev_logprobs": prev_logprobs,
@@ -222,10 +354,17 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
     def _get_device(self) -> torch.device:
         return next(self.model.parameters()).device
 
+    def _build_action_token_mapping(self) -> None:
+        action_names = ["move_forward", "turn_left", "turn_right", "stop", "no_op"]
+        for action in action_names:
+            token_ids = self.tokenizer(action, add_special_tokens=False).input_ids
+            if token_ids:
+                self._action_token_ids[action] = token_ids[0]
+
     def _get_generation_params(self, **kwargs: Any) -> dict[str, Any]:
         do_sample = kwargs.get("do_sample", "True")
         temperature = float(kwargs.get("temperature", 0.2))
-        max_new_tokens = int(kwargs.get("max_new_tokens", 1024))
+        max_new_tokens = int(kwargs.get("max_new_tokens", 1024) or 1024)
         return {
             "do_sample": bool(do_sample),
             "temperature": temperature,
@@ -358,7 +497,7 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             input_id_list.append(input_ids_single)
 
         bsz = len(input_id_list)
-        max_len = max(int(x.shape[1]) for x in input_id_list)
+        max_len = self.max_prompt_length
         pad_id = int(self.tokenizer.pad_token_id or 0)
 
         input_ids = torch.full(
@@ -367,8 +506,8 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         attention_mask = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
 
         for i, ids in enumerate(input_id_list):
-            seq_len = ids.shape[1]
-            input_ids[i, -seq_len:] = ids[0]
+            seq_len = min(ids.shape[1], max_len)
+            input_ids[i, -seq_len:] = ids[0, :seq_len]
             attention_mask[i, -seq_len:] = 1
 
         return input_ids, attention_mask
@@ -437,7 +576,26 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
                 if hist is not None and hist.shape[0] > self._max_history_len:
                     self._history_rgb_tensor[ep_id] = hist[-self._max_history_len :]
 
-            images_for_model.append(self._history_rgb_tensor[ep_id].to(device=device))
+            hist_tensor = self._history_rgb_tensor[ep_id]
+            if hist_tensor is not None:
+                max_frames = self._max_history_len if self._max_history_len else 8
+                if hist_tensor.shape[0] < max_frames:
+                    pad_size = max_frames - hist_tensor.shape[0]
+                    padding = torch.zeros(
+                        (pad_size,) + hist_tensor.shape[1:],
+                        dtype=hist_tensor.dtype,
+                        device=device,
+                    )
+                    hist_tensor = torch.cat([padding, hist_tensor], dim=0)
+            else:
+                max_frames = self._max_history_len if self._max_history_len else 8
+                hist_tensor = torch.zeros(
+                    (max_frames,) + new_frames_tensor.shape[1:],
+                    dtype=new_frames_tensor.dtype,
+                    device=device,
+                )
+
+            images_for_model.append(hist_tensor)
 
         return images_for_model
 
@@ -516,3 +674,59 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             )
 
         return chunk_actions
+
+    def _compute_action_logprobs(
+        self,
+        *,
+        gen_texts: list[str],
+        logits: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz = len(gen_texts)
+        max_num_actions = self.num_action_chunks
+
+        action_token_ids = torch.zeros(
+            (bsz, max_num_actions), dtype=torch.long, device=device
+        )
+        action_logprobs = torch.zeros(
+            (bsz, max_num_actions), dtype=torch.float32, device=device
+        )
+
+        for i, gen_text in enumerate(gen_texts):
+            text = gen_text.strip()
+            match = re.search(r"-?\d+", text)
+            num = int(match.group(0)) if match else 0
+
+            actions: list[str] = []
+            if "forward" in text:
+                for _ in range(min(3, int(num / 25))):
+                    actions.append("move_forward")
+            elif "left" in text:
+                for _ in range(min(3, int(num / 30))):
+                    actions.append("turn_left")
+            elif "right" in text:
+                for _ in range(min(3, int(num / 30))):
+                    actions.append("turn_right")
+            elif "stop" in text:
+                actions.append("stop")
+            else:
+                actions.append("no_op")
+
+            for j, action in enumerate(actions):
+                if j >= max_num_actions:
+                    break
+                if action in self._action_token_ids:
+                    action_token_ids[i, j] = self._action_token_ids[action]
+
+                    if logits is not None:
+                        token_logits = logits[i, j, :]
+                        log_probs = torch.log_softmax(token_logits, dim=-1)
+                        if action_token_ids[i, j] < log_probs.shape[0]:
+                            action_logprobs[i, j] = log_probs[action_token_ids[i, j]]
+                        else:
+                            action_logprobs[i, j] = -100.0
+
+        action_token_ids = action_token_ids.unsqueeze(1)
+        action_logprobs = action_logprobs.unsqueeze(1)
+
+        return action_token_ids, action_logprobs
