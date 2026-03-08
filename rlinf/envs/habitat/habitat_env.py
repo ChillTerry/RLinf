@@ -255,7 +255,7 @@ class HabitatEnv(gym.Env):
             mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
             mask[env_idx] = True
             for v in episode.values():
-                v[mask] = torch.zeros_like(v)
+                v[mask] = 0
         infos = {}
 
         if self.current_raw_obs is None:
