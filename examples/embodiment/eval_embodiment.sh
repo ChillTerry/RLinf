@@ -26,7 +26,7 @@ export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
 export HYDRA_FULL_ERROR=1
 
 if [ -z "$1" ]; then
-    CONFIG_NAME="maniskill_ppo_openvlaoft"
+    CONFIG_NAME="habitat_r2r_ppo_navid"
 else
     CONFIG_NAME=$1
 fi

@@ -33,6 +33,7 @@ from rlinf.models.embodiment.navid.constants import (
     IMAGE_END_TOKEN,
     IMAGE_START_TOKEN,
     IMAGE_TOKEN_INDEX,
+    NAVIGATION_IDENTIFIER,
     NAVIGATION_SPECIAL_TOKEN,
     VIDEO_END_SPECIAL_TOKEN,
     VIDEO_START_SPECIAL_TOKEN,
@@ -82,7 +83,7 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
                 input_dim=hidden_size,
                 hidden_sizes=(512, 128),
                 output_dim=1,
-                activation="gelu",
+                activation="relu",
                 bias_last=False,
             )
 
@@ -164,16 +165,18 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         if pixel_values is not None and isinstance(pixel_values, list):
             pixel_values = torch.stack(pixel_values, dim=0)
 
-        # # Set dummy prompts for training mode if not already set
-        # if not hasattr(self.model, "prompts") or self.model.prompts is None:
-        #     if pixel_values is not None and pixel_values.shape[0] > 0:
-        #         dummy_prompts = [["dummy prompt"] for _ in range(pixel_values.shape[0])]
-        #         self.model.prompts = dummy_prompts
+        prompts = forward_inputs.get("prompts")
+        if prompts is not None and prompts and isinstance(prompts[0], str):
+            prompts = [[prompt] for prompt in prompts]
+
+        if prompts is None or len(prompts) != int(input_ids.shape[0]):
+            prompts = [[NAVIGATION_IDENTIFIER] for _ in range(int(input_ids.shape[0]))]
 
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             images=pixel_values,
+            prompts=prompts,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -195,21 +198,18 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
                 action_tokens.reshape(-1),
                 reduction="none",
             ).reshape(action_tokens.shape[0], -1)
+            logprobs = logprobs.float()
 
         if compute_entropy:
             entropy = torch.nn.functional.softmax(logits, dim=-1)
             entropy = -(entropy * torch.log(entropy + 1e-8)).sum(dim=-1)
+            entropy = entropy.float()
 
         values = None
         if compute_values and hasattr(self, "value_head"):
             last_hidden_state = outputs.hidden_states[-1]
             last_hidden = last_hidden_state[:, -1, :]
-            values = self.value_head(last_hidden)
-            values = (
-                values.unsqueeze(1)
-                .unsqueeze(2)
-                .expand(-1, 1, self.num_action_chunks, 1)
-            )
+            values = self.value_head(last_hidden).expand(-1, self.num_action_chunks)
 
         return {
             "logprobs": logprobs,
@@ -341,7 +341,7 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
 
         forward_inputs["input_ids"] = input_ids
         forward_inputs["attention_mask"] = attention_mask
-        forward_inputs["pixel_values"] = images_for_model
+        forward_inputs["pixel_values"] = torch.stack(images_for_model, dim=0)
         forward_inputs["action_tokens"] = action_token_ids
 
         result = {
