@@ -29,7 +29,7 @@ runner:
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 2
+  val_check_interval: -1
   save_interval: -1
   weight_sync_interval: 1
 
@@ -60,6 +60,8 @@ algorithm:
   critic_actor_ratio: 4
   # Replay buffer settings
   replay_buffer:
+    enable_preload: True
+    prefetch_size: 5
     enable_cache: True
     cache_size: 20000 # number of trajectories cached in memory
     sample_window_size: 20000 # number of latest trajectories to sample from for replay buffer
@@ -86,7 +88,7 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  enable_offload: False
+
   train:
     obs_format: tensor
     total_num_envs: 1
@@ -105,6 +107,7 @@ env:
 
 rollout:
   enable_torch_compile: True
+  enable_cuda_graph: False
   group_name: "RolloutGroup"
   backend: "huggingface"
   enable_offload: False
@@ -120,6 +123,7 @@ rollout:
     image_num: 2
     
 actor:
+  sync_weight_no_wait: True
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 1     # how many samples each GPU processes per sampling step

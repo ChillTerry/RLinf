@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import typing
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
@@ -36,10 +37,39 @@ class DatasetItem:
 
     prompt: torch.Tensor
     length: int
-    answer: str | dict
+    answer: typing.Union[str, dict]
     idx: int
     solution: Optional[str] = None
     image_data: Optional[list[Union[bytes, str]]] = None
     prompt_text: Optional[str] = None
+    meta: Optional[dict[str, Any]] = None
+    multi_modal_inputs: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class SftDatasetItem:
+    """
+    A single item in processed dataset.
+
+    Attributes:
+        prompt (torch.Tensor): Tokenized prompt input_ids tensor.
+        length (int): Length of the prompt input_ids.
+        answer (str | dict): The answer associated with the prompt.
+        idx (int): Index of the item in the dataset.
+        solution (Optional[str]): Optional solution text if exists.
+        prompt_text (Optional[str]): Optional original prompt text before tokenization.
+        meta (Optional[Dict[str, Any]]): Optional metadata dictionary.
+        multi_modal_inputs (Optional[Dict[str, Any]]): Optional dictionary for additional multi-modal inputs.
+    """
+
+    prompt: torch.Tensor
+    length: int
+    answer: typing.Union[str, dict]
+    idx: int
+    solution: Optional[str] = None
+    attention_mask: torch.Tensor = None
+    label_mask: torch.Tensor = None
+    image_data: Optional[list[Union[bytes, str]]] = None
+    prompt_text: Optional[dict[str, Any]] = None
     meta: Optional[dict[str, Any]] = None
     multi_modal_inputs: Optional[dict[str, Any]] = None

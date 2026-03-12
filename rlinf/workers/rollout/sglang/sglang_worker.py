@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import dataclasses
+import typing
 from typing import Any, Literal, Optional
 
 from omegaconf import DictConfig
@@ -149,9 +150,14 @@ class SGLangWorker(Worker):
 
         load_format = "dummy"  # dummy means randomize init weight
         if self.weight_reload == "sync":
-            if self._cfg_rollout.validate_weight or getattr(
-                self._cfg_rollout, "validate_weight_first_sync", False
-            ):
+            validate_weight_first_sync = self._cfg_rollout.get(
+                "validate_weight_first_sync", False
+            )
+            if self._cfg.runner.resume_dir is not None:
+                # validate_weight_first_sync compare hf weights with megatron weights,
+                # and if resume_dir is enabled, hf weights can't equal to megatron's.
+                validate_weight_first_sync = False
+            if self._cfg_rollout.validate_weight or validate_weight_first_sync:
                 load_format = "auto"
         else:
             load_format = "auto"
@@ -217,12 +223,12 @@ class SGLangWorker(Worker):
 
     async def async_generate(
         self,
-        prompt: list[str] | str | None = None,
-        sampling_params: list[dict] | dict | None = None,
-        input_ids: list[list[int]] | list[int] | None = None,
-        image_data: list | None = None,
-        return_logprob: list[bool] | bool | None = False,
-        request_info: Any | None = None,
+        prompt: typing.Optional[typing.Union[list[str], str]] = None,
+        sampling_params: typing.Optional[typing.Union[list[dict], dict]] = None,
+        input_ids: typing.Optional[typing.Union[list[list[int]], list[int]]] = None,
+        image_data: typing.Optional[list] = None,
+        return_logprob: typing.Optional[typing.Union[list[bool], bool]] = False,
+        request_info: typing.Optional[Any] = None,
     ):
         """
         Asynchronously generate text using the underlying SGLang engine and return

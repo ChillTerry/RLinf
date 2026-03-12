@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import asyncio
 import queue
 import threading
+import typing
 
 import torch
 
@@ -52,7 +52,9 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
                 trajectory = input_channel.get()
                 self._recv_queue.put(trajectory)
 
-    def _drain_received_trajectories(self, max_trajectories: int | None = None):
+    def _drain_received_trajectories(
+        self, max_trajectories: typing.Optional[int] = None
+    ):
         if getattr(self, "_recv_queue", None) is None:
             return
         recv_list = []
@@ -69,6 +71,16 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             return
 
         self.replay_buffer.add_trajectories(recv_list)
+
+        if self.demo_buffer is not None:
+            intervene_traj_list = []
+            for traj in recv_list:
+                intervene_traj = traj.extract_intervene_traj()
+                if intervene_traj is not None:
+                    intervene_traj_list.append(intervene_traj)
+
+            if len(intervene_traj_list) > 0:
+                self.demo_buffer.add_trajectories(intervene_traj_list)
 
     async def _wait_for_replay_buffer_ready(self, min_buffer_size: int):
         while True:
@@ -122,6 +134,7 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     async def stop(self):
         self.should_stop = True
+        self.buffer_dataset.close()
         recv_thread = getattr(self, "_recv_rollout_thread", None)
         if recv_thread is not None and recv_thread.is_alive():
             await asyncio.to_thread(recv_thread.join, 5)

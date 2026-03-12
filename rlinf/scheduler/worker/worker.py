@@ -23,17 +23,17 @@ import sys
 import threading
 import time
 import traceback
+import typing
 import warnings
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union
 
 import ray
-import ray.dashboard.utils
 import ray.util.state
 import torch
 from omegaconf import OmegaConf
 
-from ..cluster import Cluster, ClusterEnvVar
+from ..cluster import Cluster, ClusterEnvVar, without_http_proxies
 from ..hardware import AcceleratorType, AcceleratorUtil, HardwareInfo
 from ..manager import WorkerAddress
 
@@ -313,8 +313,9 @@ class Worker(metaclass=WorkerMeta):
     logging.basicConfig()
     logger = logging.getLogger(Cluster.SYS_NAME)
     logger.setLevel(Cluster.LOGGING_LEVEL)
-    torch_platform = torch.cuda
-    torch_device_type = "cuda"
+    accelerator_type = AcceleratorUtil.get_accelerator_type()
+    torch_platform = AcceleratorUtil.get_torch_platform(accelerator_type)
+    torch_device_type = AcceleratorUtil.get_device_type(accelerator_type)
 
     def __new__(cls, *args, **kwargs):
         """Create a new instance of the Worker class."""
@@ -349,15 +350,18 @@ class Worker(metaclass=WorkerMeta):
         self._accelerator_type = AcceleratorType(
             os.environ.get("ACCELERATOR_TYPE", str(AcceleratorType.NO_ACCEL.value))
         )
+        self._accelerator_model = os.environ.get("ACCELERATOR_MODEL", "")
         self._local_accelerator_rank = int(os.environ.get("LOCAL_ACCELERATOR_RANK", -1))
         self._node_local_rank = int(os.environ.get("NODE_LOCAL_RANK", -1))
         self._node_local_world_size = int(os.environ.get("NODE_LOCAL_WORLD_SIZE", -1))
+        Worker.accelerator_type = self._accelerator_type
         Worker.torch_device_type = AcceleratorUtil.get_device_type(
             self._accelerator_type
         )
         Worker.torch_platform = AcceleratorUtil.get_torch_platform(
             self._accelerator_type
         )
+        self.accelerator_type = Worker.accelerator_type
         self.torch_device_type = Worker.torch_device_type
         self.torch_platform = Worker.torch_platform
 
@@ -555,7 +559,7 @@ class Worker(metaclass=WorkerMeta):
     @classmethod
     def create_group(
         cls: type[WorkerClsType], *args, **kwargs
-    ) -> "WorkerGroup[WorkerClsType] | WorkerClsType":
+    ) -> Union["WorkerGroup[WorkerClsType]", WorkerClsType]:
         """Create a worker group with the class arguments.
 
         Args:
@@ -568,9 +572,11 @@ class Worker(metaclass=WorkerMeta):
 
     def send(
         self,
-        object: torch.Tensor | list[torch.Tensor] | dict[str, torch.Tensor] | Any,
+        object: typing.Union[
+            torch.Tensor, list[torch.Tensor], dict[str, torch.Tensor], Any
+        ],
         dst_group_name: str,
-        dst_rank: int | list[int],
+        dst_rank: typing.Union[int, list[int]],
         async_op: bool = False,
         options: Optional["CollectiveGroupOptions"] = None,
         piggyback_payload: Optional[Any] = None,
@@ -618,7 +624,7 @@ class Worker(metaclass=WorkerMeta):
     def recv(
         self,
         src_group_name: str,
-        src_rank: int | list[int],
+        src_rank: typing.Union[int, list[int]],
         async_op: bool = False,
         options: Optional["CollectiveGroupOptions"] = None,
     ):
@@ -650,7 +656,7 @@ class Worker(metaclass=WorkerMeta):
         self,
         tensor: torch.Tensor,
         dst_group_name: str,
-        dst_rank: int | list[int],
+        dst_rank: typing.Union[int, list[int]],
         async_op: bool = False,
         options: Optional["CollectiveGroupOptions"] = None,
     ):
@@ -684,7 +690,7 @@ class Worker(metaclass=WorkerMeta):
         self,
         tensor: torch.Tensor,
         src_group_name: str,
-        src_rank: int | list[int],
+        src_rank: typing.Union[int, list[int]],
         async_op: bool = False,
         options: Optional["CollectiveGroupOptions"] = None,
     ):
@@ -718,9 +724,9 @@ class Worker(metaclass=WorkerMeta):
         self,
         object: Optional[Any] = None,
         groups: Optional[
-            list[tuple[str, list[int] | list[tuple[int]] | tuple[int] | int]]
+            list[tuple[str, typing.Union[list[int], list[tuple[int]], tuple[int], int]]]
         ] = None,
-        src: Optional[tuple[str, tuple[int] | int]] = None,
+        src: Optional[tuple[str, typing.Union[tuple[int], int]]] = None,
         async_op: bool = False,
         options: Optional["CollectiveGroupOptions"] = None,
     ):
@@ -978,30 +984,10 @@ class Worker(metaclass=WorkerMeta):
             bool: True if the worker is alive, False otherwise.
         """
         try:
-            # Internally, Ray uses HTTP to query the actor states
-            # Set no-proxy for ray address in case HTTP_PROXY is set in the environment
-            ray_address = ray.dashboard.utils.get_address_for_submission_client(None)
-            if "http://" in ray_address:
-                ray_address = ray_address.replace("http://", "")
-            elif "https://" in ray_address:
-                ray_address = ray_address.replace("https://", "")
-            if ":" in ray_address:
-                ray_address = ray_address.split(":")[0]
-            prev_no_proxy_upper = os.environ.get("NO_PROXY", None)
-            prev_no_proxy_lower = os.environ.get("no_proxy", None)
-            os.environ["NO_PROXY"] = ray_address
-            os.environ["no_proxy"] = ray_address
-
-            actors = ray.util.state.list_actors(filters=[("NAME", "=", worker_name)])
-
-            if prev_no_proxy_upper is not None:
-                os.environ["NO_PROXY"] = prev_no_proxy_upper
-            else:
-                os.environ.pop("NO_PROXY", None)
-            if prev_no_proxy_lower is not None:
-                os.environ["no_proxy"] = prev_no_proxy_lower
-            else:
-                os.environ.pop("no_proxy", None)
+            with without_http_proxies():
+                actors = ray.util.state.list_actors(
+                    filters=[("NAME", "=", worker_name)]
+                )
 
             if len(actors) == 0:
                 return False
@@ -1254,9 +1240,14 @@ class Worker(metaclass=WorkerMeta):
             group_world_size=self._world_size,
             cluster_node_rank=self._cluster_node_rank,
             accelerator_type=self._accelerator_type,
+            accelerator_model=self._accelerator_model,
             accelerator_rank=self._local_accelerator_rank,
             node_ip=node_ip,
             node_port=node_port,
             available_accelerators=self.global_accelerator_ids,
             hardware_infos=self.hardware_infos,
         )
+
+    def __repr__(self):
+        """Return a string representation of the Worker."""
+        return f"{self._group_name}(rank={self._rank})"

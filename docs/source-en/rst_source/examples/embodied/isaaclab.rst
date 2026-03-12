@@ -6,7 +6,7 @@ RL with IsaacLab
    :height: 16px
    :class: inline-icon
 
-This example provides a comprehensive guide to using the **RLinf** framework in the `IsaacLab <https://developer.nvidia.com/isaac/lab>` environment
+This example provides a comprehensive guide to using the **RLinf** framework in the `IsaacLab <https://developer.nvidia.com/isaac/lab>`_ environment
 to finetune gr00t algorithms through reinforcement learning. It covers the entire process—from environment setup and core algorithm design to training configuration, evaluation, and visualization—along with reproducible commands and configuration snippets.
 
 The primary objective is to develop a model capable of performing robotic manipulation:
@@ -154,6 +154,10 @@ Model Download
    # export HF_ENDPOINT=https://hf-mirror.com
    pip install huggingface-hub
    hf download RLinf/RLinf-Gr00t-SFT-Stack-cube --local-dir RLinf-Gr00t-SFT-Stack-cube
+
+To enable the model to improve its performance through reinforcement learning, we collected human demonstration data for the ``stack cube`` task in the IsaacLab environment and conducted supervised fine-tuning with **GR00T N1.5** (<https://github.com/NVIDIA/Isaac-GR00T/tree/n1.5-release>) as the base model, thereby achieving a baseline task success rate.
+
+The dataset has been open-sourced on HuggingFace: <https://huggingface.co/datasets/RLinf/IsaacLab-Stack-Cube-Data>
 
 Running the Script
 ------------------

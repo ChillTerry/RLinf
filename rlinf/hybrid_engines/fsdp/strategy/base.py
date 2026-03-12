@@ -36,6 +36,7 @@ from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
 from rlinf.hybrid_engines.fsdp.utils import (
     FSDPVersion,
 )
+from rlinf.scheduler import Worker
 from rlinf.utils.utils import clear_memory
 
 if TYPE_CHECKING:
@@ -84,29 +85,27 @@ class FSDPStrategyBase(ABC):
             "fsdp_config is required for creating corresponding FSDP strategy"
         )
         strategy = str(cfg.fsdp_config.get("strategy", "fsdp2")).lower()
-        match strategy:
-            case FSDPVersion.FSDP:
-                from .fsdp import FSDPStrategy
+        if strategy == FSDPVersion.FSDP:
+            from .fsdp import FSDPStrategy
 
-                return FSDPStrategy(
-                    cfg=cfg,
-                    world_size=world_size,
-                    dp_group=dp_group,
-                    logger=logger,
-                )
-            case FSDPVersion.FSDP2:
-                from .fsdp2 import FSDP2Strategy
+            return FSDPStrategy(
+                cfg=cfg,
+                world_size=world_size,
+                dp_group=dp_group,
+                logger=logger,
+            )
+        if strategy == FSDPVersion.FSDP2:
+            from .fsdp2 import FSDP2Strategy
 
-                return FSDP2Strategy(
-                    cfg=cfg,
-                    world_size=world_size,
-                    dp_group=dp_group,
-                    logger=logger,
-                )
-            case _:
-                raise ValueError(
-                    f"Unknown FSDP strategy '{strategy}'. Expected one of: 'fsdp','fsdp2'"
-                )
+            return FSDP2Strategy(
+                cfg=cfg,
+                world_size=world_size,
+                dp_group=dp_group,
+                logger=logger,
+            )
+        raise ValueError(
+            f"Unknown FSDP strategy '{strategy}'. Expected one of: 'fsdp','fsdp2'"
+        )
 
     @abstractmethod
     def clip_grad_norm_(
@@ -154,6 +153,30 @@ class FSDPStrategyBase(ABC):
         raise NotImplementedError(
             "get_fsdp_version method must be implemented by subclasses."
         )
+
+    @classmethod
+    def save_npu_weight(cls, obj, path: str) -> None:
+        """
+        Save weights safely when tensors may live on NPU.
+
+        Converts all NPU tensors to CPU recursively before saving.
+        """
+
+        def to_cpu(item):
+            if isinstance(item, torch.Tensor) and item.is_npu:
+                return item.cpu()
+            return item
+
+        if isinstance(obj, dict):
+            obj = {k: to_cpu(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            obj = type(obj)(to_cpu(v) for v in obj)
+        elif isinstance(obj, torch.Tensor):
+            obj = obj.cpu()
+        else:
+            raise ValueError("value type error")
+        torch.save(obj, path, _use_new_zipfile_serialization=True)
+        print(f"Save using _use_new_zipfile_serialization to {path}")
 
     @classmethod
     def save_checkpoint(
@@ -228,9 +251,16 @@ class FSDPStrategyBase(ABC):
             model_state_dict = get_model_state_dict(model=model, options=opts)
             if torch.distributed.get_rank() == 0:
                 os.makedirs(sd_save_path, exist_ok=True)
-                torch.save(
-                    model_state_dict, os.path.join(sd_save_path, "full_weights.pt")
-                )
+                # npu requires a specific model parameter save
+                if Worker.torch_device_type == "npu":
+                    cls.save_npu_weight(
+                        model_state_dict, os.path.join(sd_save_path, "full_weights.pt")
+                    )
+
+                else:
+                    torch.save(
+                        model_state_dict, os.path.join(sd_save_path, "full_weights.pt")
+                    )
 
             torch.distributed.barrier()
 
