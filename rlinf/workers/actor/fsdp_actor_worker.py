@@ -1375,6 +1375,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
+                        SupportedModel.NAVID,
                     ]:
                         kwargs["temperature"] = (
                             self.cfg.algorithm.sampling_params.temperature_train

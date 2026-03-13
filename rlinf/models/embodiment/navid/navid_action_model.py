@@ -329,11 +329,19 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         if hasattr(self, "value_head"):
             if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
                 last_hidden = outputs.hidden_states[-1][:, -1, :]
-                prev_values = self.value_head(last_hidden)
+                prev_values = self.value_head(last_hidden).expand(
+                    -1, self.num_action_chunks
+                )
             else:
-                prev_values = torch.zeros((bsz, 1), device=device, dtype=torch.float32)
+                prev_values = torch.zeros(
+                    (bsz, self.num_action_chunks),
+                    device=device,
+                    dtype=torch.float32,
+                )
         else:
-            prev_values = torch.zeros((bsz, 1), device=device, dtype=torch.float32)
+            prev_values = torch.zeros(
+                (bsz, self.num_action_chunks), device=device, dtype=torch.float32
+            )
 
         forward_inputs: dict[str, Any] = {}
         if return_obs:

@@ -9,4 +9,3 @@ is_lora: False
 add_value_head: False
 hidden_size: 4096
 max_prompt_length: 512
-

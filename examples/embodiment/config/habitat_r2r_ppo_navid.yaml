@@ -81,7 +81,7 @@ algorithm:
   # length argument for autoregressive sampling
   # max length means max amount of tokens to generate
   length_params:
-    max_new_token: 512
+    max_new_token: 64
 
   filter_rewards: True
   rewards_lower_bound: 0.5

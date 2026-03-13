@@ -122,6 +122,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             if SupportedModel(self.cfg.actor.model.model_type) in [
                 SupportedModel.OPENVLA,
                 SupportedModel.OPENVLA_OFT,
+                SupportedModel.NAVID,
             ]:
                 model_kwargs["temperature"] = (
                     self.cfg.algorithm.sampling_params.temperature_train
@@ -255,6 +256,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
+                        SupportedModel.NAVID,
                     ]:
                         model_kwargs["temperature"] = (
                             self.cfg.algorithm.sampling_params.temperature_train
