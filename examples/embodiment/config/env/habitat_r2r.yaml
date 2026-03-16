@@ -15,3 +15,5 @@ use_ordered_reset_state_ids: False
 
 init_params:
   config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_cma.yaml"
+  params_dict:
+    BASE_TASK_CONFIG_PATH: ".venv/habitat/.venv/habitat-lab/configs/tasks/pointnav.yaml"

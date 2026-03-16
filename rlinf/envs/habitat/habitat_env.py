@@ -503,7 +503,11 @@ class HabitatEnv(gym.Env):
             GlobalHydra.instance().clear()
 
         config_path = self.cfg.init_params.config_path
-        habitat_config = get_config(config_path)
+        params_dict = self.cfg.init_params.params_dict
+        params_list = []
+        for k, v in params_dict.items():
+            params_list.extend([k, v])
+        habitat_config = get_config(config_path, opts=params_list)
 
         habitat_dataset = habitat.datasets.make_dataset(
             habitat_config.habitat.dataset.type,
