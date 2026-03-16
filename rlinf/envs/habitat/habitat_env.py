@@ -102,6 +102,8 @@ class HabitatEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        obs_list = []
+        infos_list = []
 
         # Truncate chunk if it contains "stop" and pad with "no_op"
         for env_idx, chunk_action in enumerate(chunk_actions):
@@ -117,6 +119,9 @@ class HabitatEnv(gym.Env):
         for env_idx, elapsed_step in enumerate(self.elapsed_steps):
             if elapsed_step + chunk_size >= self.max_episode_steps:
                 reserved_idx = self.max_episode_steps - elapsed_step
+                if reserved_idx <= 0:
+                    chunk_actions[env_idx] = np.array(["no_op"] * chunk_size)
+                    continue
                 truncated_chunk = chunk_actions[env_idx][:reserved_idx].copy()
                 truncated_chunk[reserved_idx - 1] = "stop"
                 chunk_actions[env_idx] = np.concatenate(
@@ -134,6 +139,8 @@ class HabitatEnv(gym.Env):
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions
             )
+            obs_list.append(extracted_obs)
+            infos_list.append(infos)
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
@@ -154,11 +161,11 @@ class HabitatEnv(gym.Env):
             chunk_truncations = raw_chunk_truncations.clone()
 
         return (
-            extracted_obs,
+            obs_list,
             chunk_rewards,
             chunk_terminations,
             chunk_truncations,
-            infos,
+            infos_list,
         )
 
     def step(self, actions=None):
@@ -251,7 +258,7 @@ class HabitatEnv(gym.Env):
             mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
             mask[env_idx] = True
             for v in episode.values():
-                v[mask] = torch.zeros_like(v)
+                v[mask] = 0
         infos = {}
 
         if self.current_raw_obs is None:
@@ -505,15 +512,13 @@ class HabitatEnv(gym.Env):
 
         episode_ids = self._build_ordered_episodes(habitat_dataset)
 
+        episode_ranges = []
         num_episodes = len(episode_ids)
         episodes_per_env = num_episodes // self.num_envs // self.total_num_processes
-
-        episode_ranges = []
         start = self.seed_offset * episodes_per_env * self.num_envs
-        for i in range(self.num_envs - 1):
+        for i in range(self.num_envs):
             episode_ranges.append((start, start + episodes_per_env))
             start += episodes_per_env
-        episode_ranges.append((start, num_episodes))
 
         for env_id in range(self.num_envs):
             start, end = episode_ranges[env_id]

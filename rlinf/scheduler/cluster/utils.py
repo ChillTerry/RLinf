@@ -28,15 +28,12 @@ from typing import Any, Callable, Optional, Protocol, TextIO
 import torch
 
 # Type for a single tensor field value in a dataclass (used for send/recv).
-TensorFieldValue = (
-    torch.Tensor
-    | list[torch.Tensor]
-    | tuple[torch.Tensor, ...]
-    | dict[str, torch.Tensor]
-)
+TensorFieldValue = typing.Union[
+    torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, ...], dict[str, torch.Tensor]
+]
 # Metadata for flatten/unflatten: (field_name, 'tensor'|'list'|'tuple'|'dict', None|length|list_of_keys).
-DataclassTensorFieldsMetadata = list[
-    tuple[str, str, Optional[int] | Optional[list[str]]]
+DataclassTensorFieldsMetadata = typing.Union[
+    tuple[str, str, typing.Optional[int], typing.Optional[list[str]]]
 ]
 
 

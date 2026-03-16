@@ -28,7 +28,7 @@ from rlinf.utils.nested_dict_process import (
 )
 
 
-@dataclass(kw_only=True)
+@dataclass
 class EnvOutput:
     """Environment output for a single chunk step."""
 
@@ -241,7 +241,7 @@ class EnvOutput:
         return env_output_dict
 
 
-@dataclass(kw_only=True)
+@dataclass
 class ChunkStepResult:
     """Model outputs, env outputs (without observations), and training forward inputs for a chunk step."""
 
@@ -394,7 +394,7 @@ class Trajectory:
         )
 
 
-@dataclass(kw_only=True)
+@dataclass
 class EmbodiedRolloutResult:
     """
     Collect chunk-step results and transitions during rollout,

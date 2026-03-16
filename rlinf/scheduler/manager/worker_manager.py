@@ -246,8 +246,13 @@ class WorkerNode:
         child_address = self._worker_address.get_child_address(rank)
         child_node = WorkerNode(child_address, worker_info)
 
-        # Maintain sorted order of child nodes based on their rank
-        bisect.insort(self._nodes, child_node, key=lambda x: x._worker_address.rank)
+        # Maintain sorted order of child nodes based on their rank.
+        # Python 3.10+ supports `bisect.insort(..., key=...)`, but Python 3.9 does not,
+        # so we manually compute the insertion index using the ranks.
+        child_rank = child_node._worker_address.rank
+        existing_ranks = [n._worker_address.rank for n in self._nodes]
+        insert_idx = bisect.bisect_right(existing_ranks, child_rank)
+        self._nodes.insert(insert_idx, child_node)
 
     def __str__(self):
         """Produce the string representation of the worker node tree."""
