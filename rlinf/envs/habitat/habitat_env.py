@@ -32,7 +32,11 @@ from rlinf.envs.habitat.extensions.utils import (
     resize_observation_images,
 )
 from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
-from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
+from rlinf.envs.utils import (
+    list_of_dict_to_dict_of_list,
+    save_rollout_video,
+    to_tensor,
+)
 
 measures.pass_format_check()
 
@@ -251,7 +255,7 @@ class HabitatEnv(gym.Env):
             mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
             mask[env_idx] = True
             for v in episode.values():
-                v[mask] = torch.zeros_like(v)
+                v[mask] = 0
         infos = {}
 
         if self.current_raw_obs is None:
@@ -505,15 +509,13 @@ class HabitatEnv(gym.Env):
 
         episode_ids = self._build_ordered_episodes(habitat_dataset)
 
+        episode_ranges = []
         num_episodes = len(episode_ids)
         episodes_per_env = num_episodes // self.num_envs // self.total_num_processes
-
-        episode_ranges = []
         start = self.seed_offset * episodes_per_env * self.num_envs
-        for i in range(self.num_envs - 1):
+        for i in range(self.num_envs):
             episode_ranges.append((start, start + episodes_per_env))
             start += episodes_per_env
-        episode_ranges.append((start, num_episodes))
 
         for env_id in range(self.num_envs):
             start, end = episode_ranges[env_id]

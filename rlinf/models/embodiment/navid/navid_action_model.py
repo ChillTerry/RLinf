@@ -24,14 +24,17 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.models.embodiment.navid.constants import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_TOKEN,
     IAMGE_SEPARATOR,
+    IGNORE_INDEX,
     IMAGE_END_TOKEN,
     IMAGE_START_TOKEN,
     IMAGE_TOKEN_INDEX,
+    NAVIGATION_IDENTIFIER,
     NAVIGATION_SPECIAL_TOKEN,
     VIDEO_END_SPECIAL_TOKEN,
     VIDEO_START_SPECIAL_TOKEN,
@@ -44,6 +47,7 @@ from rlinf.models.embodiment.navid.mm_utils import (
     KeywordsStoppingCriteria,
     tokenizer_image_token,
 )
+from rlinf.utils.utils import compute_entropy_from_logits, compute_logprobs_from_logits
 
 
 class NaVidForRLActionPrediction(nn.Module, BasePolicy):
@@ -59,6 +63,10 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         image_processor,
         action_dim: int,
         num_action_chunks: int,
+        add_value_head: bool = False,
+        hidden_size: int = 4096,
+        max_prompt_length: int = 1024,
+        max_history_len: Optional[int] = None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -67,8 +75,20 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         self.action_dim = int(action_dim)
         self.num_action_chunks = int(num_action_chunks)
         self._history_rgb_tensor: dict[str, torch.Tensor | None] = {}
-        # TODO: initialize max history len from config
-        self._max_history_len: int | None = None
+        self._max_history_len = (
+            int(max_history_len) if max_history_len is not None else None
+        )
+        self.hidden_size = hidden_size
+        self.max_prompt_length = max_prompt_length
+
+        if add_value_head:
+            self.value_head = ValueHead(
+                input_dim=hidden_size,
+                hidden_sizes=(512, 128),
+                output_dim=1,
+                activation="relu",
+                bias_last=False,
+            )
 
     @classmethod
     def from_pretrained(
@@ -79,6 +99,10 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         torch_dtype: Optional[torch.dtype] = None,
         action_dim: int,
         num_action_chunks: int,
+        add_value_head: bool = False,
+        hidden_size: int = 4096,
+        max_prompt_length: int = 1024,
+        max_history_len: Optional[int] = None,
     ) -> "NaVidForRLActionPrediction":
         from rlinf.models.embodiment.navid.mm_utils import get_model_name_from_path
         from rlinf.models.embodiment.navid.model.builder import load_pretrained_model
@@ -94,12 +118,19 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         )
         if torch_dtype is not None:
             model.to(torch_dtype)
+
+        hidden_size = int(getattr(model.config, "hidden_size", hidden_size))
+
         return cls(
             tokenizer=tokenizer,
             model=model,
             image_processor=image_processor,
             action_dim=int(action_dim),
             num_action_chunks=int(num_action_chunks),
+            add_value_head=add_value_head,
+            hidden_size=hidden_size,
+            max_prompt_length=max_prompt_length,
+            max_history_len=max_history_len,
         )
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
@@ -107,11 +138,89 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             return self.default_forward(**kwargs)
         raise NotImplementedError
 
-    def default_forward(self, **kwargs):
-        # This wrapper is intended for rollout-time action prediction.
-        raise NotImplementedError(
-            "NaVidForRLActionPrediction does not implement training forward in RLinf yet."
+    def default_forward(
+        self,
+        forward_inputs: Optional[dict[str, Any]] = None,
+        compute_logprobs: bool = False,
+        compute_entropy: bool = False,
+        compute_values: bool = False,
+        **kwargs,
+    ):
+        if forward_inputs is None:
+            raise ValueError("NaVid default_forward requires forward_inputs.")
+
+        input_ids = forward_inputs["input_ids"].long()
+        attention_mask = forward_inputs["attention_mask"].long()
+        pixel_values = forward_inputs["pixel_values"]
+        response_token_ids = forward_inputs["response_token_ids"].long()
+        response_mask = forward_inputs["response_mask"].long()
+
+        device = self._get_device()
+        input_ids = input_ids.to(device=device)
+        attention_mask = attention_mask.to(device=device)
+        pixel_values = pixel_values.to(device=device)
+        response_token_ids = response_token_ids.to(device=device)
+        response_mask = response_mask.to(device=device)
+
+        full_input_ids, full_attention_mask, labels = self._build_teacher_forcing_batch(
+            prompt_input_ids=input_ids,
+            prompt_attention_mask=attention_mask,
+            response_token_ids=response_token_ids,
+            response_mask=response_mask,
         )
+
+        outputs, aligned_labels = self._forward_teacher_forcing_multimodal(
+            input_ids=full_input_ids,
+            attention_mask=full_attention_mask,
+            labels=labels,
+            pixel_values=pixel_values,
+            output_hidden_states=compute_values,
+        )
+
+        shift_logits = outputs.logits[..., :-1, :].contiguous()
+        shift_labels = aligned_labels[..., 1:].contiguous()
+        valid_mask = shift_labels.ne(IGNORE_INDEX)
+
+        logprobs = None
+        if compute_logprobs:
+            token_logprobs = compute_logprobs_from_logits(
+                logits=shift_logits,
+                target=shift_labels,
+            )
+            logprobs = self._compact_valid_token_tensor(
+                values=token_logprobs,
+                valid_mask=valid_mask,
+                target_length=response_token_ids.shape[1],
+            )
+
+        entropy = None
+        if compute_entropy:
+            token_entropy = compute_entropy_from_logits(shift_logits)
+            entropy = self._compact_valid_token_tensor(
+                values=token_entropy,
+                valid_mask=valid_mask,
+                target_length=response_token_ids.shape[1],
+            )
+
+        values = None
+        if (
+            compute_values
+            and hasattr(self, "value_head")
+            and outputs.hidden_states is not None
+        ):
+            shift_hidden_states = outputs.hidden_states[-1][..., :-1, :].contiguous()
+            token_values = self.value_head(shift_hidden_states)[..., 0]
+            values = self._compact_valid_token_tensor(
+                values=token_values,
+                valid_mask=valid_mask,
+                target_length=response_token_ids.shape[1],
+            )
+
+        return {
+            "logprobs": logprobs,
+            "entropy": entropy,
+            "values": values,
+        }
 
     def preprocess_env_obs(self, env_obs):
         out = dict(env_obs)
@@ -130,13 +239,10 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
     def predict_action_batch(
         self,
         env_obs: dict[str, Any],
-        mode: str = "train",
-        return_obs: bool = True,
         **kwargs,
     ):
         env_obs = self.preprocess_env_obs(env_obs)
 
-        assert mode in {"train", "eval"}, f"{mode=} is not supported"
         device = self._get_device()
         gen_params = self._get_generation_params(**kwargs)
 
@@ -183,6 +289,9 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             episode_ids=episode_ids,
             device=device,
         )
+        images_for_model = self._pad_history_frames_for_model(
+            images_for_model=images_for_model
+        )
 
         outputs = self._generate(
             questions=questions,
@@ -201,16 +310,47 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
 
         chunk_actions = self._parse_actions_from_texts(gen_texts=gen_texts)
 
-        prev_logprobs = torch.zeros(
-            (bsz, self.action_dim), device=device, dtype=torch.float32
+        if hasattr(self, "value_head") and outputs.hidden_states is not None:
+            token_hidden_states = outputs.hidden_states[0]
+            last_layer_hidden = token_hidden_states[-1]
+            prompt_last_hidden = last_layer_hidden[:, -1, :]
+            prev_values = self.value_head(prompt_last_hidden).expand(
+                -1, self.num_action_chunks
+            )
+        else:
+            prev_values = None
+
+        input_token_len = input_ids.shape[1]
+        generated_scores = torch.stack(tuple(outputs.scores), dim=1).float()
+        generated_token_ids = outputs.sequences[
+            :, input_token_len : input_token_len + generated_scores.shape[1]
+        ]
+        response_mask = self._build_response_mask(generated_token_ids)
+        prev_logprobs = (
+            compute_logprobs_from_logits(
+                logits=generated_scores,
+                target=generated_token_ids,
+            ).float()
+            * response_mask.float()
         )
-        prev_values = torch.zeros((bsz, 1), device=device, dtype=torch.float32)
+        response_target_length = int(gen_params["max_new_tokens"])
+        generated_token_ids, response_mask, prev_logprobs = (
+            self._pad_generated_response_tensors(
+                generated_token_ids=generated_token_ids,
+                response_mask=response_mask,
+                prev_logprobs=prev_logprobs,
+                target_length=response_target_length,
+            )
+        )
 
         forward_inputs: dict[str, Any] = {}
-        if return_obs:
-            forward_inputs["main_images"] = env_obs["main_images"]
-            forward_inputs["task_descriptions"] = env_obs["task_descriptions"]
-            forward_inputs["generated_text"] = gen_texts
+        forward_inputs["input_ids"] = input_ids
+        forward_inputs["attention_mask"] = attention_mask
+        forward_inputs["pixel_values"] = torch.stack(images_for_model, dim=0)
+        forward_inputs["response_token_ids"] = generated_token_ids
+        forward_inputs["response_mask"] = response_mask
+        forward_inputs["prompt_lengths"] = attention_mask.sum(dim=-1)
+        forward_inputs["response_lengths"] = response_mask.sum(dim=-1)
 
         result = {
             "prev_logprobs": prev_logprobs,
@@ -222,10 +362,166 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
     def _get_device(self) -> torch.device:
         return next(self.model.parameters()).device
 
+    def _build_response_mask(self, generated_token_ids: torch.Tensor) -> torch.Tensor:
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            return torch.ones_like(generated_token_ids, dtype=torch.long)
+
+        response_mask = generated_token_ids.ne(int(pad_token_id)).long()
+        zero_length_mask = response_mask.sum(dim=-1, keepdim=True).eq(0)
+        if zero_length_mask.any():
+            response_mask = torch.where(
+                zero_length_mask,
+                torch.ones_like(response_mask),
+                response_mask,
+            )
+        return response_mask
+
+    def _get_response_pad_token_id(self) -> int:
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is not None:
+            return int(pad_token_id)
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            return int(eos_token_id)
+        return 0
+
+    def _pad_sequence_tensor(
+        self,
+        *,
+        tensor: torch.Tensor,
+        target_length: int,
+        pad_value: int | float,
+    ) -> torch.Tensor:
+        current_length = int(tensor.shape[1])
+        if current_length >= target_length:
+            return tensor[:, :target_length]
+
+        pad = tensor.new_full(
+            (tensor.shape[0], target_length - current_length),
+            fill_value=pad_value,
+        )
+        return torch.cat((tensor, pad), dim=1)
+
+    def _pad_generated_response_tensors(
+        self,
+        *,
+        generated_token_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        prev_logprobs: torch.Tensor,
+        target_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pad_token_id = self._get_response_pad_token_id()
+        padded_token_ids = self._pad_sequence_tensor(
+            tensor=generated_token_ids,
+            target_length=target_length,
+            pad_value=pad_token_id,
+        )
+        padded_response_mask = self._pad_sequence_tensor(
+            tensor=response_mask,
+            target_length=target_length,
+            pad_value=0,
+        )
+        padded_prev_logprobs = self._pad_sequence_tensor(
+            tensor=prev_logprobs,
+            target_length=target_length,
+            pad_value=0.0,
+        )
+        return padded_token_ids, padded_response_mask, padded_prev_logprobs
+
+    def _pad_history_frames_for_model(
+        self, *, images_for_model: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        if self._max_history_len is None:
+            return images_for_model
+
+        padded_images: list[torch.Tensor] = []
+        for history_frames in images_for_model:
+            current_length = int(history_frames.shape[0])
+            if current_length >= self._max_history_len:
+                padded_images.append(history_frames[-self._max_history_len :])
+                continue
+
+            pad = history_frames.new_zeros(
+                (self._max_history_len - current_length, *history_frames.shape[1:])
+            )
+            padded_images.append(torch.cat((pad, history_frames), dim=0))
+
+        return padded_images
+
+    def _build_teacher_forcing_batch(
+        self,
+        *,
+        prompt_input_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        response_token_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        full_input_ids = torch.cat((prompt_input_ids, response_token_ids), dim=-1)
+        full_attention_mask = torch.cat((prompt_attention_mask, response_mask), dim=-1)
+
+        response_labels = torch.where(
+            response_mask.bool(),
+            response_token_ids,
+            torch.full_like(response_token_ids, IGNORE_INDEX),
+        )
+        prompt_labels = torch.full_like(prompt_input_ids, IGNORE_INDEX)
+        labels = torch.cat((prompt_labels, response_labels), dim=-1)
+        return full_input_ids, full_attention_mask, labels
+
+    def _forward_teacher_forcing_multimodal(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        pixel_values: torch.Tensor,
+        output_hidden_states: bool,
+    ) -> tuple[Any, torch.Tensor]:
+        prompts_for_update = [
+            [NAVIGATION_IDENTIFIER] for _ in range(input_ids.shape[0])
+        ]
+        _, _, _, _, prepared_labels = self.model.prepare_inputs_labels_for_multimodal(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            labels=labels,
+            images=pixel_values,
+            prompts=prompts_for_update,
+        )
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            images=pixel_values,
+            prompts=prompts_for_update,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+        return outputs, prepared_labels
+
+    def _compact_valid_token_tensor(
+        self,
+        *,
+        values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        target_length: int,
+    ) -> torch.Tensor:
+        compacted = values.new_zeros((values.shape[0], target_length))
+        for batch_idx in range(values.shape[0]):
+            valid_values = values[batch_idx][valid_mask[batch_idx]]
+            valid_len = min(int(valid_values.shape[0]), target_length)
+            if valid_len > 0:
+                compacted[batch_idx, :valid_len] = valid_values[:valid_len]
+        return compacted
+
     def _get_generation_params(self, **kwargs: Any) -> dict[str, Any]:
         do_sample = kwargs.get("do_sample", "True")
         temperature = float(kwargs.get("temperature", 0.2))
-        max_new_tokens = int(kwargs.get("max_new_tokens", 1024))
+        max_new_tokens = int(kwargs.get("max_new_tokens", 1024) or 1024)
         return {
             "do_sample": bool(do_sample),
             "temperature": temperature,
@@ -358,7 +654,7 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             input_id_list.append(input_ids_single)
 
         bsz = len(input_id_list)
-        max_len = max(int(x.shape[1]) for x in input_id_list)
+        max_len = self.max_prompt_length
         pad_id = int(self.tokenizer.pad_token_id or 0)
 
         input_ids = torch.full(
@@ -367,8 +663,8 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         attention_mask = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
 
         for i, ids in enumerate(input_id_list):
-            seq_len = ids.shape[1]
-            input_ids[i, -seq_len:] = ids[0]
+            seq_len = min(ids.shape[1], max_len)
+            input_ids[i, -seq_len:] = ids[0, :seq_len]
             attention_mask[i, -seq_len:] = 1
 
         return input_ids, attention_mask
@@ -450,7 +746,7 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         images_for_model: list[torch.Tensor],
         stopping_criteria,
         gen_params: dict[str, Any],
-    ) -> torch.Tensor:
+    ) -> Any:
         prompts_for_update = [[q] for q in questions]
         with torch.inference_mode():
             self.model.update_prompt(prompts_for_update)
@@ -463,17 +759,20 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
                 max_new_tokens=gen_params["max_new_tokens"],
                 use_cache=True,
                 stopping_criteria=[stopping_criteria],
+                return_dict_in_generate=True,
+                output_scores=True,
+                output_hidden_states=True,
             )
 
     def _decode_generated_texts(
         self,
         *,
-        outputs: torch.Tensor,
+        outputs: Any,
         input_token_len: int,
         stop_str: str,
     ) -> list[str]:
         gen_texts = self.tokenizer.batch_decode(
-            outputs[:, input_token_len:], skip_special_tokens=True
+            outputs.sequences[:, input_token_len:], skip_special_tokens=True
         )
         return [
             text[: -len(stop_str)].strip() if text.endswith(stop_str) else text.strip()
