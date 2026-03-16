@@ -16,11 +16,11 @@ cluster:
   num_nodes: 1
   component_placement:
     actor:
-      placement: 3
+      placement: 6
     rollout:
-      placement: 2
+      placement: 5
     env:
-      placement: 2
+      placement: 5
     # actor,env,rollout: 0
 
 runner:
@@ -72,7 +72,7 @@ algorithm:
 
   sampling_params:
     do_sample: True
-    temperature_train: 1.0
+    temperature_train: 0.2
     temperature_eval: 0.2
     top_k: -1
     top_p: 1.0
@@ -100,7 +100,7 @@ env:
     ignore_terminations: True
     video_cfg:
       fps: 5
-      save_video: True
+      save_video: False
       video_base_dir: ${runner.logger.log_path}/video/train
     metrics_cfg:
       save_metrics: True
@@ -127,7 +127,7 @@ env:
 rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
-  enable_offload: True
+  enable_offload: False
   pipeline_stage_num: 1
 
   model:
@@ -140,7 +140,7 @@ actor:
   micro_batch_size: 1
   global_batch_size: 4
   seed: 1234
-  enable_offload: True
+  enable_offload: False
 
   # Override the default values in model/navid
   model:
@@ -161,7 +161,6 @@ actor:
   # Override the default values in training_backend/fsdp
   fsdp_config:
     strategy: "fsdp"
-    use_orig_params: True
     gradient_checkpointing: False
     cpu_offload: True
     mixed_precision:

@@ -55,6 +55,12 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
     A thin wrapper around NaVid (LLaVA-style) model to fit RLinf embodied policy interface.
     """
 
+    _NAVID_FSDP_WRAP_NAMES = (
+        "navid_vision_tower",
+        "navid_mm_projector",
+        "navid_lm_head",
+    )
+
     def __init__(
         self,
         *,
@@ -89,6 +95,52 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
                 activation="relu",
                 bias_last=False,
             )
+
+        self._initialize_fsdp_wrap_metadata()
+
+    @property
+    def _no_split_modules(self) -> list[str] | None:
+        no_split_modules = getattr(self.model, "_no_split_modules", None)
+        if no_split_modules is None:
+            inner_model = getattr(self.model, "model", None)
+            no_split_modules = getattr(inner_model, "_no_split_modules", None)
+        if no_split_modules is None:
+            return None
+        return list(no_split_modules)
+
+    @property
+    def _no_split_names(self) -> list[str]:
+        return list(self._NAVID_FSDP_WRAP_NAMES)
+
+    def _initialize_fsdp_wrap_metadata(self) -> None:
+        llm_backbone = getattr(self.model, "model", None)
+        if llm_backbone is None:
+            return
+
+        self._set_fsdp_wrap_name(
+            self._resolve_module(getattr(llm_backbone, "vision_tower", None)),
+            "navid_vision_tower",
+        )
+        self._set_fsdp_wrap_name(
+            self._resolve_module(getattr(llm_backbone, "mm_projector", None)),
+            "navid_mm_projector",
+        )
+        self._set_fsdp_wrap_name(getattr(self.model, "lm_head", None), "navid_lm_head")
+
+    @staticmethod
+    def _resolve_module(module: Any) -> nn.Module | None:
+        if isinstance(module, nn.Module):
+            return module
+        if isinstance(module, (list, tuple)) and module:
+            first_module = module[0]
+            if isinstance(first_module, nn.Module):
+                return first_module
+        return None
+
+    @staticmethod
+    def _set_fsdp_wrap_name(module: nn.Module | None, wrap_name: str) -> None:
+        if module is not None:
+            module._fsdp_wrap_name = wrap_name
 
     @classmethod
     def from_pretrained(
