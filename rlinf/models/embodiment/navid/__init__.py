@@ -28,6 +28,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         torch_dtype=torch_dtype,
         action_dim=int(cfg.action_dim),
         num_action_chunks=int(cfg.num_action_chunks),
-        max_history_len=getattr(cfg, "max_history_len", None),
+        add_value_head=bool(cfg.get("add_value_head", False)),
+        max_prompt_length=int(cfg.get("max_prompt_length", 1024)),
+        max_history_len=cfg.get("max_history_len", None),
     )
     return model

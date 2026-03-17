@@ -168,12 +168,9 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             load_4bit=False,
             device_map=None,
         )
-        if torch_dtype is not None:
-            model.to(torch_dtype)
-
         hidden_size = int(getattr(model.config, "hidden_size", hidden_size))
 
-        return cls(
+        policy = cls(
             tokenizer=tokenizer,
             model=model,
             image_processor=image_processor,
@@ -184,6 +181,11 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             max_prompt_length=max_prompt_length,
             max_history_len=max_history_len,
         )
+
+        if torch_dtype is not None:
+            policy.to(torch_dtype)
+
+        return policy
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
@@ -261,11 +263,9 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
             and outputs.hidden_states is not None
         ):
             shift_hidden_states = outputs.hidden_states[-1][..., :-1, :].contiguous()
-            token_values = self.value_head(shift_hidden_states)[..., 0]
-            values = self._compact_valid_token_tensor(
-                values=token_values,
+            values = self._compute_response_level_values_from_shift_hidden_states(
+                shift_hidden_states=shift_hidden_states,
                 valid_mask=valid_mask,
-                target_length=response_token_ids.shape[1],
             )
 
         return {
@@ -363,11 +363,10 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         chunk_actions = self._parse_actions_from_texts(gen_texts=gen_texts)
 
         if hasattr(self, "value_head") and outputs.hidden_states is not None:
-            token_hidden_states = outputs.hidden_states[0]
-            last_layer_hidden = token_hidden_states[-1]
-            prompt_last_hidden = last_layer_hidden[:, -1, :]
-            prev_values = self.value_head(prompt_last_hidden).expand(
-                -1, self.num_action_chunks
+            prev_values = (
+                self._compute_response_level_values_from_generation_hidden_states(
+                    generation_hidden_states=outputs.hidden_states,
+                )
             )
         else:
             prev_values = None
@@ -413,6 +412,34 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
 
     def _get_device(self) -> torch.device:
         return next(self.model.parameters()).device
+
+    def _compute_response_level_values_from_generation_hidden_states(
+        self,
+        *,
+        generation_hidden_states: Any,
+    ) -> torch.Tensor:
+        token_hidden_states = generation_hidden_states[0]
+        last_layer_hidden = token_hidden_states[-1]
+        prompt_last_hidden = last_layer_hidden[:, -1, :]
+        return self.value_head(prompt_last_hidden)
+
+    def _compute_response_level_values_from_shift_hidden_states(
+        self,
+        *,
+        shift_hidden_states: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if not valid_mask.any(dim=-1).all().item():
+            raise ValueError(
+                "NaVid PPO response-level value requires at least one valid response token per sample."
+            )
+
+        first_valid_indices = valid_mask.long().argmax(dim=-1)
+        batch_indices = torch.arange(
+            shift_hidden_states.shape[0], device=shift_hidden_states.device
+        )
+        prompt_hidden_states = shift_hidden_states[batch_indices, first_valid_indices]
+        return self.value_head(prompt_hidden_states)
 
     def _build_response_mask(self, generated_token_ids: torch.Tensor) -> torch.Tensor:
         pad_token_id = self.tokenizer.pad_token_id
