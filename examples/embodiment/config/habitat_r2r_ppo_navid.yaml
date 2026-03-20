@@ -89,7 +89,6 @@ algorithm:
 
 env:
   group_name: "EnvGroup"
-  enable_offload: False
   
   # Override the default values in env/habitat_r2r
   train:
@@ -97,6 +96,7 @@ env:
     max_episode_steps: 12 # max episode steps for truncation
     max_steps_per_rollout_epoch: 12
     auto_reset: True
+    enable_offload: False  # Requires env.train.auto_reset=False
     ignore_terminations: True
     video_cfg:
       fps: 5
@@ -112,6 +112,7 @@ env:
     max_episode_steps: 40
     max_steps_per_rollout_epoch: 6402
     auto_reset: True
+    enable_offload: False
     ignore_terminations: True
     group_size: 1
     video_cfg:

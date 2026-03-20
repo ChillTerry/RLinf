@@ -69,6 +69,8 @@ class HabitatEnv(gym.Env):
         self.ignore_terminations = cfg.ignore_terminations
         self.dones_once = np.zeros(self.num_envs, dtype=bool)
         self.record_first_done_infos = None
+        self._cached_env_fn_params = None
+        self._is_offloaded = False
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -100,6 +102,8 @@ class HabitatEnv(gym.Env):
         self._is_start = value
 
     def chunk_step(self, chunk_actions):
+        self._raise_if_offloaded()
+
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         obs_list = []
@@ -167,6 +171,8 @@ class HabitatEnv(gym.Env):
 
     def step(self, actions=None):
         """Step the environment with the given actions."""
+        self._raise_if_offloaded()
+
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
         self._elapsed_steps += 1
@@ -240,12 +246,26 @@ class HabitatEnv(gym.Env):
         self,
         env_idx: Optional[Union[int, list[int], np.ndarray]] = None,
     ):
-        if env_idx is None:
-            env_idx = np.arange(self.num_envs)
+        was_offloaded = self._is_offloaded
+        if self._is_offloaded:
+            self.onload()
 
-        raw_obs = self.env.reset(env_idx)
-        self._elapsed_steps[env_idx] = 0
-        self.dones_once[env_idx] = False
+        full_env_idx = np.arange(self.num_envs)
+        if env_idx is None:
+            env_indices = full_env_idx
+        else:
+            env_indices = np.atleast_1d(np.asarray(env_idx))
+
+        if (
+            was_offloaded
+            and self.current_raw_obs is None
+            and not np.array_equal(env_indices, full_env_idx)
+        ):
+            self.current_raw_obs = list(self.env.reset(full_env_idx))
+
+        raw_obs = self.env.reset(env_indices)
+        self._elapsed_steps[env_indices] = 0
+        self.dones_once[env_indices] = False
         if (
             self.record_first_done_infos is not None
             and "episode" in self.record_first_done_infos
@@ -253,7 +273,7 @@ class HabitatEnv(gym.Env):
             episode = self.record_first_done_infos["episode"]
             device = next(iter(episode.values())).device
             mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
-            mask[env_idx] = True
+            mask[env_indices] = True
             for v in episode.values():
                 v[mask] = 0
         infos = {}
@@ -261,7 +281,7 @@ class HabitatEnv(gym.Env):
         if self.current_raw_obs is None:
             self.current_raw_obs = [None] * self.num_envs
 
-        for i, idx in enumerate(env_idx):
+        for i, idx in enumerate(env_indices):
             self.current_raw_obs[idx] = raw_obs[i]
         obs = self._wrap_obs(self.current_raw_obs)
 
@@ -270,6 +290,9 @@ class HabitatEnv(gym.Env):
     def flush_video(
         self, video_sub_dir: Optional[str] = None, dones: Optional[np.ndarray] = None
     ):
+        if self._is_offloaded:
+            return
+
         output_dir = self.video_cfg.video_base_dir
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
@@ -290,8 +313,42 @@ class HabitatEnv(gym.Env):
                 )
                 self.render_images[video_name] = []
 
+    def close(self):
+        env = getattr(self, "env", None)
+        if hasattr(self, "env"):
+            del self.env
+        if env is not None:
+            env.close()
+
+    def offload(self):
+        """Tear down subprocess env state at offload boundaries."""
+        if getattr(self, "_is_offloaded", False):
+            return
+
+        self.close()
+        self.current_raw_obs = None
+        self.render_images = {}
+        self.record_first_done_infos = None
+        self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.prev_step_reward = np.zeros(self.num_envs)
+        self.dones_once = np.zeros(self.num_envs, dtype=bool)
+        self.initial_distance_to_goal = np.zeros(self.num_envs)
+        self._is_offloaded = True
+
+    def onload(self):
+        """Rebuild subprocess env state after an offload."""
+        if not self._is_offloaded:
+            return
+
+        self._init_env()
+        self.env_config = self.env.get_env_attr("config")[0]
+
     def update_reset_state_ids(self):
         pass
+
+    def _raise_if_offloaded(self):
+        if self._is_offloaded:
+            raise RuntimeError("HabitatEnv is offloaded. Call reset() before stepping.")
 
     def _normalize_depth(self, actions, raw_obs):
         """Normalize depth for envs whose action is 'no_op', following
@@ -456,11 +513,16 @@ class HabitatEnv(gym.Env):
                     json.dump(metrics_dict, f, indent=2, ensure_ascii=False)
 
     def _init_env(self):
+        self.close()
         env_fns = self._get_env_fns()
         self.env = ReconfigureSubprocEnv(env_fns)
+        self._is_offloaded = False
 
     def _get_env_fns(self):
-        env_fn_params = self._get_env_fn_params()
+        if self._cached_env_fn_params is None:
+            self._cached_env_fn_params = self._get_env_fn_params()
+
+        env_fn_params = copy.deepcopy(self._cached_env_fn_params)
         env_fns = []
 
         for param in env_fn_params:

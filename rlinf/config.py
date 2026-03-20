@@ -878,6 +878,25 @@ def validate_embodied_cfg(cfg):
                 omnigibson_cfg.robots[0].obs_modalities = ["rgb", "depth", "proprio"]
             cfg.env.train.omnigibson_cfg = omnigibson_cfg
             cfg.env.eval.omnigibson_cfg = omnigibson_cfg
+        elif (
+            SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.HABITAT
+            or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.HABITAT
+        ):
+            assert not (
+                cfg.env.train.get("enable_offload", False)
+                and cfg.env.train.get("auto_reset", False)
+            ), (
+                "Habitat requires env.train.enable_offload to be used only with "
+                "env.train.auto_reset=False."
+            )
+            assert not (
+                cfg.env.get("enable_offload", False)
+                and not cfg.env.train.get("enable_offload", False)
+                and not cfg.env.eval.get("enable_offload", False)
+            ), (
+                "Habitat does not consume top-level env.enable_offload; set "
+                "env.train.enable_offload or env.eval.enable_offload instead."
+            )
 
     return cfg
 
