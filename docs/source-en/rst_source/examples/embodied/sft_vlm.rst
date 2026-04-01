@@ -23,6 +23,8 @@ Launch Script: ``examples/sft/run_vlm_sft.sh``
 
 Config Template: ``examples/sft/config/qwen2_5_sft_vlm.yaml``
 
+If you intend to train models such as **qwen3_vl** or **qwen3_vl_moe**, please ensure that the version of `transformers` in your current environment is **greater than or equal to 4.57.1**.
+
 The VLM config structure is similar to other RLinf training configs.  
 You mainly need to adapt ``data`` and ``actor.model`` for your VLM use case.
 
@@ -30,7 +32,7 @@ Preparation Before Running
 --------------------------
 
 1. Prepare the environment. Pull the RLinf Docker image:
-   ``rlinf/rlinf:math-rlinf0.1-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1``.
+   ``rlinf/rlinf:math-rlinf0.2-torch2.6.0-sglang0.4.6.post5-vllm0.8.5-megatron0.13.0-te2.1``.
 2. Prepare model weights:
    ``https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct``.
 3. Prepare Robo2VLM dataset:
@@ -38,7 +40,7 @@ Preparation Before Running
 4. Edit ``examples/sft/config/qwen2_5_sft_vlm.yaml`` and run
    ``examples/sft/run_vlm_sft.sh``.
 
-Example of Qwen2_5_VL_4B SFT
+Example of Qwen2_5_VL_3B SFT
 ----------------------------
 
 Important note: after downloading Robo2VLM, train and eval parquet files are mixed in one directory

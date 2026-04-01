@@ -96,6 +96,14 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
                 bias_last=False,
             )
 
+        self.action_map = {
+            "stop": 0,
+            "move_forward": 1,
+            "turn_left": 2,
+            "turn_right": 3,
+            "no_op": 4,
+        }
+
         self._initialize_fsdp_wrap_metadata()
 
     @property
@@ -361,6 +369,7 @@ class NaVidForRLActionPrediction(nn.Module, BasePolicy):
         )
 
         chunk_actions = self._parse_actions_from_texts(gen_texts=gen_texts)
+        chunk_actions = np.vectorize(lambda x: self.action_map[x])(chunk_actions)
 
         if hasattr(self, "value_head") and outputs.hidden_states is not None:
             prev_values = (

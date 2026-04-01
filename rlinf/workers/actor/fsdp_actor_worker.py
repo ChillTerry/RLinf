@@ -1058,7 +1058,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return model
 
-    def sync_model_to_rollout(self) -> None:
+    async def sync_model_to_rollout(self) -> None:
         """
         Sync the model's full state dict to the rollout worker.
         """
@@ -1069,14 +1069,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_param_and_grad(self.device)
 
         state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        handles = []
         for rank in self._weight_dst_rank_in_rollout:
-            self.send(
-                state_dict,
-                self._rollout_group_name,
-                rank,
-                async_op=True,
-                options=self._sync_weight_comm_options,
+            handles.append(
+                self.send(
+                    state_dict,
+                    self._rollout_group_name,
+                    rank,
+                    async_op=True,
+                    options=self._sync_weight_comm_options,
+                )
             )
+        for handle in handles:
+            await handle.async_wait()
         if self.enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
 
@@ -1087,7 +1092,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Args:
             input_channel: The input channel to read from.
         """
-        send_num = self._component_placement.get_world_size("rollout") * self.stage_num
+        clear_memory(sync=False)
+
+        send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")
         split_num = compute_split_num(send_num, recv_num)
 
@@ -1222,7 +1229,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             training_config_name = self.cfg.actor.config_name
             data_loader_config = get_openpi_config(
-                training_config_name, model_path=self.cfg.actor.model.model_path
+                training_config_name,
+                model_path=self.cfg.actor.model.model_path,
+                data_kwargs=getattr(self.cfg.actor, "openpi_data", None),
             )
             self.data_loader = _data.create_data_loader(
                 data_loader_config, framework="pytorch", shuffle=True
