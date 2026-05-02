@@ -1,0 +1,70 @@
+defaults:
+  - model/uninavid@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-0
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "uninavid_stage_1_sft"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: -1
+  max_steps: 8000
+  val_check_interval: -1
+  save_interval: 8000
+
+data:
+  train_data_paths: "VLN-CE/Uni-NaVid-Data/Nav-Finetune/open_uninavid_sampled_500.json"
+  image_folder: "VLN-CE/Uni-NaVid-Data/Nav-Finetune"
+  video_folder: "VLN-CE/Uni-NaVid-Data/Nav-Finetune"
+  lazy_preprocess: true
+  num_workers: 4
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 16
+  seed: 42
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.0
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: -1
+    lr_warmup_steps_ratio: 0.03
+    total_training_steps: ${runner.max_steps}
+
+  fsdp_config:
+    gradient_checkpointing: true
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: bf16
+      buffer_dtype: bf16
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
