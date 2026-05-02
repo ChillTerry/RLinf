@@ -66,6 +66,16 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_dreamzero_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
+        elif SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.UNINAVID
+        ]:
+            from rlinf.models.embodiment.uninavid.train.data import (
+                build_uninavid_sft_dataloader,
+            )
+
+            return build_uninavid_sft_dataloader(
+                self.cfg, self._world_size, self._rank, data_paths, eval_dataset
+            )
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
@@ -79,15 +89,18 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.LINGBOTVLA,
             SupportedModel.DREAMZERO,
+            SupportedModel.UNINAVID,
         ]:
             with self.amp_context:
-                losses_dict = self.model(forward_type=ForwardType.SFT, data=batch)
-            if losses_dict.get("dynamics_loss", None) is not None:
-                self._dreamzero_loss = {
-                    "dynamics_loss": losses_dict["dynamics_loss"],
-                    "action_loss": losses_dict["action_loss"],
-                }
-            return losses_dict["loss"]
+                losses = self.model(forward_type=ForwardType.SFT, data=batch)
+            if isinstance(losses, dict):
+                if losses.get("dynamics_loss", None) is not None:
+                    self._dreamzero_loss = {
+                        "dynamics_loss": losses["dynamics_loss"],
+                        "action_loss": losses["action_loss"],
+                    }
+                return losses["loss"]
+            return losses
         observation, actions = batch
 
         register_pytree_dataclasses(observation)
