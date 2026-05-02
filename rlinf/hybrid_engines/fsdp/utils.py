@@ -483,9 +483,25 @@ def get_lr_scheduler(
 
         return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
     elif lr_scheduler == "cosine":
-        from transformers.optimization import (
-            get_cosine_with_min_lr_schedule_with_warmup,
-        )
+        try:
+            from transformers.optimization import (
+                get_cosine_with_min_lr_schedule_with_warmup,
+            )
+        except ImportError as exc:
+            if min_lr not in (None, 0.0) or min_lr_rate is not None:
+                raise ImportError(
+                    "`min_lr` and `min_lr_rate` for cosine scheduling require "
+                    "`transformers.optimization.get_cosine_with_min_lr_schedule_with_warmup`."
+                ) from exc
+            from transformers.optimization import get_cosine_schedule_with_warmup
+
+            return get_cosine_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps,
+                num_cycles=num_cycles,
+                last_epoch=last_epoch,
+            )
 
         return get_cosine_with_min_lr_schedule_with_warmup(
             optimizer=optimizer,

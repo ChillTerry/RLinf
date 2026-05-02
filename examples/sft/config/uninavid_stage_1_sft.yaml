@@ -26,6 +26,7 @@ runner:
   max_steps: 8000
   val_check_interval: -1
   save_interval: 8000
+  resume_dir: null
 
 data:
   train_data_paths: "VLN-CE/Uni-NaVid-Data/Nav-Finetune/open_uninavid_sampled_500.json"
