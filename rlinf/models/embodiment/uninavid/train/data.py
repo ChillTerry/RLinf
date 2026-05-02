@@ -31,8 +31,17 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from rlinf.models.embodiment.uninavid.constants import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IMAGE_PATCH_TOKEN,
     DEFAULT_IMAGE_TOKEN,
+    IAMGE_SEPARATOR,
     IGNORE_INDEX,
+    IMAGE_END_TOKEN,
+    IMAGE_START_TOKEN,
+    NAVIGATION_SPECIAL_TOKEN,
+    VIDEO_END_SPECIAL_TOKEN,
+    VIDEO_START_SPECIAL_TOKEN,
 )
 from rlinf.models.embodiment.uninavid.train.preprocess import (
     preprocess,
@@ -63,6 +72,33 @@ def _load_decord_for_raw_video():
             "Install decord or use precomputed .pkl video features."
         ) from exc
     return decord.VideoReader, decord.cpu
+
+
+def _cfg_bool(cfg, name, default=False):
+    if hasattr(cfg, "get"):
+        return bool(cfg.get(name, default))
+    return bool(getattr(cfg, name, default))
+
+
+def add_uninavid_special_tokens(tokenizer, model_cfg):
+    tokenizer.add_tokens(
+        [
+            VIDEO_START_SPECIAL_TOKEN,
+            VIDEO_END_SPECIAL_TOKEN,
+            IMAGE_START_TOKEN,
+            IMAGE_END_TOKEN,
+            NAVIGATION_SPECIAL_TOKEN,
+            IAMGE_SEPARATOR,
+        ],
+        special_tokens=True,
+    )
+    if _cfg_bool(model_cfg, "mm_use_im_patch_token"):
+        tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+
+    if _cfg_bool(model_cfg, "mm_use_im_start_end"):
+        tokenizer.add_tokens(
+            [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
+        )
 
 
 def duplicate_with_probability(lst, n):
@@ -437,6 +473,7 @@ def build_uninavid_sft_dataloader(
         use_fast=False,
     )
     tokenizer.pad_token = tokenizer.unk_token
+    add_uninavid_special_tokens(tokenizer, model_cfg)
     image_processor = CLIPImageProcessor.from_pretrained(model_cfg.image_processor)
 
     from rlinf.models.embodiment.uninavid import conversation as conversation_lib

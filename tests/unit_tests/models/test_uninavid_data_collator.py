@@ -18,11 +18,23 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from rlinf.models.embodiment.uninavid.constants import IGNORE_INDEX
+from rlinf.models.embodiment.uninavid.constants import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IMAGE_PATCH_TOKEN,
+    IAMGE_SEPARATOR,
+    IGNORE_INDEX,
+    IMAGE_END_TOKEN,
+    IMAGE_START_TOKEN,
+    NAVIGATION_SPECIAL_TOKEN,
+    VIDEO_END_SPECIAL_TOKEN,
+    VIDEO_START_SPECIAL_TOKEN,
+)
 from rlinf.models.embodiment.uninavid.train.data import (
     DataCollatorForSupervisedDataset,
     _load_decord_for_raw_video,
     _resolve_data_path,
+    add_uninavid_special_tokens,
 )
 
 
@@ -117,3 +129,56 @@ def test_missing_decord_error_mentions_raw_video_loading(monkeypatch):
 
     with pytest.raises(ModuleNotFoundError, match="decord.*raw video loading"):
         _load_decord_for_raw_video()
+
+
+class FakeTokenizer:
+    def __init__(self):
+        self.calls = []
+
+    def add_tokens(self, tokens, special_tokens=False):
+        self.calls.append((list(tokens), special_tokens))
+        return len(tokens)
+
+
+def test_add_uninavid_special_tokens_adds_base_tokens_by_default():
+    tokenizer = FakeTokenizer()
+    cfg = SimpleNamespace(mm_use_im_patch_token=False, mm_use_im_start_end=False)
+
+    add_uninavid_special_tokens(tokenizer, cfg)
+
+    assert tokenizer.calls == [
+        (
+            [
+                VIDEO_START_SPECIAL_TOKEN,
+                VIDEO_END_SPECIAL_TOKEN,
+                IMAGE_START_TOKEN,
+                IMAGE_END_TOKEN,
+                NAVIGATION_SPECIAL_TOKEN,
+                IAMGE_SEPARATOR,
+            ],
+            True,
+        )
+    ]
+
+
+def test_add_uninavid_special_tokens_honors_image_token_flags():
+    tokenizer = FakeTokenizer()
+    cfg = SimpleNamespace(mm_use_im_patch_token=True, mm_use_im_start_end=True)
+
+    add_uninavid_special_tokens(tokenizer, cfg)
+
+    assert tokenizer.calls == [
+        (
+            [
+                VIDEO_START_SPECIAL_TOKEN,
+                VIDEO_END_SPECIAL_TOKEN,
+                IMAGE_START_TOKEN,
+                IMAGE_END_TOKEN,
+                NAVIGATION_SPECIAL_TOKEN,
+                IAMGE_SEPARATOR,
+            ],
+            True,
+        ),
+        ([DEFAULT_IMAGE_PATCH_TOKEN], True),
+        ([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], True),
+    ]
