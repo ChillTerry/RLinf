@@ -99,6 +99,7 @@ SupportedModel.LINGBOTVLA = SupportedModel.register("lingbotvla", force=True)
 SupportedModel.RESNET_REWARD = SupportedModel.register("resnet", force=True)
 SupportedModel.CFG_MODEL = SupportedModel.register("cfg_model", force=True)
 SupportedModel.VALUE_MODEL = SupportedModel.register("value_model", force=True)
+SupportedModel.UNINAVID = SupportedModel.register("uninavid", force=True)
 
 SupportedModel.QWEN2_5_VL_SFT = SupportedModel.register("qwen2.5_vl", force=True)
 SupportedModel.QWEN3_VL_SFT = SupportedModel.register("qwen3_vl", force=True)
@@ -122,6 +123,7 @@ EMBODIED_MODEL = set(
         SupportedModel.RESNET_REWARD,
         SupportedModel.CFG_MODEL,
         SupportedModel.VALUE_MODEL,
+        SupportedModel.UNINAVID,
     }
 )
 
