@@ -7,8 +7,8 @@ Date: 2026-05-03
 Add first-class RLinf rollout and evaluation support for UniNaVid in the Habitat
 VLN environment. The first implementation stage targets evaluation and rollout,
 not PPO post-training. The default fast path should support batched Habitat
-environments while preserving UniNaVid navigation memory semantics closely enough
-that batched success and SPL are close to the original UniNaVid eval script.
+environments while preserving UniNaVid navigation memory semantics and meeting
+the success/SPL tolerance defined in the success criteria.
 
 ## Assumptions
 
@@ -25,15 +25,22 @@ that batched success and SPL are close to the original UniNaVid eval script.
 ## Success Criteria
 
 - `sequential_cache` mode runs UniNaVid inside RLinf Habitat with one environment
-  and produces behavior close to the original UniNaVid eval script.
+  and reproduces the original UniNaVid eval inputs for each evaluated step:
+  identical navigation prompt text, identical current RGB frame after the same
+  image preprocessing path, and identical historical frame token sequence before
+  generation.
 - `sequential_cache` mode runs with multiple Habitat env slots without navigation
   history leaking between slots or episodes.
 - `batched_feature_cache` mode runs as the default multi-env evaluation path.
-- `batched_feature_cache` success and SPL are close to the original UniNaVid eval
-  script on the same checkpoint, split, seed policy, and sampling settings.
-  The initial acceptance tolerance is within 5 absolute percentage points for
-  success and SPL after evaluating the same episode set; this can be tightened
-  after measuring baseline sampling variance.
+- `sequential_cache` and `batched_feature_cache` are both evaluated against the
+  original UniNaVid eval script on the same checkpoint, split, seed policy, and
+  sampling settings. Each comparison must use at least 20 episodes from the same
+  episode set; single-episode comparisons are allowed only as smoke tests and do
+  not satisfy acceptance.
+- `sequential_cache` and `batched_feature_cache` success and SPL must each be
+  within 5 absolute percentage points of the original UniNaVid eval script on the
+  evaluated episode set. This tolerance applies independently to success and SPL
+  for each rollout mode.
 - Unit tests cover cache reset, slot isolation, action parsing, and action tensor
   shape.
 
@@ -170,8 +177,9 @@ Supported values:
 
 ### sequential_cache
 
-This mode preserves the original UniNaVid online eval semantics as closely as
-possible. It processes each batch slot one at a time:
+This mode preserves the original UniNaVid online eval path by reusing upstream
+generation with an explicit per-slot cache swap. It processes each batch slot
+one at a time:
 
 ```python
 for slot_id in range(batch_size):
@@ -260,10 +268,14 @@ deterministic ablations and performance experiments.
    UniNaVid generation path.
 3. Add a Habitat UniNaVid eval config using `rollout.backend: huggingface`,
    `actor.model.model_type: uninavid`, and `actor.model.num_action_chunks: 4`.
-4. Validate single-env parity against the original UniNaVid eval script.
+4. Validate single-env parity against the original UniNaVid eval script by
+   comparing prompt text, current RGB tensors, historical frame token sequence,
+   success, and SPL on at least 20 shared episodes.
 5. Implement `batched_feature_cache` by extracting minimal navigation cache
    helpers from UniNaVid internals.
-6. Validate multi-env cache isolation and batched success/SPL.
+6. Validate multi-env cache isolation and compare `batched_feature_cache`
+   success/SPL against the original UniNaVid eval script on at least 20 shared
+   episodes.
 
 ## Tests
 
@@ -293,7 +305,8 @@ manual GPU/Habitat check if assets are not available.
 
 - Batched generation may not exactly match single-env generation because of
   numerical and sampling differences. The accepted metric is success/SPL
-  closeness, not token-level identity.
+  within the stated 5 percentage point tolerance, not generated action token
+  identity.
 - UniNaVid internal cache logic is currently coupled to model global fields.
   `sequential_cache` provides a parity baseline before introducing the fast path.
 - Reusing `env_obs["states"]` as episode id assumes Habitat keeps it stable within
