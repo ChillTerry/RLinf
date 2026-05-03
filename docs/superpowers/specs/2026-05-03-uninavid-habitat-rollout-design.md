@@ -41,6 +41,13 @@ the success/SPL tolerance defined in the success criteria.
   within 5 absolute percentage points of the original UniNaVid eval script on the
   evaluated episode set. This tolerance applies independently to success and SPL
   for each rollout mode.
+- Before every manual evaluation run, record all local GPU free memory and GPU
+  utilization. Select devices by highest idle GPU capacity first
+  (`100 - utilization`), then by highest free memory. If the selected devices do
+  not have enough memory, add more devices in the same priority order until the
+  run fits or all GPUs are selected. If all GPUs still OOM, reduce config-driven
+  memory pressure and record the final GPU ids and config overrides with the
+  results.
 - Unit tests cover cache reset, slot isolation, action parsing, and action tensor
   shape.
 
@@ -261,6 +268,41 @@ max_new_token: 1024
 The RLinf config should still allow these parameters to be overridden for
 deterministic ablations and performance experiments.
 
+## GPU Resource Selection and OOM Fallback
+
+Before running the original UniNaVid eval script, `sequential_cache`, or
+`batched_feature_cache`, inspect current GPU state with `nvidia-smi` or an
+equivalent NVML query. The scheduler or run script should capture at least:
+
+```text
+gpu_id
+memory.free
+memory.total
+utilization.gpu
+```
+
+Choose GPUs with this priority:
+
+1. Higher idle GPU capacity first, computed as `100 - utilization.gpu`.
+2. Higher free memory second.
+3. Stable ascending `gpu_id` as the final tie breaker.
+
+The first attempt should use the smallest device set expected to fit the
+selected mode. On OOM, expand the selected device set using the same priority
+order until either the run succeeds or all local GPUs are selected.
+
+If all GPUs are selected and the run still OOMs, reduce memory pressure through
+configuration rather than changing model semantics first. Preferred reductions:
+
+- lower `env.eval.total_num_envs` or `env.train.total_num_envs`;
+- lower per-rollout parallelism before changing sampling behavior;
+- enable existing offload options when available;
+- lower precision only if the checkpoint and model path support it.
+
+Do not change prompt text, image preprocessing, historical frame tokenization,
+or eval sampling parameters for acceptance runs unless the result is recorded as
+a separate non-comparable ablation.
+
 ## Implementation Plan
 
 1. Add cache and action parsing helpers to the UniNaVid wrapper.
@@ -271,9 +313,12 @@ deterministic ablations and performance experiments.
 4. Validate single-env parity against the original UniNaVid eval script by
    comparing prompt text, current RGB tensors, historical frame token sequence,
    success, and SPL on at least 20 shared episodes.
-5. Implement `batched_feature_cache` by extracting minimal navigation cache
+5. Add run-time GPU selection guidance or a helper script that records GPU free
+   memory/utilization, selects devices by idle capacity then free memory, and
+   documents any OOM-driven config reductions.
+6. Implement `batched_feature_cache` by extracting minimal navigation cache
    helpers from UniNaVid internals.
-6. Validate multi-env cache isolation and compare `batched_feature_cache`
+7. Validate multi-env cache isolation and compare `batched_feature_cache`
    success/SPL against the original UniNaVid eval script on at least 20 shared
    episodes.
 
@@ -315,6 +360,9 @@ manual GPU/Habitat check if assets are not available.
 - Long episodes can grow cache memory. The fast path should reuse UniNaVid's
   existing short/long memory compression semantics instead of storing raw RGB
   history indefinitely.
+- GPU availability can vary across shared servers. Runs should record selected
+  GPU ids, free memory, utilization, and any OOM fallback config changes so
+  success/SPL comparisons are reproducible.
 
 ## Future PPO Work
 
