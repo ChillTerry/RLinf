@@ -1,0 +1,73 @@
+# @package _global_
+
+defaults:
+  - /habitat: habitat_config_base
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 500
+
+  simulator:
+    forward_step_size: 0.25
+    turn_angle: 30
+    action_space_config: v0
+
+    habitat_sim_v0:
+      gpu_device_id: 0
+      allow_sliding: True
+
+    agents:
+      main_agent:
+        sim_sensors:
+          rgb_sensor:
+            type: HabitatSimRGBSensor
+            width: 640
+            height: 480
+            hfov: 120
+            position: [0.0, 1.25, 0.0]
+
+  task:
+    type: VLN-v0
+    success_distance: 3.0
+
+    instruction_sensor_uuid: instruction
+
+    sensors:
+      - instruction_sensor
+      - shortest_path_sensor
+      - vln_oracle_progress_sensor
+
+    actions:
+      stop:
+        type: StopAction
+      move_forward:
+        type: MoveForwardAction
+      turn_left:
+        type: TurnLeftAction
+      turn_right:
+        type: TurnRightAction
+
+    measurements:
+      top_down_map_vlnce:
+        type: TopDownMapVLNCE
+      distance_to_goal:
+        type: DistanceToGoal
+      success:
+        type: Success
+        success_distance: 3.0
+      spl:
+        type: SPL
+        success_distance: 3.0
+      path_length:
+        type: PathLength
+      oracle_success:
+        type: OracleSuccess
+      steps_taken:
+        type: StepsTaken
+
+  dataset:
+    type: VLN-CE-v1
+    split: None
+    scenes_dir: "/path/to/scene_dir"
+    data_path: "/path/to/data_path"
