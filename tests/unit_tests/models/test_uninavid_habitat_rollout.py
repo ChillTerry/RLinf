@@ -17,6 +17,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from rlinf.models.embodiment.uninavid.constants import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+)
 from rlinf.models.embodiment.uninavid.nav_rollout import (
     HABITAT_NAV_ACTION_TO_ID,
     NO_OP_ACTION_ID,
@@ -188,8 +192,10 @@ class FakeSequentialTokenizer:
     def __init__(self, texts):
         self.texts = texts
         self.bos_token_id = 1
+        self.tokenized_texts = []
 
     def __call__(self, text, return_tensors=None):
+        self.tokenized_texts.append(text)
         token_ids = [1] + [ord(ch) % 100 + 2 for ch in text]
         if return_tensors == "pt":
             token_ids = torch.tensor([token_ids], dtype=torch.long)
@@ -234,6 +240,28 @@ def test_uninavid_predict_action_batch_returns_habitat_chunk_shape():
     assert actions[1].squeeze(-1).tolist() == [3, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
     assert metadata == empty_rollout_metadata()
     assert len(model.generate_calls) == 2
+
+
+def test_uninavid_navigation_input_ids_include_image_start_end_tokens_when_enabled():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    model.config.mm_use_im_start_end = True
+    tokenizer = FakeSequentialTokenizer(model.generated_text)
+    policy = UniNaVidForActionPrediction(
+        tokenizer=tokenizer,
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(rollout_mode="sequential_cache", num_action_chunks=4)
+
+    policy._build_navigation_input_ids(build_navigation_prompt("go to room one"))
+
+    assert any(DEFAULT_IM_START_TOKEN in text for text in tokenizer.tokenized_texts)
+    assert any(DEFAULT_IM_END_TOKEN in text for text in tokenizer.tokenized_texts)
 
 
 def test_uninavid_sequential_cache_swaps_slot_state():

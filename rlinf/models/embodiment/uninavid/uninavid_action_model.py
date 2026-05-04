@@ -23,6 +23,8 @@ import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.uninavid.constants import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_TOKEN,
     IMAGE_TOKEN_INDEX,
 )
@@ -498,7 +500,16 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             VIDEO_START_SPECIAL_TOKEN,
         )
 
-        qs = DEFAULT_IMAGE_TOKEN + "\n" + navigation_prompt.replace("<image>", "")
+        if self.model.config.mm_use_im_start_end:
+            qs = (
+                DEFAULT_IM_START_TOKEN
+                + DEFAULT_IMAGE_TOKEN
+                + DEFAULT_IM_END_TOKEN
+                + "\n"
+                + navigation_prompt.replace("<image>", "")
+            )
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + "\n" + navigation_prompt.replace("<image>", "")
         conv_mode = self._cfg_get(
             getattr(self, "cfg", None),
             "conv_mode",
