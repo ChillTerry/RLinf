@@ -29,10 +29,8 @@ from habitat_baselines.config.default import get_config
 from hydra.core.global_hydra import GlobalHydra
 
 from rlinf.envs.habitat.extensions import measures
-from rlinf.envs.habitat.extensions.utils import (
-    observations_to_image,
-    vram_balance_episode_ids,
-)
+from rlinf.envs.habitat.extensions.allocator import vram_balance_episode_ids
+from rlinf.envs.habitat.extensions.utils import observations_to_image
 from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
@@ -109,6 +107,21 @@ class HabitatEnv(gym.Env):
     def is_start(self, value):
         self._is_start = value
 
+    def _habitat_model_type(self):
+        return getattr(self.cfg, "model_type", None)
+
+    def _attach_uninavid_chunk_history(self, obs_list):
+        if self._habitat_model_type() != "uninavid":
+            return
+        if not obs_list:
+            return
+        if any("wrist_images" not in obs for obs in obs_list):
+            return
+        obs_list[-1]["wrist_images_history"] = torch.stack(
+            [obs["wrist_images"] for obs in obs_list],
+            dim=1,
+        )
+
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_actions = np.vectorize(lambda x: self.action_map[x])(chunk_actions)
@@ -153,6 +166,8 @@ class HabitatEnv(gym.Env):
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+
+        self._attach_uninavid_chunk_history(obs_list)
 
         # [num_envs, chunk_steps]
         chunk_rewards = torch.stack(chunk_rewards, dim=1)
@@ -328,7 +343,7 @@ class HabitatEnv(gym.Env):
         if "depth" in image_tensor:
             depth_tensor = image_tensor["depth"].clone()
             obs["extra_view_images"] = depth_tensor.unsqueeze(1)  # [N_ENV, 1, H, W, C]
-        if self.cfg.model_type == "cma":
+        if self._habitat_model_type() == "cma":
             obs["task_descriptions"] = token_list
         else:
             obs["task_descriptions"] = task_descs
