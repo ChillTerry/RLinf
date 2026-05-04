@@ -19,7 +19,6 @@ import torch
 
 from rlinf.models.embodiment.uninavid.nav_rollout import (
     NO_OP_ACTION_ID,
-    UNINAVID_NAV_PROMPT_TEMPLATE,
     UniNaVidNavCache,
     build_navigation_prompt,
     empty_rollout_metadata,
@@ -88,8 +87,15 @@ def test_uninavid_action_parser_pads_unknown_and_after_stop():
 
 def test_uninavid_prompt_matches_original_template():
     prompt = build_navigation_prompt("Walk to the kitchen.")
+    expected_prompt = (
+        "Imagine you are a robot programmed for navigation tasks. You have been given "
+        "a video of historical observations and an image of the current observation "
+        "<image>. Your assigned task is: 'Walk to the kitchen.'. Analyze this series "
+        "of images to determine your next four actions. The predicted action should "
+        "be one of the following: forward, left, right, or stop."
+    )
 
-    assert prompt == UNINAVID_NAV_PROMPT_TEMPLATE.format("Walk to the kitchen.")
+    assert prompt == expected_prompt
 
 
 def test_uninavid_select_slot_rgb_frames_prefers_chunk_history():
