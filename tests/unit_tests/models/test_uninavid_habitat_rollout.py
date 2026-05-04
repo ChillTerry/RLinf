@@ -141,7 +141,7 @@ def test_uninavid_empty_rollout_metadata_has_no_training_terms():
     }
 
 
-def test_uninavid_debug_rollout_metadata_records_prompt_and_frames(monkeypatch):
+def test_uninavid_debug_rollout_metadata_records_prompt_and_frames():
     from rlinf.models.embodiment.uninavid.uninavid_action_model import (
         UniNaVidForActionPrediction,
     )
@@ -681,6 +681,48 @@ def test_uninavid_batched_feature_cache_real_helper_batches_and_updates_slots():
     assert model.backbone.long_feat_cache == "global-long-sentinel"
     assert model.backbone.weight == 99
     assert model.backbone.new_frames == 88
+
+
+def test_uninavid_batched_debug_rollout_metadata_records_prompt_and_frames():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeBatchedModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeBatchedTokenizer(),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(
+        rollout_mode="batched_feature_cache",
+        num_action_chunks=4,
+        record_rollout_debug=True,
+    )
+    env_obs = {
+        "wrist_images": torch.stack(
+            [
+                torch.zeros(4, 4, 3, dtype=torch.uint8),
+                torch.full((4, 4, 3), 20, dtype=torch.uint8),
+            ]
+        ),
+        "task_descriptions": ["go to room one", "go to room two"],
+        "states": torch.tensor([100, 200]),
+    }
+
+    actions, metadata = policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    assert actions.shape == (2, 4, 1)
+    assert actions[0].squeeze(-1).tolist() == [1, 3, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert actions[1].squeeze(-1).tolist() == [2, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert metadata["forward_inputs"] == {}
+    assert metadata["debug"]["prompts"] == [
+        build_navigation_prompt("go to room one"),
+        build_navigation_prompt("go to room two"),
+    ]
+    assert metadata["debug"]["episode_ids"] == [100, 200]
+    assert metadata["debug"]["new_frame_counts"] == [1, 1]
 
 
 def test_uninavid_batched_feature_cache_strictly_restores_absent_run_type():
