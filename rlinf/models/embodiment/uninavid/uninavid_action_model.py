@@ -470,6 +470,21 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             )
         )
 
+    def _record_rollout_debug(self) -> bool:
+        return bool(
+            self._cfg_get(
+                getattr(self, "cfg", None),
+                "record_rollout_debug",
+                default=False,
+            )
+        )
+
+    def _rollout_metadata(self, debug: dict[str, Any] | None = None) -> dict[str, Any]:
+        metadata = empty_rollout_metadata()
+        if self._record_rollout_debug() and debug is not None:
+            metadata["debug"] = debug
+        return metadata
+
     def _load_nav_cache_into_model(self, cache: UniNaVidNavCache) -> None:
         backbone = self.model.get_model()
         backbone.feat_cache = cache.feat_cache
@@ -625,6 +640,11 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
     def _predict_action_batch_sequential_cache(self, env_obs, **generation_kwargs):
         batch_size = len(env_obs["task_descriptions"])
         action_chunks = []
+        debug = {
+            "prompts": [],
+            "episode_ids": [],
+            "new_frame_counts": [],
+        }
 
         missing_run_type = object()
         original_run_type = getattr(self.model.config, "run_type", missing_run_type)
@@ -643,6 +663,9 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 navigation_prompt = build_navigation_prompt(instruction)
                 input_ids = self._build_navigation_input_ids(navigation_prompt)
                 rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
+                debug["prompts"].append(navigation_prompt)
+                debug["episode_ids"].append(episode_id)
+                debug["new_frame_counts"].append(len(rgb_frames))
                 self.model.get_model().new_frames = len(rgb_frames)
                 images = self._preprocess_navigation_images(rgb_frames)
                 self.model.update_prompt(
@@ -680,13 +703,25 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 self.model.config.run_type = original_run_type
 
         actions = torch.stack(action_chunks, dim=0)
-        return actions, empty_rollout_metadata()
+        return actions, self._rollout_metadata(debug)
 
     def _predict_action_batch_batched_feature_cache(self, env_obs, **generation_kwargs):
-        output_texts = self._generate_batched_navigation_texts(
-            env_obs,
-            generation_kwargs,
-        )
+        debug = {
+            "prompts": [],
+            "episode_ids": [],
+            "new_frame_counts": [],
+        }
+        if self._record_rollout_debug():
+            output_texts = self._generate_batched_navigation_texts(
+                env_obs,
+                generation_kwargs,
+                debug=debug,
+            )
+        else:
+            output_texts = self._generate_batched_navigation_texts(
+                env_obs,
+                generation_kwargs,
+            )
         actions = torch.stack(
             [
                 parse_uninavid_actions(output_text, self.num_action_chunks)
@@ -694,7 +729,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             ],
             dim=0,
         )
-        return actions, empty_rollout_metadata()
+        return actions, self._rollout_metadata(debug)
 
     def _nav_size(self) -> int:
         compress_type = getattr(self.model.config, "compress_type", None)
@@ -796,6 +831,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         self,
         env_obs,
         generation_kwargs: dict[str, Any],
+        *,
+        debug: dict[str, Any] | None = None,
     ) -> list[str]:
         batch_size = len(env_obs["task_descriptions"])
         prompts: list[str] = []
@@ -820,6 +857,10 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 input_ids = self._build_navigation_input_ids(navigation_prompt)[0]
 
                 rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
+                if debug is not None:
+                    debug["prompts"].append(navigation_prompt)
+                    debug["episode_ids"].append(episode_id)
+                    debug["new_frame_counts"].append(len(rgb_frames))
                 visual_features = self._encode_rgb_frames_for_slot(rgb_frames)
                 current_tokens = self._update_slot_feature_cache(
                     cache,

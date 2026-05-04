@@ -141,6 +141,37 @@ def test_uninavid_empty_rollout_metadata_has_no_training_terms():
     }
 
 
+def test_uninavid_debug_rollout_metadata_records_prompt_and_frames(monkeypatch):
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(
+        rollout_mode="sequential_cache",
+        num_action_chunks=4,
+        record_rollout_debug=True,
+    )
+    env_obs = {
+        "wrist_images": torch.zeros(1, 4, 4, 3, dtype=torch.uint8),
+        "task_descriptions": ["go to room one"],
+        "states": torch.tensor([100]),
+    }
+
+    _, metadata = policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    assert metadata["forward_inputs"] == {}
+    assert metadata["debug"]["prompts"] == [build_navigation_prompt("go to room one")]
+    assert metadata["debug"]["episode_ids"] == [100]
+    assert metadata["debug"]["new_frame_counts"] == [1]
+
+
 class FakeSequentialBackbone:
     def __init__(self):
         self.feat_cache = None
