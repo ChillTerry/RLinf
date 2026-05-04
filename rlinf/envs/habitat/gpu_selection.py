@@ -81,8 +81,8 @@ def choose_gpu_ids(
     return selected_ids
 
 
-def query_nvidia_smi() -> str:
-    return subprocess.check_output(
+def query_nvidia_smi() -> list[GpuSnapshot]:
+    output = subprocess.check_output(
         [
             "nvidia-smi",
             "--query-gpu=index,memory.free,memory.total,utilization.gpu",
@@ -90,17 +90,17 @@ def query_nvidia_smi() -> str:
         ],
         text=True,
     )
+    return parse_nvidia_smi_csv(output)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--min-gpus", type=int, required=True)
-    parser.add_argument("--target-free-memory", type=int)
-    parser.add_argument("--output")
+    parser.add_argument("--min-gpus", type=int, default=1)
+    parser.add_argument("--target-free-memory", type=int, default=None)
+    parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
-    snapshots = parse_nvidia_smi_csv(query_nvidia_smi())
-    selection_priority = sort_gpu_snapshots(snapshots)
+    snapshots = query_nvidia_smi()
     selected_ids = choose_gpu_ids(
         snapshots,
         min_gpus=args.min_gpus,
@@ -109,14 +109,17 @@ def main() -> None:
     payload = {
         "snapshots": [asdict(snapshot) for snapshot in snapshots],
         "selected_ids": selected_ids,
-        "selection_priority": [asdict(snapshot) for snapshot in selection_priority],
+        "selection_priority": [
+            "highest idle capacity",
+            "highest free memory",
+            "ascending gpu_id",
+        ],
     }
     text = json.dumps(payload, indent=2, sort_keys=True)
 
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text + "\n")
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(text + "\n")
     print(text)
 
 
