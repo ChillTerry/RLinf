@@ -22,6 +22,20 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.uninavid.constants import (
+    DEFAULT_IMAGE_TOKEN,
+    IMAGE_TOKEN_INDEX,
+)
+from rlinf.models.embodiment.uninavid.mm_utils import tokenizer_image_token
+from rlinf.models.embodiment.uninavid.nav_rollout import (
+    UniNaVidNavCache,
+    build_navigation_prompt,
+    empty_rollout_metadata,
+    episode_id_from_obs,
+    get_slot_cache,
+    parse_uninavid_actions,
+    select_slot_rgb_frames,
+)
 
 
 class UniNaVidForActionPrediction(nn.Module, BasePolicy):
@@ -48,6 +62,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         self.model = model
         self.image_processor = image_processor
         self.torch_dtype = torch_dtype
+        self._nav_caches: dict[int, UniNaVidNavCache] = {}
 
         self._initialize_fsdp_wrap_metadata()
 
@@ -432,5 +447,222 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
     def default_forward(self, **kwargs):
         raise NotImplementedError("Uni-NaVid currently supports only SFT forward.")
 
-    def predict_action_batch(self, **kwargs):
-        raise NotImplementedError("Uni-NaVid action prediction is not wired yet.")
+    @property
+    def num_action_chunks(self) -> int:
+        cfg = getattr(self, "cfg", None)
+        return int(self._cfg_get(cfg, "num_action_chunks", default=4))
+
+    @property
+    def rollout_mode(self) -> str:
+        cfg = getattr(self, "cfg", None)
+        return str(
+            self._cfg_get(
+                cfg,
+                "rollout_mode",
+                default="batched_feature_cache",
+            )
+        )
+
+    def _load_nav_cache_into_model(self, cache: UniNaVidNavCache) -> None:
+        backbone = self.model.get_model()
+        backbone.feat_cache = cache.feat_cache
+        backbone.long_feat_cache = cache.long_feat_cache
+        backbone.weight = cache.weight
+        backbone.new_frames = cache.new_frames
+
+    def _save_model_nav_cache_to_slot(self, cache: UniNaVidNavCache) -> None:
+        backbone = self.model.get_model()
+        cache.feat_cache = getattr(backbone, "feat_cache", None)
+        cache.long_feat_cache = getattr(backbone, "long_feat_cache", None)
+        cache.weight = int(getattr(backbone, "weight", 1))
+        cache.new_frames = int(getattr(backbone, "new_frames", 0))
+
+    def _clear_model_nav_cache(self) -> None:
+        backbone = self.model.get_model()
+        if hasattr(backbone, "initialize_online_inference_nav_feat_cache"):
+            backbone.initialize_online_inference_nav_feat_cache()
+        else:
+            backbone.feat_cache = None
+            backbone.long_feat_cache = None
+            backbone.weight = 1
+            backbone.new_frames = 0
+
+    def _build_navigation_input_ids(self, navigation_prompt: str) -> torch.Tensor:
+        from rlinf.models.embodiment.uninavid import conversation as conversation_lib
+        from rlinf.models.embodiment.uninavid.constants import (
+            IAMGE_SEPARATOR,
+            IMAGE_END_TOKEN,
+            IMAGE_START_TOKEN,
+            NAVIGATION_SPECIAL_TOKEN,
+            VIDEO_END_SPECIAL_TOKEN,
+            VIDEO_START_SPECIAL_TOKEN,
+        )
+
+        qs = DEFAULT_IMAGE_TOKEN + "\n" + navigation_prompt.replace("<image>", "")
+        conv_mode = self._cfg_get(
+            getattr(self, "cfg", None),
+            "conv_mode",
+            default="vicuna_v1",
+        )
+        conv = conversation_lib.conv_templates[conv_mode].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        token_prompt = tokenizer_image_token(
+            prompt,
+            self.tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        )
+        device = self._get_device()
+        token_prompt = token_prompt.to(device=device)
+
+        video_start = self.tokenizer(
+            VIDEO_START_SPECIAL_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        image_separator = self.tokenizer(
+            IAMGE_SEPARATOR,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        video_end = self.tokenizer(
+            VIDEO_END_SPECIAL_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        image_start = self.tokenizer(
+            IMAGE_START_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        image_end = self.tokenizer(
+            IMAGE_END_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        navigation = self.tokenizer(
+            NAVIGATION_SPECIAL_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+
+        pieces: list[torch.Tensor] = []
+        while True:
+            indices = torch.where(token_prompt == IMAGE_TOKEN_INDEX)[0]
+            if indices.numel() == 0:
+                if token_prompt.numel() > 0:
+                    pieces.append(token_prompt)
+                break
+            idx = indices[0]
+            pieces.extend(
+                [
+                    token_prompt[:idx],
+                    video_start,
+                    image_separator,
+                    token_prompt[idx : idx + 1],
+                    video_end,
+                    image_start,
+                    image_end,
+                    navigation,
+                ]
+            )
+            token_prompt = token_prompt[idx + 1 :]
+
+        nonempty_pieces = [piece for piece in pieces if piece.numel() > 0]
+        return torch.cat(nonempty_pieces, dim=0).unsqueeze(0)
+
+    def _preprocess_navigation_images(
+        self,
+        rgb_frames: list[Any],
+    ) -> list[torch.Tensor]:
+        import numpy as np
+
+        batch_image = np.asarray(rgb_frames)
+        pixel_values = self.image_processor.preprocess(
+            batch_image,
+            return_tensors="pt",
+        )["pixel_values"]
+        pixel_values = self._move_image_tensor(pixel_values, device=self._get_device())
+        return [pixel_values]
+
+    def predict_action_batch(
+        self,
+        env_obs,
+        calculate_logprobs: bool = False,
+        calculate_values: bool = False,
+        mode: str = "eval",
+        **kwargs,
+    ):
+        if calculate_logprobs or calculate_values:
+            raise NotImplementedError(
+                "Uni-NaVid Habitat rollout currently returns no training logprobs or "
+                "values."
+            )
+
+        if self.rollout_mode == "sequential_cache":
+            return self._predict_action_batch_sequential_cache(env_obs, **kwargs)
+        if self.rollout_mode == "batched_feature_cache":
+            return self._predict_action_batch_batched_feature_cache(env_obs, **kwargs)
+        raise ValueError(
+            "Unsupported Uni-NaVid rollout_mode "
+            f"{self.rollout_mode!r}; expected 'sequential_cache' or "
+            "'batched_feature_cache'."
+        )
+
+    def _predict_action_batch_sequential_cache(self, env_obs, **generation_kwargs):
+        batch_size = len(env_obs["task_descriptions"])
+        action_chunks = []
+
+        original_run_type = getattr(self.model.config, "run_type", None)
+        self.model.config.run_type = "eval"
+        try:
+            for slot_id in range(batch_size):
+                episode_id = episode_id_from_obs(env_obs, slot_id)
+                cache = get_slot_cache(
+                    self._nav_caches,
+                    slot_id=slot_id,
+                    episode_id=episode_id,
+                )
+                self._load_nav_cache_into_model(cache)
+
+                instruction = env_obs["task_descriptions"][slot_id]
+                navigation_prompt = build_navigation_prompt(instruction)
+                input_ids = self._build_navigation_input_ids(navigation_prompt)
+                rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
+                self.model.get_model().new_frames = len(rgb_frames)
+                images = self._preprocess_navigation_images(rgb_frames)
+                self.model.update_prompt(
+                    [
+                        [
+                            navigation_prompt.replace(
+                                DEFAULT_IMAGE_TOKEN,
+                                "",
+                            ).replace("\n", "")
+                        ]
+                    ]
+                )
+
+                output_ids = self.model.generate(
+                    input_ids,
+                    images=images,
+                    use_cache=True,
+                    **generation_kwargs,
+                )
+                input_token_len = input_ids.shape[1]
+                output_text = self.tokenizer.batch_decode(
+                    output_ids[:, input_token_len:],
+                    skip_special_tokens=True,
+                )[0].strip()
+                action_chunks.append(
+                    parse_uninavid_actions(output_text, self.num_action_chunks)
+                )
+                self._save_model_nav_cache_to_slot(cache)
+        finally:
+            self._clear_model_nav_cache()
+            if original_run_type is not None:
+                self.model.config.run_type = original_run_type
+
+        actions = torch.stack(action_chunks, dim=0)
+        return actions, empty_rollout_metadata()
+
+    def _predict_action_batch_batched_feature_cache(self, env_obs, **generation_kwargs):
+        raise NotImplementedError(
+            "batched_feature_cache is implemented in the next task."
+        )

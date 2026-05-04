@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -131,3 +133,139 @@ def test_uninavid_empty_rollout_metadata_has_no_training_terms():
         "prev_values": None,
         "forward_inputs": {},
     }
+
+
+class FakeSequentialBackbone:
+    def __init__(self):
+        self.feat_cache = None
+        self.long_feat_cache = None
+        self.weight = 1
+        self.new_frames = 0
+
+    def initialize_online_inference_nav_feat_cache(self):
+        self.feat_cache = None
+        self.long_feat_cache = None
+        self.weight = 1
+        self.new_frames = 0
+
+
+class FakeSequentialModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.param = torch.nn.Parameter(torch.zeros(()))
+        self.config = SimpleNamespace(mm_use_im_start_end=False, run_type="train")
+        self.backbone = FakeSequentialBackbone()
+        self.generated_text = ["forward left", "right stop"]
+        self.generate_calls = []
+        self.prompt_updates = []
+
+    def get_model(self):
+        return self.backbone
+
+    def update_prompt(self, prompts):
+        self.prompt_updates.append(prompts)
+
+    def generate(self, input_ids, images, **kwargs):
+        self.generate_calls.append(
+            {
+                "input_ids_shape": tuple(input_ids.shape),
+                "num_images": len(images),
+                "new_frames": self.backbone.new_frames,
+                "run_type": self.config.run_type,
+                "kwargs": kwargs,
+            }
+        )
+        call_index = len(self.generate_calls) - 1
+        generated_ids = torch.tensor(
+            [[101, 102, call_index]],
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        return torch.cat([input_ids, generated_ids], dim=1)
+
+
+class FakeSequentialTokenizer:
+    def __init__(self, texts):
+        self.texts = texts
+        self.bos_token_id = 1
+
+    def __call__(self, text, return_tensors=None):
+        token_ids = [1] + [ord(ch) % 100 + 2 for ch in text]
+        if return_tensors == "pt":
+            token_ids = torch.tensor([token_ids], dtype=torch.long)
+        return SimpleNamespace(input_ids=token_ids)
+
+    def batch_decode(self, token_ids, skip_special_tokens=True):
+        index = int(token_ids[0][-1].item())
+        return [self.texts[index]]
+
+
+class FakeSequentialImageProcessor:
+    def preprocess(self, images, return_tensors=None):
+        array = np.asarray(images)
+        tensor = torch.from_numpy(array).permute(0, 3, 1, 2).float()
+        return {"pixel_values": tensor}
+
+
+def test_uninavid_predict_action_batch_returns_habitat_chunk_shape():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(rollout_mode="sequential_cache", num_action_chunks=4)
+    env_obs = {
+        "wrist_images": torch.zeros(2, 4, 4, 3, dtype=torch.uint8),
+        "task_descriptions": ["go to room one", "go to room two"],
+        "states": torch.tensor([100, 200]),
+    }
+
+    actions, metadata = policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    assert actions.shape == (2, 4, 1)
+    assert actions.dtype == torch.long
+    assert actions[0].squeeze(-1).tolist() == [1, 2, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert actions[1].squeeze(-1).tolist() == [3, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert metadata == empty_rollout_metadata()
+    assert len(model.generate_calls) == 2
+
+
+def test_uninavid_sequential_cache_swaps_slot_state():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(rollout_mode="sequential_cache", num_action_chunks=4)
+    policy._nav_caches[0] = UniNaVidNavCache(
+        episode_id=100,
+        feat_cache=torch.ones(1, 4, 2),
+        long_feat_cache=torch.ones(1, 2),
+        weight=3,
+        new_frames=1,
+    )
+    env_obs = {
+        "wrist_images": torch.zeros(2, 4, 4, 3, dtype=torch.uint8),
+        "task_descriptions": ["go to room one", "go to room two"],
+        "states": torch.tensor([100, 200]),
+    }
+
+    policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    assert policy._nav_caches[0].episode_id == 100
+    assert policy._nav_caches[0].feat_cache is not None
+    assert policy._nav_caches[0].weight == 3
+    assert policy._nav_caches[1].episode_id == 200
+    assert policy._nav_caches[1].feat_cache is None
