@@ -621,7 +621,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         batch_size = len(env_obs["task_descriptions"])
         action_chunks = []
 
-        original_run_type = getattr(self.model.config, "run_type", None)
+        missing_run_type = object()
+        original_run_type = getattr(self.model.config, "run_type", missing_run_type)
         self.model.config.run_type = "eval"
         try:
             for slot_id in range(batch_size):
@@ -667,7 +668,10 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 self._save_model_nav_cache_to_slot(cache)
         finally:
             self._clear_model_nav_cache()
-            if original_run_type is not None:
+            if original_run_type is missing_run_type:
+                if hasattr(self.model.config, "run_type"):
+                    delattr(self.model.config, "run_type")
+            else:
                 self.model.config.run_type = original_run_type
 
         actions = torch.stack(action_chunks, dim=0)

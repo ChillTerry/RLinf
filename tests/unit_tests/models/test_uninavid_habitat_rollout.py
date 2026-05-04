@@ -15,11 +15,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from rlinf.models.embodiment.uninavid.constants import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
+    DEFAULT_IMAGE_TOKEN,
 )
 from rlinf.models.embodiment.uninavid.nav_rollout import (
     HABITAT_NAV_ACTION_TO_ID,
@@ -175,11 +177,13 @@ class FakeSequentialModel(torch.nn.Module):
                 "input_ids_shape": tuple(input_ids.shape),
                 "num_images": len(images),
                 "new_frames": self.backbone.new_frames,
-                "run_type": self.config.run_type,
+                "run_type": getattr(self.config, "run_type", None),
                 "kwargs": kwargs,
             }
         )
         call_index = len(self.generate_calls) - 1
+        self.backbone.feat_cache = torch.full((1, 2), call_index + 10.0)
+        self.backbone.long_feat_cache = torch.full((1, 1), call_index + 20.0)
         generated_ids = torch.tensor(
             [[101, 102, call_index]],
             dtype=torch.long,
@@ -232,7 +236,11 @@ def test_uninavid_predict_action_batch_returns_habitat_chunk_shape():
         "states": torch.tensor([100, 200]),
     }
 
-    actions, metadata = policy.predict_action_batch(env_obs=env_obs, mode="eval")
+    actions, metadata = policy.predict_action_batch(
+        env_obs=env_obs,
+        mode="eval",
+        temperature=0.5,
+    )
 
     assert actions.shape == (2, 4, 1)
     assert actions.dtype == torch.long
@@ -240,6 +248,35 @@ def test_uninavid_predict_action_batch_returns_habitat_chunk_shape():
     assert actions[1].squeeze(-1).tolist() == [3, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
     assert metadata == empty_rollout_metadata()
     assert len(model.generate_calls) == 2
+    assert [call["run_type"] for call in model.generate_calls] == ["eval", "eval"]
+    assert [call["kwargs"]["use_cache"] for call in model.generate_calls] == [
+        True,
+        True,
+    ]
+    assert [call["kwargs"]["temperature"] for call in model.generate_calls] == [
+        0.5,
+        0.5,
+    ]
+    assert [call["new_frames"] for call in model.generate_calls] == [
+        len(select_slot_rgb_frames(env_obs, 0)),
+        len(select_slot_rgb_frames(env_obs, 1)),
+    ]
+    assert model.prompt_updates == [
+        [
+            [
+                build_navigation_prompt("go to room one")
+                .replace(DEFAULT_IMAGE_TOKEN, "")
+                .replace("\n", "")
+            ]
+        ],
+        [
+            [
+                build_navigation_prompt("go to room two")
+                .replace(DEFAULT_IMAGE_TOKEN, "")
+                .replace("\n", "")
+            ]
+        ],
+    ]
 
 
 def test_uninavid_navigation_input_ids_include_image_start_end_tokens_when_enabled():
@@ -294,6 +331,132 @@ def test_uninavid_sequential_cache_swaps_slot_state():
 
     assert policy._nav_caches[0].episode_id == 100
     assert policy._nav_caches[0].feat_cache is not None
+    torch.testing.assert_close(
+        policy._nav_caches[0].feat_cache,
+        torch.full((1, 2), 10.0),
+    )
+    torch.testing.assert_close(
+        policy._nav_caches[0].long_feat_cache,
+        torch.full((1, 1), 20.0),
+    )
     assert policy._nav_caches[0].weight == 3
     assert policy._nav_caches[1].episode_id == 200
-    assert policy._nav_caches[1].feat_cache is None
+    torch.testing.assert_close(
+        policy._nav_caches[1].feat_cache,
+        torch.full((1, 2), 11.0),
+    )
+    torch.testing.assert_close(
+        policy._nav_caches[1].long_feat_cache,
+        torch.full((1, 1), 21.0),
+    )
+    assert not torch.equal(
+        policy._nav_caches[0].feat_cache,
+        policy._nav_caches[1].feat_cache,
+    )
+
+
+def test_uninavid_predict_action_batch_rejects_training_terms():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(rollout_mode="sequential_cache", num_action_chunks=4)
+
+    with pytest.raises(NotImplementedError):
+        policy.predict_action_batch(env_obs={}, calculate_logprobs=True)
+    with pytest.raises(NotImplementedError):
+        policy.predict_action_batch(env_obs={}, calculate_values=True)
+
+
+def test_uninavid_predict_action_batch_rejects_unknown_rollout_mode():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(rollout_mode="bad_mode", num_action_chunks=4)
+
+    with pytest.raises(ValueError):
+        policy.predict_action_batch(env_obs={})
+
+
+def test_uninavid_batched_feature_cache_is_temporarily_unimplemented():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(
+        rollout_mode="batched_feature_cache",
+        num_action_chunks=4,
+    )
+
+    with pytest.raises(NotImplementedError):
+        policy.predict_action_batch(env_obs={})
+
+
+def test_uninavid_sequential_cache_strictly_restores_run_type_state():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    env_obs = {
+        "wrist_images": torch.zeros(1, 4, 4, 3, dtype=torch.uint8),
+        "task_descriptions": ["go to room one"],
+        "states": torch.tensor([100]),
+    }
+
+    none_model = FakeSequentialModel()
+    none_model.config.run_type = None
+    none_policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(none_model.generated_text),
+        model=none_model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    none_policy.cfg = SimpleNamespace(
+        rollout_mode="sequential_cache",
+        num_action_chunks=4,
+    )
+
+    none_policy.predict_action_batch(env_obs=env_obs)
+
+    assert none_model.generate_calls[0]["run_type"] == "eval"
+    assert none_model.config.run_type is None
+
+    absent_model = FakeSequentialModel()
+    delattr(absent_model.config, "run_type")
+    absent_policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(absent_model.generated_text),
+        model=absent_model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    absent_policy.cfg = SimpleNamespace(
+        rollout_mode="sequential_cache",
+        num_action_chunks=4,
+    )
+
+    absent_policy.predict_action_batch(env_obs=env_obs)
+
+    assert absent_model.generate_calls[0]["run_type"] == "eval"
+    assert not hasattr(absent_model.config, "run_type")
