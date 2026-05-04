@@ -14,13 +14,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
-
 
 UNINAVID_NAV_PROMPT_TEMPLATE = (
     "Imagine you are a robot programmed for navigation tasks. You have been given a "
@@ -41,6 +40,8 @@ HABITAT_NAV_ACTION_TO_ID = {
     "forward": FORWARD_ACTION_ID,
     "left": LEFT_ACTION_ID,
     "right": RIGHT_ACTION_ID,
+    "no-op": NO_OP_ACTION_ID,
+    "no_op": NO_OP_ACTION_ID,
 }
 
 _ACTION_PATTERN = re.compile(r"\b(stop|forward|left|right)\b", re.IGNORECASE)

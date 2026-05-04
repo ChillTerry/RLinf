@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-
 import numpy as np
 import torch
 
 from rlinf.models.embodiment.uninavid.nav_rollout import (
+    HABITAT_NAV_ACTION_TO_ID,
     NO_OP_ACTION_ID,
     UniNaVidNavCache,
     build_navigation_prompt,
@@ -83,6 +82,11 @@ def test_uninavid_action_parser_pads_unknown_and_after_stop():
     parsed = parse_uninavid_actions("spin forward stop left", 4)
 
     assert parsed.squeeze(-1).tolist() == [1, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+
+
+def test_uninavid_public_action_mapping_includes_no_op_aliases():
+    assert HABITAT_NAV_ACTION_TO_ID["no-op"] == NO_OP_ACTION_ID
+    assert HABITAT_NAV_ACTION_TO_ID["no_op"] == NO_OP_ACTION_ID
 
 
 def test_uninavid_prompt_matches_original_template():
