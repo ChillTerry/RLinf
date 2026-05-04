@@ -698,7 +698,13 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
 
     def _nav_size(self) -> int:
         compress_type = getattr(self.model.config, "compress_type", None)
-        return {"grid:2": 4, "grid:4": 16, "mean": 1}[compress_type]
+        nav_sizes = {"grid:2": 4, "grid:4": 16, "mean": 1}
+        if compress_type not in nav_sizes:
+            raise ValueError(
+                "Unsupported Uni-NaVid compress_type for Habitat rollout: "
+                f"{compress_type}"
+            )
+        return nav_sizes[compress_type]
 
     def _navigation_grid_size(self) -> int:
         compress_type = getattr(self.model.config, "compress_type", None)
@@ -781,8 +787,9 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             device=embeds[0].device,
         )
         for idx, embed in enumerate(embeds):
-            batch[idx, : embed.shape[0]] = embed
-            attention_mask[idx, : embed.shape[0]] = 1
+            start = max_len - embed.shape[0]
+            batch[idx, start:] = embed
+            attention_mask[idx, start:] = 1
         return batch, attention_mask
 
     def _generate_batched_navigation_texts(

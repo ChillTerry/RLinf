@@ -523,6 +523,48 @@ def test_uninavid_batched_feature_cache_uses_single_generate_call(monkeypatch):
     assert metadata == empty_rollout_metadata()
 
 
+def test_uninavid_pad_navigation_embeds_left_pads_shorter_rows():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeBatchedTokenizer(),
+        model=FakeBatchedModel(),
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    short_embed = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    long_embed = torch.tensor([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+
+    batch, attention_mask = policy._pad_navigation_embeds([short_embed, long_embed])
+
+    assert batch.shape == (2, 3, 2)
+    assert attention_mask.tolist() == [[0, 1, 1], [1, 1, 1]]
+    torch.testing.assert_close(batch[0, 0], torch.zeros(2))
+    torch.testing.assert_close(batch[0, 1:], short_embed)
+    torch.testing.assert_close(batch[0, -1], short_embed[-1])
+    torch.testing.assert_close(batch[1], long_embed)
+
+
+def test_uninavid_nav_size_rejects_unsupported_compress_type():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeBatchedModel()
+    model.config.compress_type = "unsupported"
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeBatchedTokenizer(),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported Uni-NaVid compress_type"):
+        policy._nav_size()
+
+
 def test_uninavid_batched_feature_cache_real_helper_batches_and_updates_slots():
     from rlinf.models.embodiment.uninavid.uninavid_action_model import (
         UniNaVidForActionPrediction,
@@ -547,7 +589,7 @@ def test_uninavid_batched_feature_cache_real_helper_batches_and_updates_slots():
                 torch.full((4, 4, 3), 20, dtype=torch.uint8),
             ]
         ),
-        "task_descriptions": ["go to room one", "go to room two"],
+        "task_descriptions": ["go", "go to room two"],
         "states": torch.tensor([100, 200]),
     }
 
@@ -567,6 +609,11 @@ def test_uninavid_batched_feature_cache_real_helper_batches_and_updates_slots():
     assert generate_call["inputs_embeds_shape"][0] == 2
     assert generate_call["attention_mask_shape"] == generate_call["inputs_embeds_shape"][:2]
     assert generate_call["attention_mask"].shape[0] == 2
+    assert generate_call["attention_mask"][0, 0].item() == 0
+    assert generate_call["attention_mask"][0, -1].item() == 1
+    assert generate_call["attention_mask"][1].tolist() == [
+        1
+    ] * generate_call["attention_mask"].shape[1]
     assert generate_call["use_cache"] is True
     assert generate_call["run_type"] == "eval"
     assert generate_call["kwargs"]["temperature"] == 0.5
@@ -575,7 +622,7 @@ def test_uninavid_batched_feature_cache_real_helper_batches_and_updates_slots():
     assert model.prompt_updates == [
         [
             [
-                build_navigation_prompt("go to room one")
+                build_navigation_prompt("go")
                 .replace(DEFAULT_IMAGE_TOKEN, "")
                 .replace("\n", "")
             ],
