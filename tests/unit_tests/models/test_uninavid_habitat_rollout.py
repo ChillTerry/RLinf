@@ -217,6 +217,94 @@ class FakeSequentialImageProcessor:
         return {"pixel_values": tensor}
 
 
+class FakeBatchedBackbone(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(512, 3)
+        with torch.no_grad():
+            values = torch.arange(512 * 3, dtype=torch.float32).view(512, 3)
+            self.embed_tokens.weight.copy_(values / 1000)
+        self.mm_projector = torch.nn.Identity()
+        self.feat_cache = "global-feat-sentinel"
+        self.long_feat_cache = "global-long-sentinel"
+        self.weight = 99
+        self.new_frames = 88
+
+
+class FakeBatchedVisionTower:
+    def __call__(self, images):
+        batch_size = images.shape[0]
+        base = images.float().mean(dim=(1, 2, 3)).view(batch_size, 1, 1)
+        patch_offsets = torch.arange(65, dtype=torch.float32, device=images.device).view(
+            1,
+            65,
+            1,
+        )
+        channel_offsets = torch.tensor(
+            [0.0, 0.25, 0.5],
+            dtype=torch.float32,
+            device=images.device,
+        ).view(1, 1, 3)
+        return base + patch_offsets + channel_offsets
+
+
+class FakeBatchedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.param = torch.nn.Parameter(torch.zeros(()))
+        self.config = SimpleNamespace(
+            compress_type="grid:2",
+            mm_use_im_start_end=False,
+            mm_vision_select_feature="patch",
+            run_type="train",
+        )
+        self.backbone = FakeBatchedBackbone()
+        self.vision_tower = FakeBatchedVisionTower()
+        self.generate_calls = []
+        self.prompt_updates = []
+
+    def get_model(self):
+        return self.backbone
+
+    def get_vision_tower(self):
+        return self.vision_tower
+
+    def update_prompt(self, prompts):
+        self.prompt_updates.append(prompts)
+
+    def generate(self, *, inputs_embeds, attention_mask, use_cache, **kwargs):
+        self.generate_calls.append(
+            {
+                "inputs_embeds_shape": tuple(inputs_embeds.shape),
+                "attention_mask_shape": tuple(attention_mask.shape),
+                "attention_mask": attention_mask.detach().clone(),
+                "use_cache": use_cache,
+                "run_type": getattr(self.config, "run_type", None),
+                "kwargs": kwargs,
+            }
+        )
+        return torch.tensor(
+            [[10], [11]],
+            dtype=torch.long,
+            device=inputs_embeds.device,
+        )
+
+
+class FakeBatchedTokenizer(FakeSequentialTokenizer):
+    def __init__(self):
+        super().__init__(["forward right", "left stop"])
+
+    def __call__(self, text, return_tensors=None):
+        self.tokenized_texts.append(text)
+        token_ids = [self.bos_token_id] + [ord(ch) % 200 + 2 for ch in text]
+        if return_tensors == "pt":
+            token_ids = torch.tensor([token_ids], dtype=torch.long)
+        return SimpleNamespace(input_ids=token_ids)
+
+    def batch_decode(self, token_ids, skip_special_tokens=True):
+        return [self.texts[row_index] for row_index in range(token_ids.shape[0])]
+
+
 def test_uninavid_predict_action_batch_returns_habitat_chunk_shape():
     from rlinf.models.embodiment.uninavid.uninavid_action_model import (
         UniNaVidForActionPrediction,
@@ -433,6 +521,122 @@ def test_uninavid_batched_feature_cache_uses_single_generate_call(monkeypatch):
     assert actions[0].squeeze(-1).tolist() == [1, 3, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
     assert actions[1].squeeze(-1).tolist() == [2, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
     assert metadata == empty_rollout_metadata()
+
+
+def test_uninavid_batched_feature_cache_real_helper_batches_and_updates_slots():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeBatchedModel()
+    tokenizer = FakeBatchedTokenizer()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=tokenizer,
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(
+        rollout_mode="batched_feature_cache",
+        num_action_chunks=4,
+    )
+    env_obs = {
+        "wrist_images": torch.stack(
+            [
+                torch.zeros(4, 4, 3, dtype=torch.uint8),
+                torch.full((4, 4, 3), 20, dtype=torch.uint8),
+            ]
+        ),
+        "task_descriptions": ["go to room one", "go to room two"],
+        "states": torch.tensor([100, 200]),
+    }
+
+    actions, metadata = policy.predict_action_batch(
+        env_obs=env_obs,
+        mode="eval",
+        temperature=0.5,
+    )
+
+    assert actions.shape == (2, 4, 1)
+    assert actions[0].squeeze(-1).tolist() == [1, 3, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert actions[1].squeeze(-1).tolist() == [2, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert metadata == empty_rollout_metadata()
+
+    assert len(model.generate_calls) == 1
+    generate_call = model.generate_calls[0]
+    assert generate_call["inputs_embeds_shape"][0] == 2
+    assert generate_call["attention_mask_shape"] == generate_call["inputs_embeds_shape"][:2]
+    assert generate_call["attention_mask"].shape[0] == 2
+    assert generate_call["use_cache"] is True
+    assert generate_call["run_type"] == "eval"
+    assert generate_call["kwargs"]["temperature"] == 0.5
+    assert model.config.run_type == "train"
+
+    assert model.prompt_updates == [
+        [
+            [
+                build_navigation_prompt("go to room one")
+                .replace(DEFAULT_IMAGE_TOKEN, "")
+                .replace("\n", "")
+            ],
+            [
+                build_navigation_prompt("go to room two")
+                .replace(DEFAULT_IMAGE_TOKEN, "")
+                .replace("\n", "")
+            ],
+        ]
+    ]
+
+    assert set(policy._nav_caches) == {0, 1}
+    assert policy._nav_caches[0].episode_id == 100
+    assert policy._nav_caches[1].episode_id == 200
+    assert policy._nav_caches[0].feat_cache.shape == (1, 4, 3)
+    assert policy._nav_caches[1].feat_cache.shape == (1, 4, 3)
+    assert not torch.equal(
+        policy._nav_caches[0].feat_cache,
+        policy._nav_caches[1].feat_cache,
+    )
+    assert policy._nav_caches[0].new_frames == 1
+    assert policy._nav_caches[1].new_frames == 1
+
+    assert model.backbone.feat_cache == "global-feat-sentinel"
+    assert model.backbone.long_feat_cache == "global-long-sentinel"
+    assert model.backbone.weight == 99
+    assert model.backbone.new_frames == 88
+
+
+def test_uninavid_batched_feature_cache_strictly_restores_absent_run_type():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeBatchedModel()
+    delattr(model.config, "run_type")
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeBatchedTokenizer(),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(
+        rollout_mode="batched_feature_cache",
+        num_action_chunks=4,
+    )
+    env_obs = {
+        "wrist_images": torch.stack(
+            [
+                torch.zeros(4, 4, 3, dtype=torch.uint8),
+                torch.full((4, 4, 3), 20, dtype=torch.uint8),
+            ]
+        ),
+        "task_descriptions": ["go to room one", "go to room two"],
+        "states": torch.tensor([100, 200]),
+    }
+
+    policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    assert model.generate_calls[0]["run_type"] == "eval"
+    assert not hasattr(model.config, "run_type")
 
 
 def test_uninavid_sequential_cache_strictly_restores_run_type_state():
