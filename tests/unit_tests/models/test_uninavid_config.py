@@ -46,6 +46,12 @@ def test_uninavid_habitat_eval_config_composes(monkeypatch):
     assert cfg.actor.model.action_dim == 1
     assert cfg.rollout.generation_backend == "huggingface"
     assert cfg.rollout.collect_prev_infos is False
+    assert cfg.rollout.recompute_logprobs is False
     assert cfg.algorithm.sampling_params.do_sample is True
+    assert cfg.algorithm.sampling_params.temperature_train == 0.5
     assert cfg.algorithm.sampling_params.temperature_eval == 0.5
+    assert cfg.algorithm.sampling_params.top_k == 0
+    assert cfg.algorithm.sampling_params.top_p == 1.0
+    assert cfg.algorithm.sampling_params.repetition_penalty == 1.0
+    assert cfg.algorithm.sampling_params.add_BOS is False
     assert cfg.algorithm.length_params.max_new_token == 1024
