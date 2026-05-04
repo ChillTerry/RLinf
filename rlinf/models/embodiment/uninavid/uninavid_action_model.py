@@ -29,6 +29,11 @@ from rlinf.models.embodiment.uninavid.constants import (
     IMAGE_TOKEN_INDEX,
 )
 from rlinf.models.embodiment.uninavid.mm_utils import tokenizer_image_token
+from rlinf.models.embodiment.uninavid.model.uninavid_arch import (
+    build_navigation_visual_tokens,
+    process_grid,
+    update_online_nav_cache,
+)
 from rlinf.models.embodiment.uninavid.nav_rollout import (
     UniNaVidNavCache,
     build_navigation_prompt,
@@ -678,6 +683,170 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         return actions, empty_rollout_metadata()
 
     def _predict_action_batch_batched_feature_cache(self, env_obs, **generation_kwargs):
-        raise NotImplementedError(
-            "batched_feature_cache is implemented in the next task."
+        output_texts = self._generate_batched_navigation_texts(
+            env_obs,
+            generation_kwargs,
         )
+        actions = torch.stack(
+            [
+                parse_uninavid_actions(output_text, self.num_action_chunks)
+                for output_text in output_texts
+            ],
+            dim=0,
+        )
+        return actions, empty_rollout_metadata()
+
+    def _nav_size(self) -> int:
+        compress_type = getattr(self.model.config, "compress_type", None)
+        return {"grid:2": 4, "grid:4": 16, "mean": 1}[compress_type]
+
+    def _navigation_grid_size(self) -> int:
+        compress_type = getattr(self.model.config, "compress_type", None)
+        if not isinstance(compress_type, str) or "grid:" not in compress_type:
+            raise ValueError(
+                "Unsupported Uni-NaVid compress_type for Habitat rollout: "
+                f"{compress_type}"
+            )
+        return int(compress_type.split("grid:")[-1])
+
+    def _encode_rgb_frames_for_slot(self, rgb_frames: list[Any]) -> torch.Tensor:
+        images = self._preprocess_navigation_images(rgb_frames)[0]
+        vision_tower = self.model.get_vision_tower()
+        visual_features = vision_tower(images)
+        if (
+            getattr(self.model.config, "mm_vision_select_feature", "patch") == "patch"
+            and visual_features.shape[1] % 2 == 1
+        ):
+            visual_features = visual_features[:, 1:]
+        return visual_features
+
+    def _update_slot_feature_cache(
+        self,
+        cache: UniNaVidNavCache,
+        visual_features: torch.Tensor,
+        new_frames: int,
+    ) -> torch.Tensor:
+        history_tokens = process_grid(visual_features, self._navigation_grid_size())
+        history_tokens = self.model.get_model().mm_projector(history_tokens)
+        update_online_nav_cache(cache, history_tokens, new_frames=new_frames)
+
+        current_tokens = process_grid(visual_features[-1:], 8)
+        current_tokens = self.model.get_model().mm_projector(current_tokens)[0]
+        return current_tokens
+
+    def _build_navigation_inputs_embeds(
+        self,
+        input_ids: torch.Tensor,
+        history_tokens: torch.Tensor,
+        history_lengths: list[int],
+        current_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        image_token_indices = torch.where(input_ids == IMAGE_TOKEN_INDEX)[0]
+        if image_token_indices.numel() != 1:
+            raise ValueError(
+                "Uni-NaVid navigation prompt must contain exactly one image token."
+            )
+
+        image_token_start = int(image_token_indices[0].item())
+        embed_tokens = self.model.get_model().embed_tokens
+        pieces = [
+            embed_tokens(input_ids[:image_token_start]),
+        ]
+
+        separator_token = embed_tokens(input_ids[image_token_start - 1, None])
+        video_index = 0
+        for idx, token_length in enumerate(history_lengths):
+            pieces.append(history_tokens[video_index : video_index + token_length])
+            video_index += token_length
+            if idx != len(history_lengths) - 1:
+                pieces.append(separator_token)
+
+        pieces.append(
+            embed_tokens(input_ids[image_token_start + 1 : image_token_start + 3])
+        )
+        pieces.append(current_tokens)
+        pieces.append(embed_tokens(input_ids[image_token_start + 3 :]))
+        return torch.cat(pieces, dim=0)
+
+    def _pad_navigation_embeds(
+        self,
+        embeds: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_len = max(embed.shape[0] for embed in embeds)
+        hidden_size = embeds[0].shape[-1]
+        batch = embeds[0].new_zeros((len(embeds), max_len, hidden_size))
+        attention_mask = torch.zeros(
+            (len(embeds), max_len),
+            dtype=torch.long,
+            device=embeds[0].device,
+        )
+        for idx, embed in enumerate(embeds):
+            batch[idx, : embed.shape[0]] = embed
+            attention_mask[idx, : embed.shape[0]] = 1
+        return batch, attention_mask
+
+    def _generate_batched_navigation_texts(
+        self,
+        env_obs,
+        generation_kwargs: dict[str, Any],
+    ) -> list[str]:
+        batch_size = len(env_obs["task_descriptions"])
+        prompts: list[str] = []
+        embeds: list[torch.Tensor] = []
+
+        missing_run_type = object()
+        original_run_type = getattr(self.model.config, "run_type", missing_run_type)
+        self.model.config.run_type = "eval"
+        try:
+            for slot_id in range(batch_size):
+                episode_id = episode_id_from_obs(env_obs, slot_id)
+                cache = get_slot_cache(
+                    self._nav_caches,
+                    slot_id=slot_id,
+                    episode_id=episode_id,
+                )
+                instruction = env_obs["task_descriptions"][slot_id]
+                navigation_prompt = build_navigation_prompt(instruction)
+                prompts.append(
+                    navigation_prompt.replace(DEFAULT_IMAGE_TOKEN, "").replace("\n", "")
+                )
+                input_ids = self._build_navigation_input_ids(navigation_prompt)[0]
+
+                rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
+                visual_features = self._encode_rgb_frames_for_slot(rgb_frames)
+                current_tokens = self._update_slot_feature_cache(
+                    cache,
+                    visual_features,
+                    new_frames=len(rgb_frames),
+                )
+                history_tokens, history_lengths = build_navigation_visual_tokens(
+                    cache,
+                    self._nav_size(),
+                )
+                embeds.append(
+                    self._build_navigation_inputs_embeds(
+                        input_ids,
+                        history_tokens,
+                        history_lengths,
+                        current_tokens,
+                    )
+                )
+
+            inputs_embeds, attention_mask = self._pad_navigation_embeds(embeds)
+            self.model.update_prompt([[prompt] for prompt in prompts])
+            output_ids = self.model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                use_cache=True,
+                **generation_kwargs,
+            )
+            return self.tokenizer.batch_decode(
+                output_ids,
+                skip_special_tokens=True,
+            )
+        finally:
+            if original_run_type is missing_run_type:
+                if hasattr(self.model.config, "run_type"):
+                    delattr(self.model.config, "run_type")
+            else:
+                self.model.config.run_type = original_run_type

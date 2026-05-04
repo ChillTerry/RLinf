@@ -393,14 +393,16 @@ def test_uninavid_predict_action_batch_rejects_unknown_rollout_mode():
         policy.predict_action_batch(env_obs={})
 
 
-def test_uninavid_batched_feature_cache_is_temporarily_unimplemented():
+def test_uninavid_batched_feature_cache_uses_single_generate_call(monkeypatch):
     from rlinf.models.embodiment.uninavid.uninavid_action_model import (
         UniNaVidForActionPrediction,
     )
 
     model = FakeSequentialModel()
+    model.generated_text = ["forward right", "left stop"]
+    tokenizer = FakeSequentialTokenizer(model.generated_text)
     policy = UniNaVidForActionPrediction(
-        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        tokenizer=tokenizer,
         model=model,
         image_processor=FakeSequentialImageProcessor(),
         torch_dtype=torch.float32,
@@ -410,8 +412,27 @@ def test_uninavid_batched_feature_cache_is_temporarily_unimplemented():
         num_action_chunks=4,
     )
 
-    with pytest.raises(NotImplementedError):
-        policy.predict_action_batch(env_obs={})
+    def fake_generate_batched_navigation_texts(env_obs, generation_kwargs):
+        assert len(env_obs["task_descriptions"]) == 2
+        return ["forward right", "left stop"]
+
+    monkeypatch.setattr(
+        policy,
+        "_generate_batched_navigation_texts",
+        fake_generate_batched_navigation_texts,
+    )
+    env_obs = {
+        "wrist_images": torch.zeros(2, 4, 4, 3, dtype=torch.uint8),
+        "task_descriptions": ["go to room one", "go to room two"],
+        "states": torch.tensor([100, 200]),
+    }
+
+    actions, metadata = policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    assert actions.shape == (2, 4, 1)
+    assert actions[0].squeeze(-1).tolist() == [1, 3, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert actions[1].squeeze(-1).tolist() == [2, 0, NO_OP_ACTION_ID, NO_OP_ACTION_ID]
+    assert metadata == empty_rollout_metadata()
 
 
 def test_uninavid_sequential_cache_strictly_restores_run_type_state():
