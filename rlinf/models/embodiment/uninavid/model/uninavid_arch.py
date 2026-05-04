@@ -40,6 +40,84 @@ from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
 
 
+def process_grid(vis_embed, grid_size):
+    cur_shape = int(vis_embed.shape[1] ** 0.5)
+    assert grid_size > 1, f"Grid size should be larger than 1, but got {grid_size}"
+    vis_embed = vis_embed.reshape(vis_embed.shape[0], cur_shape, cur_shape, -1)
+    grid_stride = cur_shape // grid_size
+    vis_embed = F.avg_pool2d(
+        vis_embed.permute(0, 3, 1, 2),
+        padding=0,
+        kernel_size=grid_stride,
+        stride=grid_stride,
+    )
+    return vis_embed.permute(0, 2, 3, 1).flatten(1, 2)
+
+
+def update_online_nav_cache(cache, current_visual_tokens, new_frames):
+    if cache.feat_cache is None:
+        cache.feat_cache = current_visual_tokens
+    else:
+        cache.feat_cache = torch.cat([cache.feat_cache, current_visual_tokens], dim=0)
+    cache.new_frames = int(new_frames)
+
+
+def build_navigation_visual_tokens(
+    cache,
+    nav_size,
+    length_threshold=64,
+    similarity_threshold=0.985,
+):
+    feat_cache = cache.feat_cache
+    if feat_cache is None:
+        raise ValueError("Uni-NaVid navigation cache has no visual features.")
+
+    k, m, c = feat_cache.shape
+    assert m % nav_size == 0, f"m ({m}) must be divisible by nav_size ({nav_size})"
+
+    if k <= length_threshold:
+        return feat_cache.reshape(-1, c), [nav_size] * k
+
+    cos = torch.nn.CosineSimilarity(dim=0)
+    for frame_index in range(cache.new_frames - 1, -1, -1):
+        oldest_index = k - length_threshold - frame_index - 1
+        if oldest_index < 0:
+            continue
+        oldest_short_mem_token = feat_cache[oldest_index].mean(dim=0)
+        long_term_cache = cache.long_feat_cache
+        if long_term_cache is not None:
+            similarity = cos(long_term_cache[-1], oldest_short_mem_token)
+            if similarity > similarity_threshold:
+                new_mean = (
+                    long_term_cache[-1] * cache.weight + oldest_short_mem_token
+                ) / (cache.weight + 1)
+                cache.weight += 1
+                long_term_cache[-1] = new_mean
+                cache.long_feat_cache = long_term_cache
+            else:
+                cache.long_feat_cache = torch.cat(
+                    [long_term_cache, oldest_short_mem_token[None]],
+                    dim=0,
+                )
+                cache.weight = 1
+        else:
+            cache.long_feat_cache = oldest_short_mem_token[None]
+
+    assert cache.long_feat_cache is not None
+    result_list = [1] * cache.long_feat_cache.shape[0] + [nav_size] * length_threshold
+    result_tensor = torch.cat(
+        [
+            cache.long_feat_cache,
+            feat_cache[k - length_threshold :].reshape(-1, c),
+        ],
+        dim=0,
+    )
+    assert result_tensor.shape[0] == sum(result_list), (
+        f"The sum of the list does not match the tensor dimension {result_tensor.shape[0]}, {sum(result_list)}"
+    )
+    return result_tensor, result_list
+
+
 class UniNaVIDMetaModel:
     def __init__(self, config):
         super(UniNaVIDMetaModel, self).__init__(config)
@@ -379,22 +457,6 @@ class UniNaVIDMetaForCausalLM(ABC):
         return img_feat_lst, video_or_not, nav_or_not, final_token_length_lst
 
     def token_generation(self, vis_embed, image_counts=None, navigation=False):
-        def process_grid(vis_embed, grid_size):
-            cur_shape = int(vis_embed.shape[1] ** 0.5)
-            assert grid_size > 1, (
-                f"Grid size should be larger than 1, but got {grid_size}"
-            )
-            vis_embed = vis_embed.reshape(vis_embed.shape[0], cur_shape, cur_shape, -1)
-
-            grid_stride = cur_shape // grid_size
-            vis_embed = F.avg_pool2d(
-                vis_embed.permute(0, 3, 1, 2),
-                padding=0,
-                kernel_size=grid_stride,
-                stride=grid_stride,
-            )
-            return vis_embed.permute(0, 2, 3, 1).flatten(1, 2)
-
         grid_size = int(self.config.compress_type.split("grid:")[-1])
 
         if image_counts is None or (image_counts == 1 and not navigation):

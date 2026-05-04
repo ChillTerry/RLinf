@@ -460,3 +460,31 @@ def test_uninavid_sequential_cache_strictly_restores_run_type_state():
 
     assert absent_model.generate_calls[0]["run_type"] == "eval"
     assert not hasattr(absent_model.config, "run_type")
+
+
+def test_uninavid_process_grid_reduces_patch_grid():
+    from rlinf.models.embodiment.uninavid.model.uninavid_arch import (
+        process_grid,
+    )
+
+    visual = torch.arange(16 * 2, dtype=torch.float32).view(1, 16, 2)
+
+    reduced = process_grid(visual, grid_size=2)
+
+    assert reduced.shape == (1, 4, 2)
+
+
+def test_uninavid_online_nav_cache_compresses_slot_without_global_state():
+    from rlinf.models.embodiment.uninavid.model.uninavid_arch import (
+        build_navigation_visual_tokens,
+        update_online_nav_cache,
+    )
+
+    cache = UniNaVidNavCache(episode_id=1)
+    update_online_nav_cache(cache, torch.ones(2, 4, 3), new_frames=2)
+
+    tokens, lengths = build_navigation_visual_tokens(cache, nav_size=4)
+
+    assert tokens.shape == (8, 3)
+    assert lengths == [4, 4]
+    assert cache.new_frames == 2
