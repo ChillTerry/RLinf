@@ -471,7 +471,18 @@ def test_uninavid_process_grid_reduces_patch_grid():
 
     reduced = process_grid(visual, grid_size=2)
 
-    assert reduced.shape == (1, 4, 2)
+    expected = torch.tensor(
+        [
+            [
+                [5.0, 6.0],
+                [9.0, 10.0],
+                [21.0, 22.0],
+                [25.0, 26.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(reduced, expected)
 
 
 def test_uninavid_online_nav_cache_compresses_slot_without_global_state():
@@ -482,9 +493,58 @@ def test_uninavid_online_nav_cache_compresses_slot_without_global_state():
 
     cache = UniNaVidNavCache(episode_id=1)
     update_online_nav_cache(cache, torch.ones(2, 4, 3), new_frames=2)
+    update_online_nav_cache(cache, torch.full((1, 4, 3), 2.0), new_frames=1)
 
     tokens, lengths = build_navigation_visual_tokens(cache, nav_size=4)
 
-    assert tokens.shape == (8, 3)
-    assert lengths == [4, 4]
-    assert cache.new_frames == 2
+    expected_cache = torch.cat(
+        [torch.ones(2, 4, 3), torch.full((1, 4, 3), 2.0)],
+        dim=0,
+    )
+    torch.testing.assert_close(cache.feat_cache, expected_cache)
+    torch.testing.assert_close(tokens, expected_cache.reshape(-1, 3))
+    assert lengths == [4, 4, 4]
+    assert cache.new_frames == 1
+
+
+def test_uninavid_navigation_visual_tokens_compress_long_memory_branch():
+    from rlinf.models.embodiment.uninavid.model.uninavid_arch import (
+        build_navigation_visual_tokens,
+    )
+
+    cache = UniNaVidNavCache(
+        episode_id=1,
+        feat_cache=torch.tensor(
+            [
+                [[1.0, 0.0], [1.0, 0.0]],
+                [[2.0, 0.0], [2.0, 0.0]],
+                [[0.0, 3.0], [0.0, 3.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        long_feat_cache=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        weight=2,
+        new_frames=1,
+    )
+
+    tokens, lengths = build_navigation_visual_tokens(
+        cache,
+        nav_size=2,
+        length_threshold=2,
+    )
+
+    expected_long_cache = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    expected_tokens = torch.tensor(
+        [
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 0.0],
+            [0.0, 3.0],
+            [0.0, 3.0],
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(cache.long_feat_cache, expected_long_cache)
+    assert cache.weight == 3
+    torch.testing.assert_close(tokens, expected_tokens)
+    assert lengths == [1, 2, 2]
