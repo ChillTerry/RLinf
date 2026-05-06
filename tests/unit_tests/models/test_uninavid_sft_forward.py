@@ -240,17 +240,23 @@ def test_from_pretrained_stores_and_loads_with_resolved_default_dtype(monkeypatc
     load_kwargs = {}
     fake_model = FakeFromPretrainedModel()
     fake_tokenizer = SimpleNamespace(pad_token=None, unk_token="<unk>")
+    fake_auto_config = SimpleNamespace(
+        max_position_embeddings=2048,
+        mm_vision_tower="./model_zoo/eva_vit_g.pth",
+        image_processor="./uninavid/processor/clip-patch14-224",
+    )
     fake_cfg = SimpleNamespace(
         model_path="fake-vicuna",
         version="v0.5",
         vision_tower="fake-eva",
+        image_processor="fake-image-processor",
         device="cpu",
     )
 
     monkeypatch.setattr(
         transformers.AutoConfig,
         "from_pretrained",
-        lambda *args, **kwargs: SimpleNamespace(max_position_embeddings=2048),
+        lambda *args, **kwargs: fake_auto_config,
     )
     monkeypatch.setattr(
         transformers.AutoTokenizer,
@@ -275,6 +281,8 @@ def test_from_pretrained_stores_and_loads_with_resolved_default_dtype(monkeypatc
 
     assert policy.torch_dtype is torch.float16
     assert load_kwargs["torch_dtype"] is torch.float16
+    assert load_kwargs["config"].mm_vision_tower == "fake-eva"
+    assert load_kwargs["config"].image_processor == "fake-image-processor"
     assert fake_model.vision_tower.to_kwargs["dtype"] is torch.float16
 
 

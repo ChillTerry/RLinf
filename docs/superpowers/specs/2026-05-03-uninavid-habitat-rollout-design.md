@@ -18,7 +18,13 @@ the success/SPL tolerance defined in the success criteria.
   through `task_descriptions`, and episode ids through `states`.
 - The first version uses Habitat discrete navigation actions: stop, forward,
   left, right, and no-op.
+- The authoritative original baseline for parity is
+  `NaVid-VLN-CE/run.py` with `agent_uninavid.py`, not
+  `Uni-NaVid/offline_eval_uninavid.py`.
 - The original UniNaVid prompt template is preserved for evaluation parity.
+- The original early-stop heuristic is intentionally excluded from RLinf parity
+  acceptance for this task and must be documented in the final comparison
+  summary.
 - The first version does not train the actor, so PPO logprob replay, value
   prediction, and `default_forward` for RL losses are out of scope.
 
@@ -33,14 +39,15 @@ the success/SPL tolerance defined in the success criteria.
   history leaking between slots or episodes.
 - `batched_feature_cache` mode runs as the default multi-env evaluation path.
 - `sequential_cache` and `batched_feature_cache` are both evaluated against the
-  original UniNaVid eval script on the same checkpoint, split, seed policy, and
-  sampling settings. Each comparison must use at least 20 episodes from the same
-  episode set; single-episode comparisons are allowed only as smoke tests and do
-  not satisfy acceptance.
-- `sequential_cache` and `batched_feature_cache` success and SPL must each be
-  within 5 absolute percentage points of the original UniNaVid eval script on the
-  evaluated episode set. This tolerance applies independently to success and SPL
-  for each rollout mode.
+  authoritative original UniNaVid eval script on the same checkpoint, split,
+  seed policy, and sampling settings. Each comparison must use at least 100
+  episodes from the same filtered episode set; single-episode and 20-episode
+  runs are allowed only as smoke tests and do not satisfy acceptance.
+- `sequential_cache` and `batched_feature_cache` success and SPL must each be no
+  lower than the original UniNaVid eval script by more than 5 absolute
+  percentage points on the evaluated episode set. This lower-bound acceptance
+  applies independently to success and SPL for each rollout mode. Exceeding the
+  original result is acceptable and should be recorded as an improvement.
 - Before every manual evaluation run, record all local GPU free memory and GPU
   utilization. Select devices by highest idle GPU capacity first
   (`100 - utilization`), then by highest free memory. If the selected devices do
@@ -48,6 +55,9 @@ the success/SPL tolerance defined in the success criteria.
   run fits or all GPUs are selected. If all GPUs still OOM, reduce config-driven
   memory pressure and record the final GPU ids and config overrides with the
   results.
+- Record a parity baseline before any non-parity optimization experiment. The
+  final summary document must distinguish parity runs from improvement
+  experiments and note that early-stop was intentionally excluded.
 - Unit tests cover cache reset, slot isolation, action parsing, and action tensor
   shape.
 
@@ -121,8 +131,9 @@ The output action tensor is:
 actions: torch.Tensor  # [batch_size, num_action_chunks, 1]
 ```
 
-For UniNaVid Habitat, `num_action_chunks` should default to 4 because the
-original prompt asks for the next four actions.
+For UniNaVid Habitat parity, `num_action_chunks` should default to 2. The
+original prompt asks for the next four actions, but the authoritative original
+agent executes only the first two parsed actions from each generation result.
 
 ## Cache State
 
@@ -162,10 +173,12 @@ padding -> 4
 ```
 
 Parsing should be forgiving about whitespace and punctuation. It should keep the
-first four valid actions. If fewer than four actions are generated, pad with
-no-op. If `stop` appears, keep the stop action and pad the remaining chunk with
-no-op. This matches Habitat's chunk stepping behavior, which truncates after
-stop and pads the rest of the chunk.
+first `num_action_chunks` valid actions. If fewer than `num_action_chunks`
+actions are generated, pad with no-op. If `stop` appears, keep the stop action
+and pad the remaining chunk with no-op. This matches Habitat's chunk stepping
+behavior, which truncates after stop and pads the rest of the chunk. For parity,
+`num_action_chunks=2` because the original agent only consumes two actions per
+generation even though the prompt asks for four.
 
 ## Rollout Modes
 
@@ -261,12 +274,20 @@ Default eval sampling should match the original script unless overridden:
 
 ```yaml
 do_sample: true
-temperature_eval: 0.5
+temperature_eval: 0.2
+top_k: 50
+top_p: 0.6
 max_new_token: 1024
 ```
 
+The authoritative original script explicitly sets `do_sample`, `temperature`,
+and `max_new_tokens`. The effective `top_k` and `top_p` values come from the
+checkpoint `generation_config.json` under `transformers==4.31.0`, so parity
+runs must preserve `top_k: 50` and `top_p: 0.6`.
+
 The RLinf config should still allow these parameters to be overridden for
-deterministic ablations and performance experiments.
+clearly labeled optimization experiments, but only after a parity baseline is
+recorded.
 
 ## GPU Resource Selection and OOM Fallback
 
@@ -309,18 +330,24 @@ a separate non-comparable ablation.
 2. Implement `sequential_cache` prediction using cache swap around the existing
    UniNaVid generation path.
 3. Add a Habitat UniNaVid eval config using `rollout.backend: huggingface`,
-   `actor.model.model_type: uninavid`, and `actor.model.num_action_chunks: 4`.
+   `actor.model.model_type: uninavid`, `actor.model.num_action_chunks: 2`, and
+   the authoritative effective sampling config.
 4. Validate single-env parity against the original UniNaVid eval script by
    comparing prompt text, current RGB tensors, historical frame token sequence,
-   success, and SPL on at least 20 shared episodes.
+   success, and SPL on at least 100 shared episodes from the same filtered
+   dataset. Acceptance is that RLinf is not more than 5 percentage points below
+   the original on success or SPL. Document that early-stop was intentionally
+   excluded from parity scope.
 5. Add run-time GPU selection guidance or a helper script that records GPU free
    memory/utilization, selects devices by idle capacity then free memory, and
    documents any OOM-driven config reductions.
 6. Implement `batched_feature_cache` by extracting minimal navigation cache
    helpers from UniNaVid internals.
 7. Validate multi-env cache isolation and compare `batched_feature_cache`
-   success/SPL against the original UniNaVid eval script on at least 20 shared
-   episodes.
+   success/SPL against the original UniNaVid eval script on the same 100 shared
+   episodes. Record improvements above the original separately from parity.
+8. After parity is recorded, run explicitly labeled optimization experiments and
+   summarize them separately from parity evidence.
 
 ## Tests
 
@@ -340,7 +367,7 @@ def test_uninavid_action_parser_maps_text_to_habitat_ids():
 
 
 def test_uninavid_predict_action_batch_returns_habitat_chunk_shape():
-    assert returned_actions_shape_is_batch_by_four_chunks_by_one
+    assert returned_actions_shape_is_batch_by_two_chunks_by_one
 ```
 
 Add a small smoke test if Habitat assets are available in CI or document it as a
@@ -350,16 +377,22 @@ manual GPU/Habitat check if assets are not available.
 
 - Batched generation may not exactly match single-env generation because of
   numerical and sampling differences. The accepted metric is success/SPL
-  within the stated 5 percentage point tolerance, not generated action token
-  identity.
+  not more than 5 percentage points below the stated original baseline, not
+  generated action token identity.
 - UniNaVid internal cache logic is currently coupled to model global fields.
   `sequential_cache` provides a parity baseline before introducing the fast path.
+- There are multiple upstream UniNaVid evaluation entrypoints in the workspace.
+  The comparison must stay pinned to `NaVid-VLN-CE/run.py` with
+  `agent_uninavid.py`, or the baseline will drift.
 - Reusing `env_obs["states"]` as episode id assumes Habitat keeps it stable within
   an episode and changes it after reset. This should be verified with a small
   cache reset test and a multi-env smoke run.
 - Long episodes can grow cache memory. The fast path should reuse UniNaVid's
   existing short/long memory compression semantics instead of storing raw RGB
   history indefinitely.
+- The original early-stop heuristic is intentionally omitted for this task. That
+  may shift absolute metrics, so every parity and optimization summary must
+  state that the comparison excludes early-stop.
 - GPU availability can vary across shared servers. Runs should record selected
   GPU ids, free memory, utilization, and any OOM fallback config changes so
   success/SPL comparisons are reproducible.

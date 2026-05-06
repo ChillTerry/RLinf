@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from rlinf.data.embodied_io_struct import EnvOutput
 from rlinf.models.embodiment.uninavid.constants import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
@@ -131,6 +133,30 @@ def test_uninavid_select_slot_rgb_frames_prefers_chunk_history():
     assert frames[1][0, 0, 0] == 22
 
 
+def test_env_output_preserves_uninavid_wrist_image_history():
+    env_output = EnvOutput(
+        obs={
+            "wrist_images": torch.zeros(1, 4, 4, 3, dtype=torch.uint8),
+            "wrist_images_history": torch.stack(
+                [
+                    torch.full((1, 4, 4, 3), 11, dtype=torch.uint8),
+                    torch.full((1, 4, 4, 3), 22, dtype=torch.uint8),
+                ],
+                dim=1,
+            ),
+            "states": torch.tensor([7]),
+            "task_descriptions": ["go"],
+        }
+    )
+
+    obs_dict = env_output.to_dict()["obs"]
+
+    assert "wrist_images_history" in obs_dict
+    assert obs_dict["wrist_images_history"].shape == (1, 2, 4, 4, 3)
+    assert obs_dict["wrist_images_history"][0, 0, 0, 0, 0].item() == 11
+    assert obs_dict["wrist_images_history"][0, 1, 0, 0, 0].item() == 22
+
+
 def test_uninavid_empty_rollout_metadata_has_no_training_terms():
     metadata = empty_rollout_metadata()
 
@@ -170,6 +196,60 @@ def test_uninavid_debug_rollout_metadata_records_prompt_and_frames():
     assert metadata["debug"]["prompts"] == [build_navigation_prompt("go to room one")]
     assert metadata["debug"]["episode_ids"] == [100]
     assert metadata["debug"]["new_frame_counts"] == [1]
+
+
+def test_uninavid_sequential_rollout_trace_writes_jsonl_record(tmp_path, monkeypatch):
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    output_text = model.generated_text[0]
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    trace_path = tmp_path / "uninavid-sequential-trace.jsonl"
+    monkeypatch.setenv("UNINAVID_MODEL_OUTPUT_TRACE_PATH", str(trace_path))
+    policy.cfg = SimpleNamespace(
+        rollout_mode="sequential_cache",
+        num_action_chunks=4,
+    )
+    env_obs = {
+        "wrist_images": torch.zeros(1, 4, 4, 3, dtype=torch.uint8),
+        "task_descriptions": ["go to room one"],
+        "states": torch.tensor([100]),
+    }
+
+    policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    assert trace_path.exists()
+    lines = trace_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["episode_id"] == 100
+    assert record["slot_id"] == 0
+    assert record["rollout_mode"] == "sequential_cache"
+    assert record["prompt"] == build_navigation_prompt("go to room one")
+    assert record["input_ids_shape"][0] == 1
+    assert isinstance(record["input_ids_hash"], str)
+    assert len(record["input_ids_hash"]) == 64
+    assert record["image_batch_shape"] == [1, 3, 4, 4]
+    assert record["image_tensor_sum"] == 0.0
+    assert record["navigation_text"] == output_text
+    assert record["output_text"] == output_text
+    assert record["parsed_actions"] == ["forward", "left", "no_op", "no_op"]
+    assert record["parsed_action_ids"] == parse_uninavid_actions(
+        output_text,
+        4,
+    ).squeeze(-1).tolist()
+    assert record["new_frame_count"] == 1
+    assert record["feat_cache_shape"] == [1, 2]
+    assert record["long_feat_cache_shape"] == [1, 1]
+    assert record["weight"] == 1
+    assert record["new_frames"] == 1
 
 
 class FakeSequentialBackbone:
@@ -554,6 +634,125 @@ def test_uninavid_batched_feature_cache_uses_single_generate_call(monkeypatch):
     assert metadata == empty_rollout_metadata()
 
 
+def test_uninavid_llava_forward_accepts_inputs_embeds_without_images():
+    from rlinf.models.embodiment.uninavid.model.language_model.llava_llama_vid import (
+        LlavaConfig,
+        LlavaLlamaAttForCausalLM,
+    )
+
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    model = LlavaLlamaAttForCausalLM(config)
+    model.eval()
+
+    batch_size = 2
+    seq_len = 5
+    inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+    output = model(
+        input_ids=None,
+        attention_mask=attention_mask,
+        inputs_embeds=inputs_embeds,
+        images=None,
+        return_dict=True,
+    )
+
+    assert output.logits.shape == (batch_size, seq_len, config.vocab_size)
+
+
+def test_uninavid_llava_forward_inputs_embeds_fast_path_skips_multimodal_prep(
+    monkeypatch,
+):
+    from rlinf.models.embodiment.uninavid.model.language_model.llava_llama_vid import (
+        LlavaConfig,
+        LlavaLlamaAttForCausalLM,
+    )
+
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    model = LlavaLlamaAttForCausalLM(config)
+    model.eval()
+
+    def fail_if_multimodal_prep_runs(*args, **kwargs):
+        raise AssertionError("inputs_embeds fast path should bypass multimodal prep")
+
+    monkeypatch.setattr(
+        model,
+        "prepare_inputs_labels_for_multimodal",
+        fail_if_multimodal_prep_runs,
+    )
+
+    batch_size = 2
+    seq_len = 5
+    inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+    output = model(
+        input_ids=None,
+        attention_mask=attention_mask,
+        inputs_embeds=inputs_embeds,
+        images=None,
+        return_dict=True,
+    )
+
+    assert output.logits.shape == (batch_size, seq_len, config.vocab_size)
+
+
+def test_uninavid_llava_generate_accepts_inputs_embeds_without_images():
+    from rlinf.models.embodiment.uninavid.model.language_model.llava_llama_vid import (
+        LlavaConfig,
+        LlavaLlamaAttForCausalLM,
+    )
+
+    config = LlavaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+    )
+    model = LlavaLlamaAttForCausalLM(config)
+    model.eval()
+
+    batch_size = 2
+    seq_len = 5
+    inputs_embeds = torch.randn(batch_size, seq_len, config.hidden_size)
+    attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
+
+    generated = model.generate(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        images=None,
+        max_new_tokens=2,
+        do_sample=False,
+        use_cache=True,
+    )
+
+    assert generated.dtype == torch.long
+    assert generated.shape[0] == batch_size
+    assert generated.shape[1] >= 2
+
+
 def test_uninavid_pad_navigation_embeds_left_pads_shorter_rows():
     from rlinf.models.embodiment.uninavid.uninavid_action_model import (
         UniNaVidForActionPrediction,
@@ -723,6 +922,77 @@ def test_uninavid_batched_debug_rollout_metadata_records_prompt_and_frames():
     ]
     assert metadata["debug"]["episode_ids"] == [100, 200]
     assert metadata["debug"]["new_frame_counts"] == [1, 1]
+
+
+def test_uninavid_batched_rollout_trace_writes_jsonl_records(tmp_path):
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeBatchedModel()
+    tokenizer = FakeBatchedTokenizer()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=tokenizer,
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    trace_dir = tmp_path / "uninavid-batched-trace"
+    policy.cfg = SimpleNamespace(
+        rollout_mode="batched_feature_cache",
+        num_action_chunks=4,
+        rollout_trace_dir=str(trace_dir),
+    )
+    env_obs = {
+        "wrist_images": torch.stack(
+            [
+                torch.zeros(4, 4, 3, dtype=torch.uint8),
+                torch.full((4, 4, 3), 20, dtype=torch.uint8),
+            ]
+        ),
+        "task_descriptions": ["go to room one", "go to room two"],
+        "states": torch.tensor([100, 200]),
+    }
+
+    policy.predict_action_batch(env_obs=env_obs, mode="eval")
+
+    trace_files = list(trace_dir.glob("*.jsonl"))
+    assert len(trace_files) == 1
+    lines = trace_files[0].read_text().splitlines()
+    assert len(lines) == 2
+    records = [json.loads(line) for line in lines]
+
+    assert records[0]["episode_id"] == 100
+    assert records[0]["slot_id"] == 0
+    assert records[0]["rollout_mode"] == "batched_feature_cache"
+    assert records[0]["prompt"] == build_navigation_prompt("go to room one")
+    assert records[0]["input_ids_shape"][0] == 1
+    assert isinstance(records[0]["input_ids_hash"], str)
+    assert len(records[0]["input_ids_hash"]) == 64
+    assert records[0]["image_batch_shape"] == [1, 3, 4, 4]
+    assert records[0]["image_tensor_sum"] == 0.0
+    assert records[0]["output_text"] == tokenizer.texts[0]
+    assert records[0]["parsed_action_ids"] == parse_uninavid_actions(
+        tokenizer.texts[0],
+        4,
+    ).squeeze(-1).tolist()
+    assert records[0]["new_frame_count"] == 1
+
+    assert records[1]["episode_id"] == 200
+    assert records[1]["slot_id"] == 1
+    assert records[1]["rollout_mode"] == "batched_feature_cache"
+    assert records[1]["prompt"] == build_navigation_prompt("go to room two")
+    assert records[1]["input_ids_shape"][0] == 1
+    assert isinstance(records[1]["input_ids_hash"], str)
+    assert len(records[1]["input_ids_hash"]) == 64
+    assert records[1]["image_batch_shape"] == [1, 3, 4, 4]
+    assert records[1]["image_tensor_sum"] == 960.0
+    assert records[1]["output_text"] == tokenizer.texts[1]
+    assert records[1]["parsed_action_ids"] == parse_uninavid_actions(
+        tokenizer.texts[1],
+        4,
+    ).squeeze(-1).tolist()
+    assert records[1]["new_frame_count"] == 1
 
 
 def test_uninavid_batched_feature_cache_strictly_restores_absent_run_type():

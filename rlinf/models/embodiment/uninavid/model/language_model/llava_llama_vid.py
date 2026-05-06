@@ -89,22 +89,46 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        if not self.training:
-            if images[0].device != self.device:
-                images[0] = images[0].to(device=self.device)
-            if input_ids.device != self.device:
-                input_ids = input_ids.to(device=self.device)
+        use_no_images_fast_path = images is None
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = (
-            self.prepare_inputs_labels_for_multimodal(
-                input_ids,
-                attention_mask,
-                past_key_values,
-                labels,
-                images,
-                prompts=prompts,
+        if use_no_images_fast_path:
+            if (
+                not self.training
+                and inputs_embeds is not None
+                and inputs_embeds.device != self.device
+            ):
+                inputs_embeds = inputs_embeds.to(device=self.device)
+            if (
+                not self.training
+                and input_ids is not None
+                and input_ids.device != self.device
+            ):
+                input_ids = input_ids.to(device=self.device)
+            if (
+                not self.training
+                and attention_mask is not None
+                and attention_mask.device != self.device
+            ):
+                attention_mask = attention_mask.to(device=self.device)
+            if not self.training and labels is not None and labels.device != self.device:
+                labels = labels.to(device=self.device)
+        else:
+            if not self.training:
+                if images[0].device != self.device:
+                    images[0] = images[0].to(device=self.device)
+                if input_ids.device != self.device:
+                    input_ids = input_ids.to(device=self.device)
+
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels = (
+                self.prepare_inputs_labels_for_multimodal(
+                    input_ids,
+                    attention_mask,
+                    past_key_values,
+                    labels,
+                    images,
+                    prompts=prompts,
+                )
             )
-        )
 
         torch.cuda.empty_cache()
 

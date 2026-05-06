@@ -72,9 +72,9 @@ algorithm:
   sampling_params:
     do_sample: True
     temperature_train: 0.5
-    temperature_eval: 0.5
-    top_k: 0
-    top_p: 1.0
+    temperature_eval: 0.2
+    top_k: 50
+    top_p: 0.6
     repetition_penalty: 1.0
     add_BOS: False
 

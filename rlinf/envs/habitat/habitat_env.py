@@ -41,6 +41,9 @@ measures.pass_format_check()
 
 logger = logging.getLogger(__name__)
 
+_UNINAVID_ORIGINAL_EARLY_STOP_ROTATION = 25
+_UNINAVID_ORIGINAL_EARLY_STOP_STEPS = 400
+
 
 @registry.register_task_action
 class NoOpAction(SimulatorTaskAction):
@@ -81,7 +84,13 @@ class HabitatEnv(gym.Env):
         self.current_raw_obs = None
 
         self.env_config = self.env.get_env_attr("config")[0]
-        self.initial_distance_to_goal = np.zeros(self.num_envs)
+        self.initial_distance_to_goal = np.full(self.num_envs, np.nan, dtype=np.float32)
+        self._uninavid_early_stop_last_distance_to_goal = np.full(
+            self.num_envs, np.nan, dtype=np.float32
+        )
+        self._uninavid_early_stop_rotation_counts = np.zeros(
+            self.num_envs, dtype=np.int32
+        )
 
         self.action_map = {
             0: "stop",
@@ -108,7 +117,89 @@ class HabitatEnv(gym.Env):
         self._is_start = value
 
     def _habitat_model_type(self):
-        return getattr(self.cfg, "model_type", None)
+        return getattr(getattr(self, "cfg", None), "model_type", None)
+
+    def _uninavid_use_raw_rgb_enabled(self):
+        return self._habitat_model_type() == "uninavid" and bool(
+            getattr(self.cfg, "uninavid_use_raw_rgb", False)
+        )
+
+    def _uninavid_original_early_stop_enabled(self):
+        return (
+            self._habitat_model_type() == "uninavid"
+            and bool(getattr(self.cfg, "uninavid_original_early_stop", False))
+            and bool(
+                getattr(self, "auto_reset", getattr(self.cfg, "auto_reset", False))
+            )
+        )
+
+    def _ensure_uninavid_early_stop_state(self):
+        state_shape = (self.num_envs,)
+        if (
+            not hasattr(self, "_uninavid_early_stop_last_distance_to_goal")
+            or self._uninavid_early_stop_last_distance_to_goal.shape != state_shape
+        ):
+            self._uninavid_early_stop_last_distance_to_goal = np.full(
+                self.num_envs, np.nan, dtype=np.float32
+            )
+        if (
+            not hasattr(self, "_uninavid_early_stop_rotation_counts")
+            or self._uninavid_early_stop_rotation_counts.shape != state_shape
+        ):
+            self._uninavid_early_stop_rotation_counts = np.zeros(
+                self.num_envs, dtype=np.int32
+            )
+
+    def _reset_uninavid_early_stop_state(self, env_idx):
+        self._ensure_uninavid_early_stop_state()
+        self._uninavid_early_stop_last_distance_to_goal[env_idx] = np.nan
+        self._uninavid_early_stop_rotation_counts[env_idx] = 0
+
+    def _apply_uninavid_original_early_stop(self, actions):
+        if not self._uninavid_original_early_stop_enabled():
+            return actions
+
+        self._ensure_uninavid_early_stop_state()
+        rotation_threshold = int(
+            getattr(
+                self.cfg,
+                "uninavid_early_stop_rotation",
+                _UNINAVID_ORIGINAL_EARLY_STOP_ROTATION,
+            )
+        )
+        step_threshold = int(
+            getattr(
+                self.cfg,
+                "uninavid_early_stop_steps",
+                _UNINAVID_ORIGINAL_EARLY_STOP_STEPS,
+            )
+        )
+        pre_step_iter_count = np.maximum(self._elapsed_steps - 1, 0)
+        should_stop = (
+            self._uninavid_early_stop_rotation_counts > rotation_threshold
+        ) | (pre_step_iter_count > step_threshold)
+        if not should_stop.any():
+            return actions
+
+        actions = actions.copy()
+        actions[should_stop] = "stop"
+        return actions
+
+    def _update_uninavid_original_early_stop_state(self, info_lists):
+        if not self._uninavid_original_early_stop_enabled():
+            return
+
+        self._ensure_uninavid_early_stop_state()
+        distance_to_goal = np.array(
+            [info["distance_to_goal"] for info in info_lists], dtype=np.float32
+        )
+        last_distance_to_goal = self._uninavid_early_stop_last_distance_to_goal
+        distance_changed = np.isnan(last_distance_to_goal) | (
+            distance_to_goal != last_distance_to_goal
+        )
+        self._uninavid_early_stop_rotation_counts[distance_changed] = 0
+        self._uninavid_early_stop_rotation_counts[~distance_changed] += 1
+        last_distance_to_goal[:] = distance_to_goal
 
     def _attach_uninavid_chunk_history(self, obs_list):
         if self._habitat_model_type() != "uninavid":
@@ -122,9 +213,80 @@ class HabitatEnv(gym.Env):
             dim=1,
         )
 
+    def _habitat_step_trace_dir(self):
+        cfg = getattr(self, "cfg", None)
+        trace_dir = getattr(cfg, "habitat_step_trace_dir", None)
+        if trace_dir:
+            return trace_dir
+        return os.environ.get("RLINF_HABITAT_TRACE_DIR")
+
+    def _append_habitat_step_trace(
+        self,
+        proposed_actions,
+        executed_actions,
+        info_lists,
+        early_stop_applied,
+    ):
+        trace_dir = self._habitat_step_trace_dir()
+        if not trace_dir:
+            return
+
+        episode_ids = self.env.get_current_episode_metadata()["episode_id"]
+        rotation_counts = getattr(
+            self,
+            "_uninavid_early_stop_rotation_counts",
+            np.zeros(self.num_envs, dtype=np.int32),
+        )
+        os.makedirs(trace_dir, exist_ok=True)
+
+        for env_idx, episode_id in enumerate(episode_ids):
+            info = info_lists[env_idx]
+            distance_to_goal = info.get("distance_to_goal")
+            trajectory_length = info.get("trajectory_Length")
+            record = {
+                "episode_id": str(episode_id),
+                "elapsed_step": int(self._elapsed_steps[env_idx]),
+                "proposed_action": str(proposed_actions[env_idx]),
+                "executed_action": str(executed_actions[env_idx]),
+                "distance_to_goal": (
+                    None if distance_to_goal is None else float(distance_to_goal)
+                ),
+                "trajectory_Length": (
+                    None if trajectory_length is None else float(trajectory_length)
+                ),
+                "early_stop_applied": bool(early_stop_applied[env_idx]),
+                "rotation_count": int(rotation_counts[env_idx]),
+            }
+            trace_path = os.path.join(trace_dir, f"episode_{episode_id}.jsonl")
+            with open(trace_path, "a") as f:
+                json.dump(record, f, ensure_ascii=False)
+                f.write("\n")
+
+    @staticmethod
+    def _format_habitat_actions(actions):
+        formatted_actions = []
+        for action in actions:
+            action_array = np.asarray(action)
+            if action_array.shape:
+                if action_array.size != 1:
+                    raise ValueError(
+                        "Habitat navigation expects one discrete action per env."
+                    )
+                action = action_array.reshape(-1)[0]
+            formatted_actions.append({"action": str(action)})
+        return formatted_actions
+
+    @staticmethod
+    def _squeeze_singleton_action_dim(actions):
+        actions = np.asarray(actions)
+        if actions.ndim > 1 and actions.shape[-1] == 1:
+            return np.squeeze(actions, axis=-1)
+        return actions
+
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_actions = np.vectorize(lambda x: self.action_map[x])(chunk_actions)
+        chunk_actions = self._squeeze_singleton_action_dim(chunk_actions)
         chunk_size = chunk_actions.shape[1]
         obs_list = []
         infos_list = []
@@ -155,17 +317,43 @@ class HabitatEnv(gym.Env):
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
-        for i in range(chunk_size):
-            actions = chunk_actions[:, i]
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                actions
-            )
-            obs_list.append(extracted_obs)
-            infos_list.append(infos)
+        original_auto_reset = self.auto_reset
+        num_envs = getattr(self, "num_envs", chunk_actions.shape[0])
+        deferred_reset_dones = np.zeros(num_envs, dtype=bool)
+        if original_auto_reset:
+            self.auto_reset = False
+        try:
+            for i in range(chunk_size):
+                actions = chunk_actions[:, i].copy()
+                if deferred_reset_dones.any():
+                    actions[deferred_reset_dones] = "no_op"
+                extracted_obs, step_reward, terminations, truncations, infos = (
+                    self.step(actions)
+                )
+                obs_list.append(extracted_obs)
+                infos_list.append(infos)
 
-            chunk_rewards.append(step_reward)
-            raw_chunk_terminations.append(terminations)
-            raw_chunk_truncations.append(truncations)
+                chunk_rewards.append(step_reward)
+                raw_chunk_terminations.append(terminations)
+                raw_chunk_truncations.append(truncations)
+
+                step_reset_dones = infos.get("_reset_dones_mask")
+                if isinstance(step_reset_dones, torch.Tensor):
+                    step_reset_dones = step_reset_dones.cpu().numpy()
+                elif step_reset_dones is None:
+                    step_reset_dones = torch.logical_or(
+                        terminations, truncations
+                    ).cpu().numpy()
+                deferred_reset_dones |= np.asarray(step_reset_dones, dtype=bool)
+        finally:
+            self.auto_reset = original_auto_reset
+
+        if original_auto_reset and deferred_reset_dones.any():
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                deferred_reset_dones,
+                obs_list[-1],
+                infos_list[-1],
+            )
 
         self._attach_uninavid_chunk_history(obs_list)
 
@@ -195,20 +383,36 @@ class HabitatEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+        actions = self._squeeze_singleton_action_dim(actions)
         self._elapsed_steps += 1
 
         # After excuting "stop" action, habitat env needs reset to process the next action.
         # Replace "stop" with "no_op" before stepping the underlying env to avoid unable
         # to process the next action.
-        actions = actions.astype("U12")
-        is_stop = actions == "stop"
-        actions[is_stop] = "no_op"
+        proposed_actions = actions.astype("U12")
+        policy_actions = self._apply_uninavid_original_early_stop(
+            proposed_actions.copy()
+        )
+        early_stop_applied = policy_actions != proposed_actions
+        executed_actions = policy_actions.copy()
+        env_actions = executed_actions.copy()
+        is_stop = env_actions == "stop"
+        env_actions[is_stop] = "no_op"
 
-        raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+        raw_obs, _reward, terminations, info_lists = self.env.step(
+            self._format_habitat_actions(env_actions)
+        )
+        self._update_uninavid_original_early_stop_state(info_lists)
+        self._append_habitat_step_trace(
+            proposed_actions=proposed_actions,
+            executed_actions=executed_actions,
+            info_lists=info_lists,
+            early_stop_applied=early_stop_applied,
+        )
 
         # If some envs execute "no_op", manually normalize depth observations
         # according to Habitat's depth sensor config.
-        self._normalize_depth(actions, raw_obs)
+        self._normalize_depth(env_actions, raw_obs)
 
         terminations[is_stop] = True
         # TODO: what if termination means failure? (e.g. robot falling down)
@@ -228,12 +432,13 @@ class HabitatEnv(gym.Env):
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs, info_lists)
 
+        reset_dones = terminations | truncations
+        infos["_reset_dones_mask"] = reset_dones.copy()
         if self.ignore_terminations:
             terminations[:] = False
-        dones = terminations | truncations
 
-        if dones.any() and self.auto_reset:
-            obs, infos = self._handle_auto_reset(dones, obs, infos)
+        if reset_dones.any() and self.auto_reset:
+            obs, infos = self._handle_auto_reset(reset_dones, obs, infos)
 
         return (
             obs,
@@ -254,6 +459,16 @@ class HabitatEnv(gym.Env):
         self._elapsed_steps[env_idx] = 0
         self.prev_step_reward[env_idx] = 0.0
         self.dones_once[env_idx] = False
+        self.initial_distance_to_goal[env_idx] = np.nan
+        self._reset_uninavid_early_stop_state(env_idx)
+        current_metrics = self.env.get_current_metrics(env_idx)
+        distance_to_goal = current_metrics.get("distance_to_goal", None)
+        if distance_to_goal is not None:
+            distance_to_goal = np.asarray(distance_to_goal, dtype=np.float32)
+            self.initial_distance_to_goal[env_idx] = distance_to_goal
+            self._uninavid_early_stop_last_distance_to_goal[env_idx] = (
+                distance_to_goal
+            )
         if self.first_done_infos is not None and "episode" in self.first_done_infos:
             episode = self.first_done_infos["episode"]
             device = next(iter(episode.values())).device
@@ -304,6 +519,7 @@ class HabitatEnv(gym.Env):
 
     def _wrap_obs(self, obs_list, info_lists=None):
         image_list = []
+        raw_rgb_list = []
         task_descs = []
         token_list = []
         should_render_video = info_lists is not None and self.cfg.video_cfg.save_video
@@ -312,15 +528,18 @@ class HabitatEnv(gym.Env):
             info = info_lists[i] if info_lists is not None else None
             if should_render_video:
                 images = observations_to_image(obs, info)
-                image_size = (images["rgb"].shape[1], images["rgb"].shape[0])
-                images["top_down_map"] = cv2.resize(
-                    images["top_down_map"],
-                    dsize=image_size,
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                images["concat"] = np.concatenate(
-                    (images["rgb"], images["top_down_map"]), axis=1
-                )
+                if "top_down_map" in images:
+                    image_size = (images["rgb"].shape[1], images["rgb"].shape[0])
+                    images["top_down_map"] = cv2.resize(
+                        images["top_down_map"],
+                        dsize=image_size,
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    images["concat"] = np.concatenate(
+                        (images["rgb"], images["top_down_map"]), axis=1
+                    )
+                else:
+                    images["concat"] = images["rgb"]
             else:
                 images = observations_to_image(obs)
             inst = str(obs["instruction"].get("text", ""))
@@ -328,18 +547,25 @@ class HabitatEnv(gym.Env):
             # https://github.com/jacobkrantz/VLN-CE for more details.
             token = obs["instruction"].get("tokens", [])
             image_list.append(images)
+            raw_rgb_list.append(obs["rgb"])
             task_descs.append(inst)
             token_list.append(token)
         image_tensor = to_tensor(list_of_dict_to_dict_of_list(image_list))
+        raw_rgb_tensor = None
+        if self._uninavid_use_raw_rgb_enabled():
+            raw_rgb_tensor = to_tensor(raw_rgb_list)
 
         episode_ids = self.env.get_current_episode_metadata()["episode_id"]
 
         obs = {}
         if should_render_video:
             obs["main_images"] = image_tensor["concat"].clone()  # [N_ENV, H, W, C]
-        obs["wrist_images"] = image_tensor[
-            "rgb"
-        ].clone()  # Temporarily use wrist_images to store rgb images
+        if raw_rgb_tensor is not None:
+            obs["wrist_images"] = raw_rgb_tensor.clone()
+        else:
+            obs["wrist_images"] = image_tensor[
+                "rgb"
+            ].clone()  # Temporarily use wrist_images to store rgb images
         if "depth" in image_tensor:
             depth_tensor = image_tensor["depth"].clone()
             obs["extra_view_images"] = depth_tensor.unsqueeze(1)  # [N_ENV, 1, H, W, C]
@@ -385,10 +611,11 @@ class HabitatEnv(gym.Env):
 
         # Record initial distance to goal at the first step of each episode
         is_first_step = self._elapsed_steps == 1
-        if is_first_step.any():
-            self.initial_distance_to_goal[is_first_step] = episode_info[
+        needs_seed = is_first_step & np.isnan(self.initial_distance_to_goal)
+        if needs_seed.any():
+            self.initial_distance_to_goal[needs_seed] = episode_info[
                 "distance_to_goal"
-            ][is_first_step].copy()
+            ][needs_seed].copy()
 
         episode_info["success"] = (
             terminations & (episode_info["distance_to_goal"] < dist_threshold)
@@ -453,6 +680,8 @@ class HabitatEnv(gym.Env):
                         self.metrics_cfg.metrics_base_dir, f"episode_{episode_id}.json"
                     )
                     os.makedirs(self.metrics_cfg.metrics_base_dir, exist_ok=True)
+                    if os.path.exists(metrics_file):
+                        continue
                     with open(metrics_file, "w") as f:
                         json.dump(metrics_dict, f, indent=2, ensure_ascii=False)
 

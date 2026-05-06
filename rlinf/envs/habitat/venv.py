@@ -57,6 +57,9 @@ class HabitatRLEnv(RLEnv):
     def step(self, *args, **kwargs):
         return super().step(*args, **kwargs)
 
+    def get_current_metrics(self):
+        return self.habitat_env.get_metrics()
+
     def get_reward_range(self):
         return (-np.inf, np.inf)
 
@@ -175,6 +178,11 @@ def _worker(
                         "episode_id": getattr(episode, "episode_id", None),
                     }
                 )
+            elif cmd == "get_current_metrics":
+                if hasattr(env, "get_current_metrics"):
+                    p.send(env.get_current_metrics())
+                else:
+                    p.send({})
             elif cmd == "reconfigure":
                 env.close()
                 config = data.pop("config")
@@ -249,3 +257,20 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
                 episode_metadata[key].append(value)
 
         return episode_metadata
+
+    def get_current_metrics(self, id=None):
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(id)
+
+        metrics: dict[str, list[Any]] = {}
+        for i in id:
+            self.workers[i].parent_remote.send(["get_current_metrics", None])
+            worker_metrics = self.workers[i].parent_remote.recv()
+            for key, value in worker_metrics.items():
+                if key not in metrics:
+                    metrics[key] = []
+                metrics[key].append(value)
+
+        return metrics
