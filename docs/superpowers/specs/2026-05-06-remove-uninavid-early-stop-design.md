@@ -119,3 +119,30 @@ If the environment dependencies are available, run a small UniNaVid eval smoke t
 - aggregate `num_trajectories` matches the configured episode count formula.
 
 If Habitat/UniNaVid assets or dependencies are unavailable, report that the runtime smoke test could not be executed and include the completed static verification.
+
+## Acceptance Loop
+
+After implementation, run the UniNaVid Habitat eval using the same acceptance setup represented by:
+
+```text
+results/uninavid_habitat/20260505T160803Z-acceptance/batched_candidate_greedy_v2
+```
+
+Use that directory as the reference for the run mode and metric floor. Its recorded RLinf baseline is:
+
+```json
+{
+  "episodes_valid": 100,
+  "success_rate": 0.49,
+  "spl": 0.45595802783966066
+}
+```
+
+The implementation is not complete if `success_rate` or `spl` drops by more than 2 absolute percentage points from that baseline. In decimal metric form, this means the new run must satisfy:
+
+```text
+success_rate >= 0.47
+spl >= 0.43595802783966064
+```
+
+If either metric fails this floor, continue the implementation/debugging loop until both metrics are within the 2-point tolerance. Fixes in that loop must preserve the design goals above: do not reintroduce EARLY_STOP, action-rewrite heuristics, or post-processing bandages to recover the metric.
