@@ -22,7 +22,7 @@ import rlinf.envs.habitat.habitat_env as habitat_env_module
 from rlinf.envs.habitat.habitat_env import HabitatEnv
 
 
-def test_habitat_attaches_uninavid_chunk_rgb_history():
+def test_habitat_packs_uninavid_chunk_rgb_history_into_wrist_images():
     env = object.__new__(HabitatEnv)
     env.cfg = SimpleNamespace(model_type="uninavid")
     obs_list = [
@@ -33,9 +33,9 @@ def test_habitat_attaches_uninavid_chunk_rgb_history():
 
     env._attach_uninavid_chunk_history(obs_list)
 
-    assert "wrist_images_history" in obs_list[-1]
-    assert obs_list[-1]["wrist_images_history"].shape == (2, 3, 4, 4, 3)
-    assert obs_list[-1]["wrist_images_history"][0, :, 0, 0, 0].tolist() == [1, 2, 3]
+    assert "wrist_images_history" not in obs_list[-1]
+    assert obs_list[-1]["wrist_images"].shape == (2, 3, 4, 4, 3)
+    assert obs_list[-1]["wrist_images"][0, :, 0, 0, 0].tolist() == [1, 2, 3]
 
 
 def test_habitat_does_not_attach_chunk_history_for_other_models():

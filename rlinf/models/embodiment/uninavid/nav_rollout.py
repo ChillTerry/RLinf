@@ -111,10 +111,10 @@ def tensor_to_rgb_numpy(frame: torch.Tensor | np.ndarray) -> np.ndarray:
 
 
 def select_slot_rgb_frames(env_obs: dict[str, Any], slot_id: int) -> list[np.ndarray]:
-    if "wrist_images_history" in env_obs and env_obs["wrist_images_history"] is not None:
-        history = env_obs["wrist_images_history"][slot_id]
-        return [tensor_to_rgb_numpy(frame) for frame in history]
-    return [tensor_to_rgb_numpy(env_obs["wrist_images"][slot_id])]
+    slot_images = env_obs["wrist_images"][slot_id]
+    if getattr(slot_images, "ndim", None) == 4:
+        return [tensor_to_rgb_numpy(frame) for frame in slot_images]
+    return [tensor_to_rgb_numpy(slot_images)]
 
 
 def episode_id_from_obs(env_obs: dict[str, Any], slot_id: int) -> int:

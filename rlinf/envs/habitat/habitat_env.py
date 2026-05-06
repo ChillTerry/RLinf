@@ -208,7 +208,7 @@ class HabitatEnv(gym.Env):
             return
         if any("wrist_images" not in obs for obs in obs_list):
             return
-        obs_list[-1]["wrist_images_history"] = torch.stack(
+        obs_list[-1]["wrist_images"] = torch.stack(
             [obs["wrist_images"] for obs in obs_list],
             dim=1,
         )

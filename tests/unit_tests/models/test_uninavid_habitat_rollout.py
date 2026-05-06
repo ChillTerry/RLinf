@@ -112,10 +112,9 @@ def test_uninavid_prompt_matches_original_template():
     assert prompt == expected_prompt
 
 
-def test_uninavid_select_slot_rgb_frames_prefers_chunk_history():
+def test_uninavid_select_slot_rgb_frames_accepts_chronological_wrist_image_sequence():
     env_obs = {
-        "wrist_images": torch.zeros(2, 3, 4, 4, 3, dtype=torch.uint8),
-        "wrist_images_history": torch.stack(
+        "wrist_images": torch.stack(
             [
                 torch.full((2, 4, 4, 3), 11, dtype=torch.uint8),
                 torch.full((2, 4, 4, 3), 22, dtype=torch.uint8),
@@ -133,11 +132,10 @@ def test_uninavid_select_slot_rgb_frames_prefers_chunk_history():
     assert frames[1][0, 0, 0] == 22
 
 
-def test_env_output_preserves_uninavid_wrist_image_history():
+def test_env_output_preserves_chronological_wrist_images_without_history_payload():
     env_output = EnvOutput(
         obs={
-            "wrist_images": torch.zeros(1, 4, 4, 3, dtype=torch.uint8),
-            "wrist_images_history": torch.stack(
+            "wrist_images": torch.stack(
                 [
                     torch.full((1, 4, 4, 3), 11, dtype=torch.uint8),
                     torch.full((1, 4, 4, 3), 22, dtype=torch.uint8),
@@ -151,10 +149,11 @@ def test_env_output_preserves_uninavid_wrist_image_history():
 
     obs_dict = env_output.to_dict()["obs"]
 
-    assert "wrist_images_history" in obs_dict
-    assert obs_dict["wrist_images_history"].shape == (1, 2, 4, 4, 3)
-    assert obs_dict["wrist_images_history"][0, 0, 0, 0, 0].item() == 11
-    assert obs_dict["wrist_images_history"][0, 1, 0, 0, 0].item() == 22
+    assert "wrist_images" in obs_dict
+    assert obs_dict["wrist_images"].shape == (1, 2, 4, 4, 3)
+    assert obs_dict["wrist_images"][0, 0, 0, 0, 0].item() == 11
+    assert obs_dict["wrist_images"][0, 1, 0, 0, 0].item() == 22
+    assert obs_dict["wrist_images_history"] is None
 
 
 def test_uninavid_empty_rollout_metadata_has_no_training_terms():
