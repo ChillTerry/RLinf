@@ -213,55 +213,6 @@ class HabitatEnv(gym.Env):
             dim=1,
         )
 
-    def _habitat_step_trace_dir(self):
-        cfg = getattr(self, "cfg", None)
-        trace_dir = getattr(cfg, "habitat_step_trace_dir", None)
-        if trace_dir:
-            return trace_dir
-        return os.environ.get("RLINF_HABITAT_TRACE_DIR")
-
-    def _append_habitat_step_trace(
-        self,
-        proposed_actions,
-        executed_actions,
-        info_lists,
-        early_stop_applied,
-    ):
-        trace_dir = self._habitat_step_trace_dir()
-        if not trace_dir:
-            return
-
-        episode_ids = self.env.get_current_episode_metadata()["episode_id"]
-        rotation_counts = getattr(
-            self,
-            "_uninavid_early_stop_rotation_counts",
-            np.zeros(self.num_envs, dtype=np.int32),
-        )
-        os.makedirs(trace_dir, exist_ok=True)
-
-        for env_idx, episode_id in enumerate(episode_ids):
-            info = info_lists[env_idx]
-            distance_to_goal = info.get("distance_to_goal")
-            trajectory_length = info.get("trajectory_Length")
-            record = {
-                "episode_id": str(episode_id),
-                "elapsed_step": int(self._elapsed_steps[env_idx]),
-                "proposed_action": str(proposed_actions[env_idx]),
-                "executed_action": str(executed_actions[env_idx]),
-                "distance_to_goal": (
-                    None if distance_to_goal is None else float(distance_to_goal)
-                ),
-                "trajectory_Length": (
-                    None if trajectory_length is None else float(trajectory_length)
-                ),
-                "early_stop_applied": bool(early_stop_applied[env_idx]),
-                "rotation_count": int(rotation_counts[env_idx]),
-            }
-            trace_path = os.path.join(trace_dir, f"episode_{episode_id}.jsonl")
-            with open(trace_path, "a") as f:
-                json.dump(record, f, ensure_ascii=False)
-                f.write("\n")
-
     @staticmethod
     def _format_habitat_actions(actions):
         formatted_actions = []
@@ -393,7 +344,6 @@ class HabitatEnv(gym.Env):
         policy_actions = self._apply_uninavid_original_early_stop(
             proposed_actions.copy()
         )
-        early_stop_applied = policy_actions != proposed_actions
         executed_actions = policy_actions.copy()
         env_actions = executed_actions.copy()
         is_stop = env_actions == "stop"
@@ -403,12 +353,6 @@ class HabitatEnv(gym.Env):
             self._format_habitat_actions(env_actions)
         )
         self._update_uninavid_original_early_stop_state(info_lists)
-        self._append_habitat_step_trace(
-            proposed_actions=proposed_actions,
-            executed_actions=executed_actions,
-            info_lists=info_lists,
-            early_stop_applied=early_stop_applied,
-        )
 
         # If some envs execute "no_op", manually normalize depth observations
         # according to Habitat's depth sensor config.

@@ -14,11 +14,7 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
-import os
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -485,183 +481,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             )
         )
 
-    def _record_rollout_debug(self) -> bool:
-        return bool(
-            self._cfg_get(
-                getattr(self, "cfg", None),
-                "record_rollout_debug",
-                default=False,
-            )
-        )
-
-    def _rollout_trace_path(self) -> Path | None:
-        cfg = getattr(self, "cfg", None)
-        trace_path = self._cfg_get(cfg, "rollout_trace_path", default=None)
-        if trace_path:
-            return Path(trace_path)
-
-        trace_dir = self._cfg_get(cfg, "rollout_trace_dir", default=None)
-        if trace_dir:
-            return Path(trace_dir) / "uninavid_rollout_trace.jsonl"
-
-        for env_var in (
-            "RLINF_UNINAVID_MODEL_OUTPUT_TRACE_PATH",
-            "UNINAVID_MODEL_OUTPUT_TRACE_PATH",
-        ):
-            env_trace_path = os.getenv(env_var)
-            if env_trace_path:
-                return Path(env_trace_path)
-        return None
-
-    def _rollout_metadata(self, debug: dict[str, Any] | None = None) -> dict[str, Any]:
-        metadata = empty_rollout_metadata()
-        if self._record_rollout_debug() and debug is not None:
-            metadata["debug"] = debug
-        return metadata
-
-    @staticmethod
-    def _trace_episode_id(value: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            return value.item()
-        if hasattr(value, "item") and callable(value.item):
-            try:
-                return value.item()
-            except (TypeError, ValueError):
-                return value
-        return value
-
-    @staticmethod
-    def _trace_action_name(action_id: int) -> str:
-        if action_id == 0:
-            return "stop"
-        if action_id == 1:
-            return "forward"
-        if action_id == 2:
-            return "left"
-        if action_id == 3:
-            return "right"
-        if action_id == 4:
-            return "no_op"
-        return str(action_id)
-
-    @staticmethod
-    def _trace_shape(value: Any) -> list[int] | None:
-        if value is None:
-            return None
-        shape = getattr(value, "shape", None)
-        if shape is None:
-            return None
-        return [int(dim) for dim in shape]
-
-    @staticmethod
-    def _trace_int(value: Any) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, torch.Tensor):
-            if value.numel() != 1:
-                return None
-            return int(value.detach().cpu().item())
-        if hasattr(value, "item") and callable(value.item):
-            try:
-                return int(value.item())
-            except (TypeError, ValueError):
-                return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _trace_tensor_hash(value: Any) -> str | None:
-        if not isinstance(value, torch.Tensor):
-            return None
-        tensor = value.detach().cpu().contiguous()
-        hasher = hashlib.sha256()
-        hasher.update(str(tensor.dtype).encode("ascii"))
-        hasher.update(json.dumps([int(dim) for dim in tensor.shape]).encode("ascii"))
-        try:
-            hasher.update(tensor.numpy().tobytes())
-        except TypeError:
-            hasher.update(tensor.to(dtype=torch.float32).numpy().tobytes())
-        return hasher.hexdigest()
-
-    @staticmethod
-    def _trace_tensor_sum(value: Any) -> float | None:
-        if not isinstance(value, torch.Tensor):
-            return None
-        total = float(value.detach().cpu().to(dtype=torch.float64).sum().item())
-        if not math.isfinite(total):
-            return None
-        return total
-
-    def _trace_generate_input_summary(
-        self,
-        *,
-        input_ids: torch.Tensor | None,
-        images: Any,
-    ) -> dict[str, Any]:
-        image_tensor = None
-        if isinstance(images, torch.Tensor):
-            image_tensor = images
-        elif isinstance(images, list) and images and isinstance(images[0], torch.Tensor):
-            image_tensor = images[0]
-        return {
-            "input_ids_shape": self._trace_shape(input_ids),
-            "input_ids_hash": self._trace_tensor_hash(input_ids),
-            "image_batch_shape": self._trace_shape(image_tensor),
-            "image_tensor_sum": self._trace_tensor_sum(image_tensor),
-        }
-
-    def _trace_nav_cache_summary(self, backbone: Any) -> dict[str, Any]:
-        return {
-            "feat_cache_shape": self._trace_shape(getattr(backbone, "feat_cache", None)),
-            "long_feat_cache_shape": self._trace_shape(
-                getattr(backbone, "long_feat_cache", None)
-            ),
-            "weight": self._trace_int(getattr(backbone, "weight", None)),
-            "new_frames": self._trace_int(getattr(backbone, "new_frames", None)),
-        }
-
-    def _write_rollout_trace(
-        self,
-        *,
-        episode_id: Any,
-        slot_id: int,
-        prompt: str,
-        output_text: str,
-        parsed_actions: torch.Tensor,
-        new_frame_count: int,
-        input_summary: dict[str, Any] | None = None,
-        cache_summary: dict[str, Any] | None = None,
-    ) -> None:
-        trace_path = self._rollout_trace_path()
-        if trace_path is None:
-            return
-
-        trace_path.parent.mkdir(parents=True, exist_ok=True)
-        parsed_action_ids = [
-            int(action_id) for action_id in parsed_actions.view(-1).detach().cpu().tolist()
-        ]
-        record = {
-            "episode_id": self._trace_episode_id(episode_id),
-            "slot_id": int(slot_id),
-            "rollout_mode": self.rollout_mode,
-            "prompt": prompt,
-            "navigation_text": output_text,
-            "output_text": output_text,
-            "parsed_actions": [
-                self._trace_action_name(action_id) for action_id in parsed_action_ids
-            ],
-            "parsed_action_ids": parsed_action_ids,
-            "new_frame_count": int(new_frame_count),
-        }
-        if input_summary is not None:
-            record.update(input_summary)
-        if cache_summary is not None:
-            record.update(cache_summary)
-        with trace_path.open("a", encoding="utf-8") as trace_file:
-            trace_file.write(json.dumps(record, ensure_ascii=True) + "\n")
-
     def _load_nav_cache_into_model(self, cache: UniNaVidNavCache) -> None:
         backbone = self.model.get_model()
         backbone.feat_cache = cache.feat_cache
@@ -817,12 +636,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
     def _predict_action_batch_sequential_cache(self, env_obs, **generation_kwargs):
         batch_size = len(env_obs["task_descriptions"])
         action_chunks = []
-        trace_enabled = self._rollout_trace_path() is not None
-        debug = {
-            "prompts": [],
-            "episode_ids": [],
-            "new_frame_counts": [],
-        }
 
         missing_run_type = object()
         original_run_type = getattr(self.model.config, "run_type", missing_run_type)
@@ -841,17 +654,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 navigation_prompt = build_navigation_prompt(instruction)
                 input_ids = self._build_navigation_input_ids(navigation_prompt)
                 rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
-                debug["prompts"].append(navigation_prompt)
-                debug["episode_ids"].append(episode_id)
-                debug["new_frame_counts"].append(len(rgb_frames))
                 self.model.get_model().new_frames = len(rgb_frames)
                 images = self._preprocess_navigation_images(rgb_frames)
-                input_summary = None
-                if trace_enabled:
-                    input_summary = self._trace_generate_input_summary(
-                        input_ids=input_ids,
-                        images=images,
-                    )
                 self.model.update_prompt(
                     [
                         [
@@ -879,17 +683,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                     self.num_action_chunks,
                 )
                 action_chunks.append(parsed_actions)
-                cache_summary = self._trace_nav_cache_summary(self.model.get_model())
-                self._write_rollout_trace(
-                    episode_id=episode_id,
-                    slot_id=slot_id,
-                    prompt=navigation_prompt,
-                    output_text=output_text,
-                    parsed_actions=parsed_actions,
-                    new_frame_count=len(rgb_frames),
-                    input_summary=input_summary,
-                    cache_summary=cache_summary,
-                )
                 self._save_model_nav_cache_to_slot(cache)
         finally:
             self._clear_model_nav_cache()
@@ -900,52 +693,23 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 self.model.config.run_type = original_run_type
 
         actions = torch.stack(action_chunks, dim=0)
-        return actions, self._rollout_metadata(debug)
+        return actions, empty_rollout_metadata()
 
     def _predict_action_batch_batched_feature_cache(self, env_obs, **generation_kwargs):
-        trace_enabled = self._rollout_trace_path() is not None
-        debug = None
-        if self._record_rollout_debug() or trace_enabled:
-            debug = {
-                "prompts": [],
-                "episode_ids": [],
-                "new_frame_counts": [],
-            }
-            if trace_enabled:
-                debug["input_summaries"] = []
-        if debug is None:
-            output_texts = self._generate_batched_navigation_texts(
-                env_obs,
-                generation_kwargs,
-            )
-        else:
-            output_texts = self._generate_batched_navigation_texts(
-                env_obs,
-                generation_kwargs,
-                debug=debug,
-            )
+        output_texts = self._generate_batched_navigation_texts(
+            env_obs,
+            generation_kwargs,
+        )
         action_chunks = []
-        for slot_id, output_text in enumerate(output_texts):
+        for output_text in output_texts:
             normalized_output_text = output_text.strip()
             parsed_actions = parse_uninavid_actions(
                 normalized_output_text,
                 self.num_action_chunks,
             )
             action_chunks.append(parsed_actions)
-            if debug is not None:
-                self._write_rollout_trace(
-                    episode_id=debug["episode_ids"][slot_id],
-                    slot_id=slot_id,
-                    prompt=debug["prompts"][slot_id],
-                    output_text=normalized_output_text,
-                    parsed_actions=parsed_actions,
-                    new_frame_count=debug["new_frame_counts"][slot_id],
-                    input_summary=debug.get("input_summaries", [None] * len(output_texts))[
-                        slot_id
-                    ],
-                )
         actions = torch.stack(action_chunks, dim=0)
-        return actions, self._rollout_metadata(debug)
+        return actions, empty_rollout_metadata()
 
     def _nav_size(self) -> int:
         compress_type = getattr(self.model.config, "compress_type", None)
@@ -1053,8 +817,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         self,
         env_obs,
         generation_kwargs: dict[str, Any],
-        *,
-        debug: dict[str, Any] | None = None,
     ) -> list[str]:
         batch_size = len(env_obs["task_descriptions"])
         prompts: list[str] = []
@@ -1080,25 +842,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 input_ids = full_input_ids[0]
 
                 rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
-                if debug is not None:
-                    debug["prompts"].append(navigation_prompt)
-                    debug["episode_ids"].append(episode_id)
-                    debug["new_frame_counts"].append(len(rgb_frames))
-                preprocessed_images = None
-                if debug is not None and "input_summaries" in debug:
-                    preprocessed_images = self._preprocess_navigation_images(rgb_frames)[0]
-                    debug["input_summaries"].append(
-                        self._trace_generate_input_summary(
-                            input_ids=full_input_ids,
-                            images=preprocessed_images,
-                        )
-                    )
-                if preprocessed_images is None:
-                    visual_features = self._encode_rgb_frames_for_slot(rgb_frames)
-                else:
-                    visual_features = self._encode_preprocessed_rgb_frames(
-                        preprocessed_images
-                    )
+                visual_features = self._encode_rgb_frames_for_slot(rgb_frames)
                 current_tokens = self._update_slot_feature_cache(
                     cache,
                     visual_features,
