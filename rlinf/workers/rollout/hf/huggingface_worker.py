@@ -252,13 +252,19 @@ class MultiStepRolloutWorker(Worker):
     def predict(
         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
         kwargs = (
             self._train_sampling_params
             if mode == "train"
             else self._eval_sampling_params
         )
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        if model_type == SupportedModel.UNINAVID:
+            rollout_mode = (
+                "eval" if self.cfg.algorithm.loss_type == "embodied_dagger" else mode
+            )
+            kwargs = {**kwargs, "mode": rollout_mode}
+        elif model_type in [
             SupportedModel.OPENPI,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
@@ -271,7 +277,7 @@ class MultiStepRolloutWorker(Worker):
             else:
                 kwargs = {"mode": mode}
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        if model_type in [
             SupportedModel.CNN_POLICY,
             SupportedModel.FLOW_POLICY,
             SupportedModel.MLP_POLICY,

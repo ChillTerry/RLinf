@@ -617,10 +617,24 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         mode: str = "eval",
         **kwargs,
     ):
-        if calculate_logprobs or calculate_values:
+        if calculate_values:
             raise NotImplementedError(
-                "Uni-NaVid Habitat rollout currently returns no training logprobs or "
-                "values."
+                "UniNaVid does not provide critic values for GRPO training."
+            )
+        if calculate_logprobs and mode != "train":
+            raise NotImplementedError(
+                "UniNaVid logprob metadata is only available in train mode."
+            )
+
+        if mode == "train":
+            if self.rollout_mode != "batched_feature_cache":
+                raise NotImplementedError(
+                    "UniNaVid train rollout metadata is supported only for "
+                    "rollout_mode='batched_feature_cache'."
+                )
+            return self._predict_action_batch_with_batched_feature_cache_train(
+                env_obs,
+                kwargs,
             )
 
         if self.rollout_mode == "sequential_cache":
@@ -710,6 +724,42 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             action_chunks.append(parsed_actions)
         actions = torch.stack(action_chunks, dim=0)
         return actions, empty_rollout_metadata()
+
+    def _predict_action_batch_with_batched_feature_cache_train(
+        self,
+        env_obs: dict[str, Any],
+        generation_kwargs: dict[str, Any],
+    ):
+        output_texts, prompt_inputs_embeds, prompt_attention_mask, response_ids = (
+            self._generate_batched_navigation_outputs(env_obs, generation_kwargs)
+        )
+        action_chunks = []
+        for output_text in output_texts:
+            parsed_actions = parse_uninavid_actions(
+                output_text.strip(),
+                self.num_action_chunks,
+            )
+            action_chunks.append(parsed_actions)
+        actions = torch.stack(action_chunks, dim=0)
+        response_mask = self._build_response_mask(response_ids)
+        with torch.no_grad():
+            prev_logprobs = self._compute_response_logprobs_from_embeds(
+                prompt_inputs_embeds=prompt_inputs_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                response_ids=response_ids,
+                response_mask=response_mask,
+            )
+        metadata = {
+            "prev_logprobs": prev_logprobs.detach(),
+            "prev_values": None,
+            "forward_inputs": {
+                "prompt_inputs_embeds": prompt_inputs_embeds.detach(),
+                "prompt_attention_mask": prompt_attention_mask.detach(),
+                "response_ids": response_ids.detach(),
+                "response_mask": response_mask.detach(),
+            },
+        }
+        return actions, metadata
 
     def _nav_size(self) -> int:
         compress_type = getattr(self.model.config, "compress_type", None)
@@ -818,6 +868,17 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         env_obs,
         generation_kwargs: dict[str, Any],
     ) -> list[str]:
+        output_texts, _, _, _ = self._generate_batched_navigation_outputs(
+            env_obs,
+            generation_kwargs,
+        )
+        return output_texts
+
+    def _generate_batched_navigation_outputs(
+        self,
+        env_obs: dict[str, Any],
+        generation_kwargs: dict[str, Any],
+    ):
         batch_size = len(env_obs["task_descriptions"])
         prompts: list[str] = []
         embeds: list[torch.Tensor] = []
@@ -869,13 +930,68 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 use_cache=True,
                 **generation_kwargs,
             )
-            return self.tokenizer.batch_decode(
-                output_ids,
+            response_ids = self._response_ids_from_inputs_embeds_generation(output_ids)
+            output_texts = self.tokenizer.batch_decode(
+                response_ids,
                 skip_special_tokens=True,
             )
+            return output_texts, inputs_embeds, attention_mask, response_ids
         finally:
             if original_run_type is missing_run_type:
                 if hasattr(self.model.config, "run_type"):
                     delattr(self.model.config, "run_type")
             else:
                 self.model.config.run_type = original_run_type
+
+    def _response_ids_from_inputs_embeds_generation(
+        self,
+        output_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # HF generation starts from a synthetic one-token sequence when
+        # inputs_embeds are provided without input_ids. Exclude that seed from
+        # response-only rollout metadata and old-logprob recomputation.
+        return output_ids[:, 1:]
+
+    def _build_response_mask(self, response_ids: torch.Tensor) -> torch.Tensor:
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            return torch.ones_like(response_ids, dtype=torch.bool)
+        return response_ids.ne(pad_token_id)
+
+    def _embed_response_ids(self, response_ids: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.model, "get_input_embeddings"):
+            return self.model.get_input_embeddings()(response_ids)
+        if hasattr(self.model, "get_model") and hasattr(
+            self.model.get_model(),
+            "embed_tokens",
+        ):
+            return self.model.get_model().embed_tokens(response_ids)
+        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+            return self.model.model.embed_tokens(response_ids)
+        raise AttributeError("UniNaVid language model does not expose token embeddings.")
+
+    def _compute_response_logprobs_from_embeds(
+        self,
+        *,
+        prompt_inputs_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        response_embeds = self._embed_response_ids(response_ids)
+        full_inputs_embeds = torch.cat([prompt_inputs_embeds, response_embeds], dim=1)
+        full_attention_mask = torch.cat(
+            [prompt_attention_mask, response_mask.to(prompt_attention_mask.dtype)],
+            dim=1,
+        )
+        outputs = self.model(
+            inputs_embeds=full_inputs_embeds,
+            attention_mask=full_attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        prompt_len = prompt_inputs_embeds.shape[1]
+        response_logits = outputs.logits[:, prompt_len - 1 : -1, :]
+        logprobs = torch.log_softmax(response_logits.float(), dim=-1)
+        token_logprobs = logprobs.gather(-1, response_ids.unsqueeze(-1))
+        return token_logprobs * response_mask.unsqueeze(-1).to(token_logprobs.dtype)

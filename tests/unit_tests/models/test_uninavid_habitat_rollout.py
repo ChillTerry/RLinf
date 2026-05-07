@@ -319,15 +319,37 @@ class FakeBatchedModel(torch.nn.Module):
             }
         )
         return torch.tensor(
-            [[10], [11]],
+            [[1, 10], [1, 11]],
             dtype=torch.long,
             device=inputs_embeds.device,
         )
+
+    def forward(
+        self,
+        *,
+        inputs_embeds=None,
+        attention_mask=None,
+        use_cache=False,
+        return_dict=True,
+        **kwargs,
+    ):
+        batch_size, seq_len, _ = inputs_embeds.shape
+        vocab_size = 32
+        logits = torch.full(
+            (batch_size, seq_len, vocab_size),
+            -20.0,
+            device=inputs_embeds.device,
+        )
+        logits[..., 10] = 3.0
+        logits[..., 11] = 2.0
+        logits[..., 12] = 1.0
+        return SimpleNamespace(logits=logits)
 
 
 class FakeBatchedTokenizer(FakeSequentialTokenizer):
     def __init__(self):
         super().__init__(["forward right", "left stop"])
+        self.decoded_token_ids = []
 
     def __call__(self, text, return_tensors=None):
         self.tokenized_texts.append(text)
@@ -337,7 +359,50 @@ class FakeBatchedTokenizer(FakeSequentialTokenizer):
         return SimpleNamespace(input_ids=token_ids)
 
     def batch_decode(self, token_ids, skip_special_tokens=True):
+        self.decoded_token_ids.append(token_ids.detach().cpu().clone())
         return [self.texts[row_index] for row_index in range(token_ids.shape[0])]
+
+
+def make_env_obs(batch_size=2):
+    return {
+        "wrist_images": torch.zeros(batch_size, 2, 4, 4, 3, dtype=torch.uint8),
+        "task_descriptions": [f"go to room {idx}" for idx in range(batch_size)],
+        "states": torch.arange(batch_size),
+    }
+
+
+def make_sequential_policy():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    model = FakeSequentialModel()
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeSequentialTokenizer(model.generated_text),
+        model=model,
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(rollout_mode="sequential_cache", num_action_chunks=4)
+    return policy
+
+
+def make_batched_policy():
+    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
+        UniNaVidForActionPrediction,
+    )
+
+    policy = UniNaVidForActionPrediction(
+        tokenizer=FakeBatchedTokenizer(),
+        model=FakeBatchedModel(),
+        image_processor=FakeSequentialImageProcessor(),
+        torch_dtype=torch.float32,
+    )
+    policy.cfg = SimpleNamespace(
+        rollout_mode="batched_feature_cache",
+        num_action_chunks=4,
+    )
+    return policy
 
 
 def test_uninavid_predict_action_batch_returns_habitat_chunk_shape():
@@ -478,24 +543,62 @@ def test_uninavid_sequential_cache_swaps_slot_state():
     )
 
 
-def test_uninavid_predict_action_batch_rejects_training_terms():
-    from rlinf.models.embodiment.uninavid.uninavid_action_model import (
-        UniNaVidForActionPrediction,
+def test_uninavid_eval_rollout_metadata_stays_empty():
+    policy = make_batched_policy()
+
+    actions, metadata = policy.predict_action_batch(
+        make_env_obs(batch_size=2),
+        mode="eval",
     )
 
-    model = FakeSequentialModel()
-    policy = UniNaVidForActionPrediction(
-        tokenizer=FakeSequentialTokenizer(model.generated_text),
-        model=model,
-        image_processor=FakeSequentialImageProcessor(),
-        torch_dtype=torch.float32,
-    )
-    policy.cfg = SimpleNamespace(rollout_mode="sequential_cache", num_action_chunks=4)
+    assert actions.shape == (2, 4, 1)
+    assert metadata == empty_rollout_metadata()
+    assert policy.tokenizer.decoded_token_ids[-1].tolist() == [[10], [11]]
 
-    with pytest.raises(NotImplementedError):
-        policy.predict_action_batch(env_obs={}, calculate_logprobs=True)
-    with pytest.raises(NotImplementedError):
-        policy.predict_action_batch(env_obs={}, calculate_values=True)
+
+def test_uninavid_batched_train_rollout_returns_response_token_metadata():
+    policy = make_batched_policy()
+
+    actions, metadata = policy.predict_action_batch(
+        make_env_obs(batch_size=2),
+        mode="train",
+    )
+
+    assert actions.shape == (2, 4, 1)
+    assert metadata["prev_values"] is None
+    assert set(metadata["forward_inputs"]) == {
+        "prompt_inputs_embeds",
+        "prompt_attention_mask",
+        "response_ids",
+        "response_mask",
+    }
+    assert metadata["forward_inputs"]["response_ids"].tolist() == [[10], [11]]
+    assert policy.tokenizer.decoded_token_ids[-1].tolist() == [[10], [11]]
+    logits = torch.full((32,), -20.0)
+    logits[10] = 3.0
+    logits[11] = 2.0
+    logits[12] = 1.0
+    expected_logprobs = torch.log_softmax(logits, dim=-1)[
+        metadata["forward_inputs"]["response_ids"]
+    ].unsqueeze(-1)
+    torch.testing.assert_close(metadata["prev_logprobs"], expected_logprobs)
+    assert (
+        metadata["prev_logprobs"].shape
+        == metadata["forward_inputs"]["response_ids"].shape + (1,)
+    )
+    assert (
+        metadata["forward_inputs"]["response_mask"].shape
+        == metadata["forward_inputs"]["response_ids"].shape
+    )
+    assert metadata["prev_logprobs"].requires_grad is False
+    assert metadata["forward_inputs"]["prompt_inputs_embeds"].requires_grad is False
+
+
+def test_uninavid_sequential_train_rollout_rejects_training_metadata():
+    policy = make_sequential_policy()
+
+    with pytest.raises(NotImplementedError, match="batched_feature_cache"):
+        policy.predict_action_batch(make_env_obs(batch_size=1), mode="train")
 
 
 def test_uninavid_predict_action_batch_rejects_unknown_rollout_mode():
