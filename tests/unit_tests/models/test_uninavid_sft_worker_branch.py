@@ -47,6 +47,9 @@ def test_embodied_fsdp_actor_worker_has_uninavid_token_loss_branch():
     assert "SupportedModel.UNINAVID" in source
     assert "prepare_uninavid_token_level_loss_inputs" in source
     assert "get_policy_loss" in uninavid_branch
+    assert "self.loss_agg_func" not in uninavid_branch
+    assert "loss_agg_func = get_loss_agg_func(" in uninavid_branch
+    assert "self.cfg.algorithm.loss_agg_func" in uninavid_branch
     assert "loss, metrics_data = policy_loss(" not in uninavid_branch
     assert "fast_path_zero_loss_mask=True" not in uninavid_branch
 

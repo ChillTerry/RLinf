@@ -18,7 +18,11 @@ import numpy as np
 import pytest
 import torch
 
-from rlinf.data.embodied_io_struct import EnvOutput
+from rlinf.data.embodied_io_struct import (
+    ChunkStepResult,
+    EmbodiedRolloutResult,
+    EnvOutput,
+)
 from rlinf.models.embodiment.uninavid.constants import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
@@ -401,6 +405,7 @@ def make_batched_policy():
     policy.cfg = SimpleNamespace(
         rollout_mode="batched_feature_cache",
         num_action_chunks=4,
+        model_max_length=2048,
     )
     return policy
 
@@ -562,6 +567,7 @@ def test_uninavid_batched_train_rollout_returns_response_token_metadata():
     actions, metadata = policy.predict_action_batch(
         make_env_obs(batch_size=2),
         mode="train",
+        max_new_tokens=3,
     )
 
     assert actions.shape == (2, 4, 1)
@@ -572,16 +578,25 @@ def test_uninavid_batched_train_rollout_returns_response_token_metadata():
         "response_ids",
         "response_mask",
     }
-    assert metadata["forward_inputs"]["response_ids"].tolist() == [[10], [11]]
+    assert metadata["forward_inputs"]["response_ids"].shape == (2, 3)
+    assert metadata["forward_inputs"]["response_ids"].tolist() == [
+        [10, 0, 0],
+        [11, 0, 0],
+    ]
+    assert metadata["forward_inputs"]["response_mask"].tolist() == [
+        [True, False, False],
+        [True, False, False],
+    ]
     assert policy.tokenizer.decoded_token_ids[-1].tolist() == [[10], [11]]
     logits = torch.full((32,), -20.0)
     logits[10] = 3.0
     logits[11] = 2.0
     logits[12] = 1.0
     expected_logprobs = torch.log_softmax(logits, dim=-1)[
-        metadata["forward_inputs"]["response_ids"]
+        torch.tensor([[10], [11]])
     ].unsqueeze(-1)
-    torch.testing.assert_close(metadata["prev_logprobs"], expected_logprobs)
+    torch.testing.assert_close(metadata["prev_logprobs"][:, :1], expected_logprobs)
+    assert metadata["prev_logprobs"][:, 1:].eq(0).all()
     assert (
         metadata["prev_logprobs"].shape
         == metadata["forward_inputs"]["response_ids"].shape + (1,)
@@ -592,6 +607,42 @@ def test_uninavid_batched_train_rollout_returns_response_token_metadata():
     )
     assert metadata["prev_logprobs"].requires_grad is False
     assert metadata["forward_inputs"]["prompt_inputs_embeds"].requires_grad is False
+
+
+def test_uninavid_batched_train_rollout_metadata_stacks_with_growing_nav_cache():
+    policy = make_batched_policy()
+    rollout = EmbodiedRolloutResult(max_episode_length=2)
+    step_prompt_shapes = []
+
+    for _ in range(2):
+        actions, metadata = policy.predict_action_batch(
+            make_env_obs(batch_size=2),
+            mode="train",
+            max_new_tokens=3,
+        )
+        step_prompt_shapes.append(
+            tuple(metadata["forward_inputs"]["prompt_inputs_embeds"].shape)
+        )
+        rollout.append_step_result(
+            ChunkStepResult(
+                actions=actions,
+                prev_logprobs=metadata["prev_logprobs"],
+                prev_values=metadata["prev_values"],
+                forward_inputs=metadata["forward_inputs"],
+            )
+        )
+
+    trajectory = rollout.to_trajectory()
+
+    assert step_prompt_shapes == [(2, 2045, 3), (2, 2045, 3)]
+    assert trajectory.forward_inputs["prompt_inputs_embeds"].shape == (2, 2, 2045, 3)
+    assert trajectory.forward_inputs["prompt_attention_mask"].shape == (2, 2, 2045)
+    assert trajectory.forward_inputs["response_ids"].shape == (2, 2, 3)
+    assert trajectory.forward_inputs["response_mask"].shape == (2, 2, 3)
+    assert trajectory.prev_logprobs.shape == (2, 2, 3, 1)
+    assert trajectory.forward_inputs["response_mask"][:, :, 0].all()
+    assert not trajectory.forward_inputs["response_mask"][:, :, 1:].any()
+    assert trajectory.prev_logprobs[:, :, 1:].eq(0).all()
 
 
 def test_uninavid_sequential_train_rollout_rejects_training_metadata():

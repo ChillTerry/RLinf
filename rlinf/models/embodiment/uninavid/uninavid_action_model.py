@@ -787,7 +787,25 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             )
             action_chunks.append(parsed_actions)
         actions = torch.stack(action_chunks, dim=0)
-        response_mask = self._build_response_mask(response_ids)
+        response_len = self._resolve_train_response_length(
+            response_ids,
+            generation_kwargs,
+        )
+        prompt_len = self._resolve_train_prompt_length(
+            response_len,
+            current_prompt_len=int(prompt_inputs_embeds.shape[1]),
+        )
+        prompt_inputs_embeds, prompt_attention_mask = (
+            self._left_pad_prompt_forward_inputs(
+                prompt_inputs_embeds,
+                prompt_attention_mask,
+                target_len=prompt_len,
+            )
+        )
+        response_ids, response_mask = self._pad_response_forward_inputs(
+            response_ids,
+            target_len=response_len,
+        )
         with torch.no_grad():
             prev_logprobs = self._compute_response_logprobs_from_embeds(
                 prompt_inputs_embeds=prompt_inputs_embeds,
@@ -806,6 +824,112 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             },
         }
         return actions, metadata
+
+    def _resolve_train_response_length(
+        self,
+        response_ids: torch.Tensor,
+        generation_kwargs: dict[str, Any],
+    ) -> int:
+        max_new_tokens = generation_kwargs.get("max_new_tokens")
+        if max_new_tokens is None:
+            return int(response_ids.shape[1])
+        return int(max_new_tokens)
+
+    def _resolve_train_prompt_length(
+        self,
+        response_len: int,
+        current_prompt_len: int,
+    ) -> int:
+        cfg = getattr(self, "cfg", None)
+        model_max_length = int(
+            self._cfg_get(
+                cfg,
+                "model_max_length",
+                default=getattr(self.model, "model_max_length", 0),
+            )
+        )
+        if model_max_length <= 0:
+            return current_prompt_len
+        prompt_len = model_max_length - response_len
+        if prompt_len <= 0:
+            raise ValueError(
+                "UniNaVid train metadata requires model_max_length > max_new_tokens."
+            )
+        return prompt_len
+
+    def _left_pad_prompt_forward_inputs(
+        self,
+        prompt_inputs_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        target_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current_len = int(prompt_inputs_embeds.shape[1])
+        if int(prompt_attention_mask.shape[1]) != current_len:
+            raise ValueError(
+                "UniNaVid train metadata prompt embeds and attention mask lengths differ."
+            )
+        if current_len > target_len:
+            raise ValueError(
+                "UniNaVid train metadata prompt length exceeds "
+                "model_max_length - max_new_tokens."
+            )
+        if current_len == target_len:
+            return prompt_inputs_embeds, prompt_attention_mask
+
+        pad_len = target_len - current_len
+        embed_pad = prompt_inputs_embeds.new_zeros(
+            (
+                prompt_inputs_embeds.shape[0],
+                pad_len,
+                prompt_inputs_embeds.shape[2],
+            )
+        )
+        mask_pad = prompt_attention_mask.new_zeros(
+            (prompt_attention_mask.shape[0], pad_len)
+        )
+        return (
+            torch.cat([embed_pad, prompt_inputs_embeds], dim=1),
+            torch.cat([mask_pad, prompt_attention_mask], dim=1),
+        )
+
+    def _pad_response_forward_inputs(
+        self,
+        response_ids: torch.Tensor,
+        target_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if target_len < 0:
+            raise ValueError(
+                "UniNaVid train metadata requires non-negative max_new_tokens."
+            )
+        current_len = int(response_ids.shape[1])
+        if current_len > target_len:
+            raise ValueError(
+                "UniNaVid train metadata response length exceeds max_new_tokens."
+            )
+
+        response_mask = self._build_response_mask(response_ids)
+        if current_len == target_len:
+            return response_ids, response_mask
+
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+        pad_len = target_len - current_len
+        id_pad = torch.full(
+            (response_ids.shape[0], pad_len),
+            int(pad_token_id),
+            dtype=response_ids.dtype,
+            device=response_ids.device,
+        )
+        mask_pad = torch.zeros(
+            (response_ids.shape[0], pad_len),
+            dtype=torch.bool,
+            device=response_ids.device,
+        )
+        return (
+            torch.cat([response_ids, id_pad], dim=1),
+            torch.cat([response_mask, mask_pad], dim=1),
+        )
 
     def _nav_size(self) -> int:
         compress_type = getattr(self.model.config, "compress_type", None)

@@ -1464,9 +1464,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         )
 
                         loss_fn = get_policy_loss(self.cfg.algorithm.loss_type)
+                        loss_agg_func = get_loss_agg_func(
+                            self.cfg.algorithm.loss_agg_func
+                        )
                         loss, metrics_data = loss_fn(
                             task_type=self.cfg.runner.task_type,
-                            loss_agg_func=self.loss_agg_func,
+                            loss_agg_func=loss_agg_func,
                             clip_ratio_c=self.cfg.algorithm.get("clip_ratio_c", 3.0),
                             clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
                             clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
