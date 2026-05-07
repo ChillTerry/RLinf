@@ -41,8 +41,78 @@ measures.pass_format_check()
 
 logger = logging.getLogger(__name__)
 
-_UNINAVID_ORIGINAL_EARLY_STOP_ROTATION = 25
-_UNINAVID_ORIGINAL_EARLY_STOP_STEPS = 400
+
+def _clone_habitat_chunk_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, dict):
+        return {k: _clone_habitat_chunk_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_clone_habitat_chunk_value(v) for v in value)
+    return copy.deepcopy(value)
+
+
+def _masked_update_habitat_chunk_value(dst, src, mask):
+    if src is None:
+        return dst
+
+    if isinstance(src, torch.Tensor):
+        src = src.clone()
+        if dst is None:
+            return src
+        dst = dst.clone()
+        if src.ndim > 0 and dst.ndim > 0 and src.shape[0] == mask.shape[0]:
+            dst[mask] = src[mask]
+            return dst
+        return src
+
+    if isinstance(src, np.ndarray):
+        src = src.copy()
+        if dst is None:
+            return src
+        dst = np.array(dst, copy=True)
+        mask_np = mask.detach().cpu().numpy()
+        if src.ndim > 0 and dst.ndim > 0 and src.shape[0] == mask_np.shape[0]:
+            dst[mask_np] = src[mask_np]
+            return dst
+        return src
+
+    if isinstance(src, dict):
+        dst_dict = {} if not isinstance(dst, dict) else _clone_habitat_chunk_value(dst)
+        for key, value in src.items():
+            dst_dict[key] = _masked_update_habitat_chunk_value(
+                dst_dict.get(key), value, mask
+            )
+        return dst_dict
+
+    if isinstance(src, (list, tuple)):
+        src_seq = [_clone_habitat_chunk_value(v) for v in src]
+        if len(src_seq) == mask.shape[0]:
+            if isinstance(dst, (list, tuple)) and len(dst) == len(src_seq):
+                dst_seq = [_clone_habitat_chunk_value(v) for v in dst]
+            else:
+                dst_seq = [_clone_habitat_chunk_value(v) for v in src_seq]
+            mask_np = mask.detach().cpu().numpy()
+            for idx, value in enumerate(src_seq):
+                if mask_np[idx]:
+                    dst_seq[idx] = value
+            return type(src)(dst_seq)
+
+        if dst is None:
+            return type(src)(src_seq)
+        dst_seq = list(dst)
+        for idx, value in enumerate(src_seq):
+            if idx >= len(dst_seq):
+                dst_seq.append(value)
+            else:
+                dst_seq[idx] = _masked_update_habitat_chunk_value(
+                    dst_seq[idx], value, mask
+                )
+        return type(src)(dst_seq)
+
+    return _clone_habitat_chunk_value(src)
 
 
 @registry.register_task_action
@@ -85,12 +155,6 @@ class HabitatEnv(gym.Env):
 
         self.env_config = self.env.get_env_attr("config")[0]
         self.initial_distance_to_goal = np.full(self.num_envs, np.nan, dtype=np.float32)
-        self._uninavid_early_stop_last_distance_to_goal = np.full(
-            self.num_envs, np.nan, dtype=np.float32
-        )
-        self._uninavid_early_stop_rotation_counts = np.zeros(
-            self.num_envs, dtype=np.int32
-        )
 
         self.action_map = {
             0: "stop",
@@ -123,83 +187,6 @@ class HabitatEnv(gym.Env):
         return self._habitat_model_type() == "uninavid" and bool(
             getattr(self.cfg, "uninavid_use_raw_rgb", False)
         )
-
-    def _uninavid_original_early_stop_enabled(self):
-        return (
-            self._habitat_model_type() == "uninavid"
-            and bool(getattr(self.cfg, "uninavid_original_early_stop", False))
-            and bool(
-                getattr(self, "auto_reset", getattr(self.cfg, "auto_reset", False))
-            )
-        )
-
-    def _ensure_uninavid_early_stop_state(self):
-        state_shape = (self.num_envs,)
-        if (
-            not hasattr(self, "_uninavid_early_stop_last_distance_to_goal")
-            or self._uninavid_early_stop_last_distance_to_goal.shape != state_shape
-        ):
-            self._uninavid_early_stop_last_distance_to_goal = np.full(
-                self.num_envs, np.nan, dtype=np.float32
-            )
-        if (
-            not hasattr(self, "_uninavid_early_stop_rotation_counts")
-            or self._uninavid_early_stop_rotation_counts.shape != state_shape
-        ):
-            self._uninavid_early_stop_rotation_counts = np.zeros(
-                self.num_envs, dtype=np.int32
-            )
-
-    def _reset_uninavid_early_stop_state(self, env_idx):
-        self._ensure_uninavid_early_stop_state()
-        self._uninavid_early_stop_last_distance_to_goal[env_idx] = np.nan
-        self._uninavid_early_stop_rotation_counts[env_idx] = 0
-
-    def _apply_uninavid_original_early_stop(self, actions):
-        if not self._uninavid_original_early_stop_enabled():
-            return actions
-
-        self._ensure_uninavid_early_stop_state()
-        rotation_threshold = int(
-            getattr(
-                self.cfg,
-                "uninavid_early_stop_rotation",
-                _UNINAVID_ORIGINAL_EARLY_STOP_ROTATION,
-            )
-        )
-        step_threshold = int(
-            getattr(
-                self.cfg,
-                "uninavid_early_stop_steps",
-                _UNINAVID_ORIGINAL_EARLY_STOP_STEPS,
-            )
-        )
-        pre_step_iter_count = np.maximum(self._elapsed_steps - 1, 0)
-        should_stop = (
-            self._uninavid_early_stop_rotation_counts > rotation_threshold
-        ) | (pre_step_iter_count > step_threshold)
-        if not should_stop.any():
-            return actions
-
-        actions = actions.copy()
-        actions[should_stop] = "stop"
-        return actions
-
-    def _update_uninavid_original_early_stop_state(self, info_lists):
-        if not self._uninavid_original_early_stop_enabled():
-            return
-
-        self._ensure_uninavid_early_stop_state()
-        distance_to_goal = np.array(
-            [info["distance_to_goal"] for info in info_lists], dtype=np.float32
-        )
-        last_distance_to_goal = self._uninavid_early_stop_last_distance_to_goal
-        distance_changed = np.isnan(last_distance_to_goal) | (
-            distance_to_goal != last_distance_to_goal
-        )
-        self._uninavid_early_stop_rotation_counts[distance_changed] = 0
-        self._uninavid_early_stop_rotation_counts[~distance_changed] += 1
-        last_distance_to_goal[:] = distance_to_goal
 
     def _attach_uninavid_chunk_history(self, obs_list):
         if self._habitat_model_type() != "uninavid":
@@ -242,76 +229,66 @@ class HabitatEnv(gym.Env):
         obs_list = []
         infos_list = []
 
-        # Truncate chunk if it contains "stop" and pad with "no_op"
-        for env_idx, chunk_action in enumerate(chunk_actions):
-            stop_idx = np.where(chunk_action == "stop")[0]
-            if len(stop_idx) > 0:
-                stop_idx = stop_idx[0] + 1
-                truncated_chunk = chunk_action[:stop_idx].copy()
-                chunk_actions[env_idx] = np.concatenate(
-                    [truncated_chunk, ["no_op"] * (chunk_size - len(truncated_chunk))]
-                )
-
-        # Truncate chunk if it would exceed max_episode_steps and pad with "no_op"
-        for env_idx, elapsed_step in enumerate(self.elapsed_steps):
-            if elapsed_step + chunk_size >= self.max_episode_steps:
-                reserved_idx = self.max_episode_steps - elapsed_step
-                truncated_chunk = chunk_actions[env_idx][:reserved_idx].copy()
-                truncated_chunk[reserved_idx - 1] = "stop"
-                chunk_actions[env_idx] = np.concatenate(
-                    [
-                        truncated_chunk,
-                        ["no_op"] * (chunk_size - len(truncated_chunk)),
-                    ]
-                )
-
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
-        original_auto_reset = self.auto_reset
-        num_envs = getattr(self, "num_envs", chunk_actions.shape[0])
-        deferred_reset_dones = np.zeros(num_envs, dtype=bool)
-        if original_auto_reset:
-            self.auto_reset = False
-        try:
-            for i in range(chunk_size):
-                actions = chunk_actions[:, i].copy()
-                if deferred_reset_dones.any():
-                    actions[deferred_reset_dones] = "no_op"
-                extracted_obs, step_reward, terminations, truncations, infos = (
-                    self.step(actions)
-                )
-                obs_list.append(extracted_obs)
-                infos_list.append(infos)
-
-                chunk_rewards.append(step_reward)
-                raw_chunk_terminations.append(terminations)
-                raw_chunk_truncations.append(truncations)
-
-                step_reset_dones = infos.get("_reset_dones_mask")
-                if isinstance(step_reset_dones, torch.Tensor):
-                    step_reset_dones = step_reset_dones.cpu().numpy()
-                elif step_reset_dones is None:
-                    step_reset_dones = torch.logical_or(
-                        terminations, truncations
-                    ).cpu().numpy()
-                deferred_reset_dones |= np.asarray(step_reset_dones, dtype=bool)
-        finally:
-            self.auto_reset = original_auto_reset
-
-        if original_auto_reset and deferred_reset_dones.any():
-            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
-                deferred_reset_dones,
-                obs_list[-1],
-                infos_list[-1],
+        aggregated_final_info = None
+        aggregated_final_obs = None
+        for i in range(chunk_size):
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(
+                chunk_actions[:, i].copy()
             )
+            obs_list.append(extracted_obs)
+            infos_list.append(infos)
+
+            chunk_rewards.append(step_reward)
+            raw_chunk_terminations.append(terminations)
+            raw_chunk_truncations.append(truncations)
+
+            step_dones = torch.logical_or(terminations, truncations)
+            if step_dones.any() and self.auto_reset:
+                aggregated_final_info = _masked_update_habitat_chunk_value(
+                    aggregated_final_info,
+                    infos.get("final_info", infos),
+                    step_dones,
+                )
+                aggregated_final_obs = _masked_update_habitat_chunk_value(
+                    aggregated_final_obs,
+                    infos.get("final_observation", extracted_obs),
+                    step_dones,
+                )
+
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+        past_terminations = raw_chunk_terminations.any(dim=1)
+        past_truncations = raw_chunk_truncations.any(dim=1)
+        past_dones = torch.logical_or(past_terminations, past_truncations)
+        if past_dones.any() and self.auto_reset:
+            infos_list[-1] = dict(infos_list[-1])
+            final_info = _clone_habitat_chunk_value(
+                infos_list[-1].get("final_info", infos_list[-1])
+            )
+            if aggregated_final_info is not None:
+                final_info = _masked_update_habitat_chunk_value(
+                    final_info, aggregated_final_info, past_dones
+                )
+
+            final_observation = _clone_habitat_chunk_value(obs_list[-1])
+            if aggregated_final_obs is not None:
+                final_observation = _masked_update_habitat_chunk_value(
+                    final_observation, aggregated_final_obs, past_dones
+                )
+
+            infos_list[-1]["final_info"] = final_info
+            infos_list[-1]["final_observation"] = final_observation
+            infos_list[-1]["_final_info"] = past_dones.clone()
+            infos_list[-1]["_final_observation"] = past_dones.clone()
+            infos_list[-1]["_elapsed_steps"] = past_dones.clone()
 
         self._attach_uninavid_chunk_history(obs_list)
 
         # [num_envs, chunk_steps]
         chunk_rewards = torch.stack(chunk_rewards, dim=1)
-        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
-        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
         if self.auto_reset or self.ignore_terminations:
             chunk_terminations = torch.zeros_like(raw_chunk_terminations)
             chunk_terminations[:, -1] = raw_chunk_terminations.any(dim=1)
@@ -337,22 +314,15 @@ class HabitatEnv(gym.Env):
         actions = self._squeeze_singleton_action_dim(actions)
         self._elapsed_steps += 1
 
-        # After excuting "stop" action, habitat env needs reset to process the next action.
-        # Replace "stop" with "no_op" before stepping the underlying env to avoid unable
-        # to process the next action.
-        proposed_actions = actions.astype("U12")
-        policy_actions = self._apply_uninavid_original_early_stop(
-            proposed_actions.copy()
-        )
-        executed_actions = policy_actions.copy()
-        env_actions = executed_actions.copy()
+        # Habitat cannot execute STOP and continue stepping the same episode, so forward
+        # it as no_op to the simulator while still marking the policy action as terminal.
+        env_actions = actions.astype("U12").copy()
         is_stop = env_actions == "stop"
         env_actions[is_stop] = "no_op"
 
         raw_obs, _reward, terminations, info_lists = self.env.step(
             self._format_habitat_actions(env_actions)
         )
-        self._update_uninavid_original_early_stop_state(info_lists)
 
         # If some envs execute "no_op", manually normalize depth observations
         # according to Habitat's depth sensor config.
@@ -376,13 +346,12 @@ class HabitatEnv(gym.Env):
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs, info_lists)
 
-        reset_dones = terminations | truncations
-        infos["_reset_dones_mask"] = reset_dones.copy()
         if self.ignore_terminations:
             terminations[:] = False
 
-        if reset_dones.any() and self.auto_reset:
-            obs, infos = self._handle_auto_reset(reset_dones, obs, infos)
+        dones = terminations | truncations
+        if dones.any() and self.auto_reset:
+            obs, infos = self._handle_auto_reset(dones, obs, infos)
 
         return (
             obs,
@@ -404,15 +373,11 @@ class HabitatEnv(gym.Env):
         self.prev_step_reward[env_idx] = 0.0
         self.dones_once[env_idx] = False
         self.initial_distance_to_goal[env_idx] = np.nan
-        self._reset_uninavid_early_stop_state(env_idx)
         current_metrics = self.env.get_current_metrics(env_idx)
         distance_to_goal = current_metrics.get("distance_to_goal", None)
         if distance_to_goal is not None:
             distance_to_goal = np.asarray(distance_to_goal, dtype=np.float32)
             self.initial_distance_to_goal[env_idx] = distance_to_goal
-            self._uninavid_early_stop_last_distance_to_goal[env_idx] = (
-                distance_to_goal
-            )
         if self.first_done_infos is not None and "episode" in self.first_done_infos:
             episode = self.first_done_infos["episode"]
             device = next(iter(episode.values())).device
@@ -710,6 +675,7 @@ class HabitatEnv(gym.Env):
             f"habitat.dataset.split={self.cfg.split}",
             f"habitat.dataset.data_path={self.cfg.data_path}",
             f"habitat.dataset.scenes_dir={self.cfg.scenes_dir}",
+            f"habitat.environment.max_episode_steps={self.max_episode_steps}",
             "habitat.environment.iterator_options.shuffle=False",
             "habitat.environment.iterator_options.group_by_scene=False",
         ]
