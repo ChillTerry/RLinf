@@ -39,6 +39,23 @@ class FakeUniNaVidModel(nn.Module):
         return SimpleNamespace(loss=self.loss)
 
 
+class FakeResponseForwardModel(nn.Module):
+    def __init__(self, vocab_size=16, hidden_size=4):
+        super().__init__()
+        self.embeddings = nn.Embedding(vocab_size, hidden_size)
+
+    def get_input_embeddings(self):
+        return self.embeddings
+
+    def forward(self, *, inputs_embeds, attention_mask, use_cache, return_dict):
+        batch_size, seq_len, _ = inputs_embeds.shape
+        logits = torch.zeros(batch_size, seq_len, self.embeddings.num_embeddings)
+        positions = torch.arange(seq_len, dtype=logits.dtype).view(1, seq_len)
+        logits[..., 2] = 2.0 + positions
+        logits[..., 3] = 1.0 - positions
+        return SimpleNamespace(logits=logits)
+
+
 class FakeTokenizer:
     def __init__(self, initial_length):
         self.length = initial_length
@@ -158,6 +175,24 @@ def _make_batch(images):
     }
 
 
+def make_fake_response_policy():
+    return UniNaVidForActionPrediction(
+        tokenizer=object(),
+        model=FakeResponseForwardModel(),
+        image_processor=object(),
+        torch_dtype=torch.float32,
+    )
+
+
+def make_response_forward_inputs(batch_size, response_len):
+    return {
+        "prompt_inputs_embeds": torch.zeros(batch_size, 5, 4),
+        "prompt_attention_mask": torch.ones(batch_size, 5, dtype=torch.long),
+        "response_ids": torch.full((batch_size, response_len), 2, dtype=torch.long),
+        "response_mask": torch.ones(batch_size, response_len, dtype=torch.bool),
+    }
+
+
 def test_sft_forward_returns_inner_loss_and_moves_tensor_images():
     policy = _make_policy()
     batch = _make_batch(torch.ones(2, 3, 4, 4, dtype=torch.float32))
@@ -222,6 +257,52 @@ def test_sft_forward_raises_value_error_when_output_has_no_loss():
 
     with pytest.raises(ValueError):
         policy(forward_type=ForwardType.SFT, data=batch)
+
+
+def test_uninavid_default_forward_returns_response_token_logprobs():
+    model = make_fake_response_policy()
+    forward_inputs = make_response_forward_inputs(batch_size=2, response_len=3)
+
+    output = model.default_forward(forward_inputs=forward_inputs, compute_logprobs=True)
+
+    assert set(output) == {"logprobs", "entropy", "values"}
+    assert output["logprobs"].shape == (2, 3, 1)
+    prompt_len = forward_inputs["prompt_inputs_embeds"].shape[1]
+    response_positions = torch.arange(prompt_len - 1, prompt_len + 2)
+    logits = torch.zeros(3, 16)
+    logits[:, 2] = 2.0 + response_positions
+    logits[:, 3] = 1.0 - response_positions
+    expected_logprobs = torch.log_softmax(logits, dim=-1)[:, 2].view(1, 3, 1)
+    torch.testing.assert_close(
+        output["logprobs"],
+        expected_logprobs.expand(2, -1, -1),
+    )
+    assert output["entropy"] is None
+    assert output["values"] is None
+
+
+def test_uninavid_default_forward_entropy_uses_response_mask():
+    model = make_fake_response_policy()
+    forward_inputs = make_response_forward_inputs(batch_size=1, response_len=4)
+    forward_inputs["response_mask"] = torch.tensor([[1, 1, 0, 0]], dtype=torch.bool)
+
+    output = model.default_forward(
+        forward_inputs=forward_inputs,
+        compute_logprobs=True,
+        compute_entropy=True,
+    )
+
+    assert output["entropy"].shape == (1, 4, 1)
+    assert torch.count_nonzero(output["entropy"][:, 2:]) == 0
+    assert torch.count_nonzero(output["logprobs"][:, 2:]) == 0
+
+
+def test_uninavid_default_forward_rejects_values():
+    model = make_fake_response_policy()
+    forward_inputs = make_response_forward_inputs(batch_size=1, response_len=2)
+
+    with pytest.raises(NotImplementedError, match="critic values"):
+        model.default_forward(forward_inputs=forward_inputs, compute_values=True)
 
 
 def test_resolve_torch_dtype_defaults_to_float16():

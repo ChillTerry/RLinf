@@ -462,8 +462,54 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
     def _get_device(self) -> torch.device:
         return next(self.model.parameters()).device
 
-    def default_forward(self, **kwargs):
-        raise NotImplementedError("Uni-NaVid currently supports only SFT forward.")
+    def default_forward(
+        self,
+        forward_inputs: dict[str, torch.Tensor] | None = None,
+        compute_logprobs: bool = True,
+        compute_entropy: bool = False,
+        compute_values: bool = False,
+        **kwargs,
+    ) -> dict[str, torch.Tensor | None]:
+        if compute_values:
+            raise NotImplementedError(
+                "UniNaVid GRPO training does not use critic values."
+            )
+        if forward_inputs is None:
+            raise ValueError(
+                "UniNaVid default_forward requires response-token forward_inputs."
+            )
+
+        prompt_inputs_embeds = forward_inputs["prompt_inputs_embeds"]
+        prompt_attention_mask = forward_inputs["prompt_attention_mask"]
+        response_ids = forward_inputs["response_ids"]
+        response_mask = forward_inputs["response_mask"].to(torch.bool)
+
+        response_logits = self._compute_response_logits_from_embeds(
+            prompt_inputs_embeds=prompt_inputs_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            response_ids=response_ids,
+            response_mask=response_mask,
+        )
+
+        logprobs = None
+        if compute_logprobs:
+            token_logprobs = torch.log_softmax(response_logits.float(), dim=-1).gather(
+                -1,
+                response_ids.unsqueeze(-1),
+            )
+            logprobs = token_logprobs * response_mask.unsqueeze(-1).to(
+                token_logprobs.dtype
+            )
+
+        entropy = None
+        if compute_entropy:
+            response_logits = response_logits.float()
+            probs = torch.softmax(response_logits, dim=-1)
+            token_logprobs_all = torch.log_softmax(response_logits, dim=-1)
+            entropy = -(probs * token_logprobs_all).sum(dim=-1, keepdim=True)
+            entropy = entropy * response_mask.unsqueeze(-1).to(entropy.dtype)
+
+        return {"logprobs": logprobs, "entropy": entropy, "values": None}
 
     @property
     def num_action_chunks(self) -> int:
@@ -978,6 +1024,25 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         response_ids: torch.Tensor,
         response_mask: torch.Tensor,
     ) -> torch.Tensor:
+        response_mask = response_mask.to(torch.bool)
+        response_logits = self._compute_response_logits_from_embeds(
+            prompt_inputs_embeds=prompt_inputs_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            response_ids=response_ids,
+            response_mask=response_mask,
+        )
+        logprobs = torch.log_softmax(response_logits.float(), dim=-1)
+        token_logprobs = logprobs.gather(-1, response_ids.unsqueeze(-1))
+        return token_logprobs * response_mask.unsqueeze(-1).to(token_logprobs.dtype)
+
+    def _compute_response_logits_from_embeds(
+        self,
+        *,
+        prompt_inputs_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> torch.Tensor:
         response_embeds = self._embed_response_ids(response_ids)
         full_inputs_embeds = torch.cat([prompt_inputs_embeds, response_embeds], dim=1)
         full_attention_mask = torch.cat(
@@ -991,7 +1056,4 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             return_dict=True,
         )
         prompt_len = prompt_inputs_embeds.shape[1]
-        response_logits = outputs.logits[:, prompt_len - 1 : -1, :]
-        logprobs = torch.log_softmax(response_logits.float(), dim=-1)
-        token_logprobs = logprobs.gather(-1, response_ids.unsqueeze(-1))
-        return token_logprobs * response_mask.unsqueeze(-1).to(token_logprobs.dtype)
+        return outputs.logits[:, prompt_len - 1 : -1, :]
