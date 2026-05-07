@@ -585,6 +585,7 @@ class HabitatEnv(gym.Env):
                             metrics_dict[k] = v[i]
                         else:
                             metrics_dict[k] = v
+                    metrics_dict["elapsed_steps"] = int(self._elapsed_steps[i])
                     metrics_file = os.path.join(
                         self.metrics_cfg.metrics_base_dir, f"episode_{episode_id}.json"
                     )

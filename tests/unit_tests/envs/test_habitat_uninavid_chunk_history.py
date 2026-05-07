@@ -591,6 +591,7 @@ def test_habitat_save_metrics_preserves_first_file_for_revisited_episode(tmp_pat
         save_metrics=True,
         metrics_base_dir=str(tmp_path),
     )
+    env._elapsed_steps = np.array([11], dtype=np.int32)
     env.dones_once = np.array([False])
     env.first_done_infos = None
     metric_save_masks = np.array([True])
@@ -609,13 +610,14 @@ def test_habitat_save_metrics_preserves_first_file_for_revisited_episode(tmp_pat
     }
 
     env._save_metrics(first_infos, metric_save_masks)
+    env._elapsed_steps[:] = 99
     env._save_metrics(revisited_infos, metric_save_masks)
 
     metrics_file = tmp_path / "episode_episode-7.json"
     with metrics_file.open() as f:
         metrics = json.load(f)
 
-    assert metrics == {"success": 1.0, "spl": 0.75}
+    assert metrics == {"success": 1.0, "spl": 0.75, "elapsed_steps": 11}
 
 
 def test_habitat_env_fn_params_override_internal_max_episode_steps(monkeypatch):
