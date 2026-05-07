@@ -1413,11 +1413,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     prev_values = batch.get("prev_values", None)
                     loss_mask = batch.get("loss_mask", None)
                     loss_mask_sum = batch.get("loss_mask_sum", None)
+                    critic_warmup = self.optimizer_steps < self.critic_warmup_steps
+                    model_type = SupportedModel(self.cfg.actor.model.model_type)
 
                     forward_inputs = batch.get("forward_inputs", None)
 
                     kwargs = {}
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
+                    if model_type in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
                     ]:
@@ -1425,10 +1427,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             self.cfg.algorithm.sampling_params.temperature_train
                         )
                         kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
-                    elif (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
+                    elif model_type == SupportedModel.GR00T:
                         kwargs["prev_logprobs"] = prev_logprobs
 
                     compute_values = (
@@ -1445,50 +1444,89 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             **kwargs,
                         )
 
-                    if (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
-                    ):
+                    if model_type == SupportedModel.GR00T:
                         prev_logprobs = output_dict["prev_logprobs"]
 
-                    kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": output_dict["logprobs"],
-                        "values": output_dict.get("values", None),
-                        "old_logprobs": prev_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": prev_values,
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
-                    }
-                    loss, metrics_data = policy_loss(**kwargs)
+                    if model_type == SupportedModel.UNINAVID:
+                        from rlinf.algorithms.registry import get_policy_loss
+                        from rlinf.algorithms.utils import postprocess_loss_metric
+                        from rlinf.models.embodiment.uninavid.rl_loss import (
+                            prepare_uninavid_token_level_loss_inputs,
+                        )
+
+                        prepared_loss_inputs = prepare_uninavid_token_level_loss_inputs(
+                            logprobs=output_dict["logprobs"],
+                            old_logprobs=prev_logprobs,
+                            advantages=advantages,
+                            response_mask=batch["forward_inputs"]["response_mask"],
+                            sample_loss_mask=loss_mask,
+                            entropy=output_dict.get("entropy"),
+                        )
+
+                        loss_fn = get_policy_loss(self.cfg.algorithm.loss_type)
+                        loss, metrics_data = loss_fn(
+                            task_type=self.cfg.runner.task_type,
+                            loss_agg_func=self.loss_agg_func,
+                            clip_ratio_c=self.cfg.algorithm.get("clip_ratio_c", 3.0),
+                            clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
+                            clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
+                            clip_log_ratio_min=self.cfg.algorithm.get(
+                                "clip_log_ratio_min", None
+                            ),
+                            clip_log_ratio_max=self.cfg.algorithm.get(
+                                "clip_log_ratio_max", None
+                            ),
+                            fast_path_zero_loss_mask=False,
+                            critic_warmup=critic_warmup,
+                            **prepared_loss_inputs,
+                        )
+                        metrics_data = postprocess_loss_metric(metrics_data)
+                        loss_mask = prepared_loss_inputs["loss_mask"]
+                    else:
+                        kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            "logprob_type": self.cfg.algorithm.logprob_type,
+                            "reward_type": self.cfg.algorithm.reward_type,
+                            "single_action_dim": self.cfg.actor.model.get(
+                                "action_dim", 7
+                            ),
+                            "logprobs": output_dict["logprobs"],
+                            "values": output_dict.get("values", None),
+                            "old_logprobs": prev_logprobs,
+                            "advantages": advantages,
+                            "returns": returns,
+                            "prev_values": prev_values,
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "value_clip": self.cfg.algorithm.get("value_clip", None),
+                            "huber_delta": self.cfg.algorithm.get(
+                                "huber_delta", None
+                            ),
+                            "loss_mask": loss_mask,
+                            "loss_mask_sum": loss_mask_sum,
+                            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": critic_warmup,
+                        }
+                        loss, metrics_data = policy_loss(**kwargs)
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
                     )
                     if (
                         self.cfg.algorithm.entropy_bonus > 0
-                        and not kwargs["critic_warmup"]
+                        and not critic_warmup
                     ):
-                        entropy = output_dict["entropy"]
-                        entropy = reshape_entropy(
-                            entropy,
-                            entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=output_dict["logprobs"].shape[0],
-                        )
+                        if model_type == SupportedModel.UNINAVID:
+                            entropy = prepared_loss_inputs["entropy"]
+                        else:
+                            entropy = output_dict["entropy"]
+                            entropy = reshape_entropy(
+                                entropy,
+                                entropy_type=self.cfg.algorithm.entropy_type,
+                                action_dim=self.cfg.actor.model.get("action_dim", 7),
+                                batch_size=output_dict["logprobs"].shape[0],
+                            )
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
                     metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()

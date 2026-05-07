@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import torch
 
 from rlinf.config import SupportedModel
+from rlinf.workers.actor import fsdp_actor_worker
 from rlinf.workers.rollout.hf import huggingface_worker
 from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
 
@@ -34,6 +35,20 @@ def test_get_train_model_output_uses_uninavid_sft_forward_path():
 
     assert "SupportedModel.UNINAVID" in source
     assert "ForwardType.SFT" in source
+
+
+def test_embodied_fsdp_actor_worker_has_uninavid_token_loss_branch():
+    source = inspect.getsource(fsdp_actor_worker.EmbodiedFSDPActor)
+    branch = source.split("if model_type == SupportedModel.UNINAVID:", maxsplit=1)[1]
+    uninavid_branch = branch.split(
+        "else:\n                        kwargs = {", maxsplit=1
+    )[0]
+
+    assert "SupportedModel.UNINAVID" in source
+    assert "prepare_uninavid_token_level_loss_inputs" in source
+    assert "get_policy_loss" in uninavid_branch
+    assert "loss, metrics_data = policy_loss(" not in uninavid_branch
+    assert "fast_path_zero_loss_mask=True" not in uninavid_branch
 
 
 class FakeAlgorithmConfig(SimpleNamespace):
