@@ -21,4 +21,4 @@ run_type: "eval"
 
 rollout_mode: "batched_feature_cache"
 action_dim: 1
-num_action_chunks: 2
+num_action_chunks: 4

@@ -87,6 +87,17 @@ def test_uninavid_action_parser_maps_text_to_habitat_ids():
     assert parsed.squeeze(-1).tolist() == [1, 2, 3, 0]
 
 
+def test_uninavid_action_parser_pads_fewer_than_four_actions():
+    parsed = parse_uninavid_actions("forward right", 4)
+
+    assert parsed.squeeze(-1).tolist() == [
+        HABITAT_NAV_ACTION_TO_ID["forward"],
+        HABITAT_NAV_ACTION_TO_ID["right"],
+        HABITAT_NAV_ACTION_TO_ID["no-op"],
+        HABITAT_NAV_ACTION_TO_ID["no-op"],
+    ]
+
+
 def test_uninavid_action_parser_pads_unknown_and_after_stop():
     parsed = parse_uninavid_actions("spin forward stop left", 4)
 
