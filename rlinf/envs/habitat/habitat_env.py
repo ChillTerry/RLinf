@@ -42,79 +42,6 @@ measures.pass_format_check()
 logger = logging.getLogger(__name__)
 
 
-def _clone_habitat_chunk_value(value):
-    if isinstance(value, torch.Tensor):
-        return value.clone()
-    if isinstance(value, np.ndarray):
-        return value.copy()
-    if isinstance(value, dict):
-        return {k: _clone_habitat_chunk_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return type(value)(_clone_habitat_chunk_value(v) for v in value)
-    return copy.deepcopy(value)
-
-
-def _masked_update_habitat_chunk_value(dst, src, mask):
-    if src is None:
-        return dst
-
-    if isinstance(src, torch.Tensor):
-        src = src.clone()
-        if dst is None:
-            return src
-        dst = dst.clone()
-        if src.ndim > 0 and dst.ndim > 0 and src.shape[0] == mask.shape[0]:
-            dst[mask] = src[mask]
-            return dst
-        return src
-
-    if isinstance(src, np.ndarray):
-        src = src.copy()
-        if dst is None:
-            return src
-        dst = np.array(dst, copy=True)
-        mask_np = mask.detach().cpu().numpy()
-        if src.ndim > 0 and dst.ndim > 0 and src.shape[0] == mask_np.shape[0]:
-            dst[mask_np] = src[mask_np]
-            return dst
-        return src
-
-    if isinstance(src, dict):
-        dst_dict = {} if not isinstance(dst, dict) else _clone_habitat_chunk_value(dst)
-        for key, value in src.items():
-            dst_dict[key] = _masked_update_habitat_chunk_value(
-                dst_dict.get(key), value, mask
-            )
-        return dst_dict
-
-    if isinstance(src, (list, tuple)):
-        src_seq = [_clone_habitat_chunk_value(v) for v in src]
-        if len(src_seq) == mask.shape[0]:
-            if isinstance(dst, (list, tuple)) and len(dst) == len(src_seq):
-                dst_seq = [_clone_habitat_chunk_value(v) for v in dst]
-            else:
-                dst_seq = [_clone_habitat_chunk_value(v) for v in src_seq]
-            mask_np = mask.detach().cpu().numpy()
-            for idx, value in enumerate(src_seq):
-                if mask_np[idx]:
-                    dst_seq[idx] = value
-            return type(src)(dst_seq)
-
-        if dst is None:
-            return type(src)(src_seq)
-        dst_seq = list(dst)
-        for idx, value in enumerate(src_seq):
-            if idx >= len(dst_seq):
-                dst_seq.append(value)
-            else:
-                dst_seq[idx] = _masked_update_habitat_chunk_value(
-                    dst_seq[idx], value, mask
-                )
-        return type(src)(dst_seq)
-
-    return _clone_habitat_chunk_value(src)
-
-
 @registry.register_task_action
 class NoOpAction(SimulatorTaskAction):
     """Register manually defined No-operation action for habitat env."""
@@ -169,36 +96,12 @@ class HabitatEnv(gym.Env):
         return self._elapsed_steps
 
     @property
-    def info_logging_keys(self):
-        return []
-
-    @property
     def is_start(self):
         return self._is_start
 
     @is_start.setter
     def is_start(self, value):
         self._is_start = value
-
-    def _habitat_model_type(self):
-        return getattr(getattr(self, "cfg", None), "model_type", None)
-
-    def _uninavid_use_raw_rgb_enabled(self):
-        return self._habitat_model_type() == "uninavid" and bool(
-            getattr(self.cfg, "uninavid_use_raw_rgb", False)
-        )
-
-    def _attach_uninavid_chunk_history(self, obs_list):
-        if self._habitat_model_type() != "uninavid":
-            return
-        if not obs_list:
-            return
-        if any("wrist_images" not in obs for obs in obs_list):
-            return
-        obs_list[-1]["wrist_images"] = torch.stack(
-            [obs["wrist_images"] for obs in obs_list],
-            dim=1,
-        )
 
     @staticmethod
     def _format_habitat_actions(actions):
@@ -229,14 +132,40 @@ class HabitatEnv(gym.Env):
         obs_list = []
         infos_list = []
 
+        # Truncate chunk if it contains "stop" and pad with "no_op"
+        for env_idx, chunk_action in enumerate(chunk_actions):
+            stop_idx = np.where(chunk_action == "stop")[0]
+            if len(stop_idx) > 0:
+                stop_idx = stop_idx[0] + 1
+                truncated_chunk = chunk_action[:stop_idx].copy()
+                chunk_actions[env_idx] = np.concatenate(
+                    [truncated_chunk, ["no_op"] * (chunk_size - len(truncated_chunk))]
+                )
+
+        # Truncate chunk if it would exceed max_episode_steps and pad with "no_op"
+        for env_idx, elapsed_step in enumerate(self._elapsed_steps):
+            if elapsed_step + chunk_size >= self.max_episode_steps:
+                reserved_idx = self.max_episode_steps - elapsed_step
+                assert reserved_idx > 0, (
+                    f"Executed step {elapsed_step} exceeds max_episode_steps {self.max_episode_steps}, "
+                    "reset env before executing next step."
+                )
+                truncated_chunk = chunk_actions[env_idx][:reserved_idx].copy()
+                truncated_chunk[reserved_idx - 1] = "stop"
+                chunk_actions[env_idx] = np.concatenate(
+                    [
+                        truncated_chunk,
+                        ["no_op"] * (chunk_size - len(truncated_chunk)),
+                    ]
+                )
+
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
-        aggregated_final_info = None
-        aggregated_final_obs = None
         for i in range(chunk_size):
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                chunk_actions[:, i].copy()
+                chunk_actions[:, i].copy(),
+                auto_reset=False,
             )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
@@ -245,47 +174,19 @@ class HabitatEnv(gym.Env):
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
-            step_dones = torch.logical_or(terminations, truncations)
-            if step_dones.any() and self.auto_reset:
-                aggregated_final_info = _masked_update_habitat_chunk_value(
-                    aggregated_final_info,
-                    infos.get("final_info", infos),
-                    step_dones,
-                )
-                aggregated_final_obs = _masked_update_habitat_chunk_value(
-                    aggregated_final_obs,
-                    infos.get("final_observation", extracted_obs),
-                    step_dones,
-                )
-
         raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
         raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
         if past_dones.any() and self.auto_reset:
-            infos_list[-1] = dict(infos_list[-1])
-            final_info = _clone_habitat_chunk_value(
-                infos_list[-1].get("final_info", infos_list[-1])
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones.cpu().numpy(),
+                obs_list[-1],
+                infos_list[-1],
             )
-            if aggregated_final_info is not None:
-                final_info = _masked_update_habitat_chunk_value(
-                    final_info, aggregated_final_info, past_dones
-                )
 
-            final_observation = _clone_habitat_chunk_value(obs_list[-1])
-            if aggregated_final_obs is not None:
-                final_observation = _masked_update_habitat_chunk_value(
-                    final_observation, aggregated_final_obs, past_dones
-                )
-
-            infos_list[-1]["final_info"] = final_info
-            infos_list[-1]["final_observation"] = final_observation
-            infos_list[-1]["_final_info"] = past_dones.clone()
-            infos_list[-1]["_final_observation"] = past_dones.clone()
-            infos_list[-1]["_elapsed_steps"] = past_dones.clone()
-
-        self._attach_uninavid_chunk_history(obs_list)
+        self._attach_rgb_chunk_history(obs_list)
 
         # [num_envs, chunk_steps]
         chunk_rewards = torch.stack(chunk_rewards, dim=1)
@@ -307,7 +208,7 @@ class HabitatEnv(gym.Env):
             infos_list,
         )
 
-    def step(self, actions=None):
+    def step(self, actions=None, auto_reset=True):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
@@ -334,7 +235,7 @@ class HabitatEnv(gym.Env):
         infos = self._record_metrics(infos, terminations)
         step_reward = self._calc_step_reward(infos["episode"]["success"])
 
-        truncations = self.elapsed_steps >= self.max_episode_steps
+        truncations = self._elapsed_steps >= self.max_episode_steps
         dones_for_metric_save = terminations | truncations
         # Only save episode metrics once: at the first time an env becomes done.
         metric_save_masks = dones_for_metric_save & (~self.dones_once)
@@ -350,7 +251,7 @@ class HabitatEnv(gym.Env):
             terminations[:] = False
 
         dones = terminations | truncations
-        if dones.any() and self.auto_reset:
+        if dones.any() and auto_reset and self.auto_reset:
             obs, infos = self._handle_auto_reset(dones, obs, infos)
 
         return (
@@ -428,7 +329,6 @@ class HabitatEnv(gym.Env):
 
     def _wrap_obs(self, obs_list, info_lists=None):
         image_list = []
-        raw_rgb_list = []
         task_descs = []
         token_list = []
         should_render_video = info_lists is not None and self.cfg.video_cfg.save_video
@@ -456,35 +356,38 @@ class HabitatEnv(gym.Env):
             # https://github.com/jacobkrantz/VLN-CE for more details.
             token = obs["instruction"].get("tokens", [])
             image_list.append(images)
-            raw_rgb_list.append(obs["rgb"])
             task_descs.append(inst)
             token_list.append(token)
         image_tensor = to_tensor(list_of_dict_to_dict_of_list(image_list))
-        raw_rgb_tensor = None
-        if self._uninavid_use_raw_rgb_enabled():
-            raw_rgb_tensor = to_tensor(raw_rgb_list)
 
         episode_ids = self.env.get_current_episode_metadata()["episode_id"]
 
         obs = {}
         if should_render_video:
             obs["main_images"] = image_tensor["concat"].clone()  # [N_ENV, H, W, C]
-        if raw_rgb_tensor is not None:
-            obs["wrist_images"] = raw_rgb_tensor.clone()
-        else:
-            obs["wrist_images"] = image_tensor[
-                "rgb"
-            ].clone()  # Temporarily use wrist_images to store rgb images
+        obs["wrist_images"] = image_tensor[
+            "rgb"
+        ].clone()  # Temporarily use wrist_images to store rgb images
         if "depth" in image_tensor:
             depth_tensor = image_tensor["depth"].clone()
             obs["extra_view_images"] = depth_tensor.unsqueeze(1)  # [N_ENV, 1, H, W, C]
-        if self._habitat_model_type() == "cma":
+        if self.cfg.model_type == "cma":
             obs["task_descriptions"] = token_list
         else:
             obs["task_descriptions"] = task_descs
         obs["states"] = torch.tensor([int(episode_id) for episode_id in episode_ids])
 
         return obs
+
+    def _attach_rgb_chunk_history(self, obs_list):
+        if not obs_list:
+            return
+        if any("wrist_images" not in obs for obs in obs_list):
+            return
+        obs_list[-1]["wrist_images"] = torch.stack(
+            [obs["wrist_images"] for obs in obs_list],
+            dim=1,
+        )
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
