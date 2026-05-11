@@ -32,7 +32,7 @@ from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
 
 from rlinf.envs.habitat.extensions import measures
-from rlinf.envs.habitat.extensions.allocator import vram_balance_episode_ids
+from rlinf.envs.habitat.extensions.allocator import vram_balance_episode_sequences
 from rlinf.envs.habitat.extensions.utils import observations_to_image
 from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
 from rlinf.envs.utils import (
@@ -43,6 +43,91 @@ from rlinf.envs.utils import (
 measures.pass_format_check()
 
 logger = logging.getLogger(__name__)
+
+
+def build_habitat_global_plan(
+    cfg,
+    *,
+    num_group: int,
+    total_num_processes: int,
+    max_episode_steps: int,
+) -> dict:
+    # Habitat uses hydra to load the config, but hydra may already be
+    # initialized elsewhere in the process.
+    hydra_initialized = GlobalHydra.instance().is_initialized()
+    if hydra_initialized:
+        GlobalHydra.instance().clear()
+
+    config_path = cfg.init_params.config_path
+    overrides = build_habitat_overrides(cfg, max_episode_steps=max_episode_steps)
+    habitat_config = get_config(config_path, overrides=overrides)
+
+    habitat_dataset = habitat.datasets.make_dataset(
+        habitat_config.habitat.dataset.type,
+        config=habitat_config.habitat.dataset,
+    )
+
+    sampled_scene_ids = get_sampled_habitat_scene_ids(
+        habitat_dataset.episodes,
+        getattr(cfg, "sample_num_scenes", None),
+        cfg.seed,
+    )
+    if sampled_scene_ids is not None:
+        sampled_scene_id_set = set(sampled_scene_ids)
+        habitat_dataset.episodes = [
+            ep for ep in habitat_dataset.episodes if ep.scene_id in sampled_scene_id_set
+        ]
+
+    episode_sequences = vram_balance_episode_sequences(
+        habitat_dataset.episodes,
+        auto_reset=cfg.auto_reset,
+        total_num_processes=total_num_processes,
+        num_group=num_group,
+        total_num_envs=cfg.total_num_envs,
+        max_steps_per_rollout_epoch=cfg.max_steps_per_rollout_epoch,
+        max_episode_steps=max_episode_steps,
+    )
+
+    return {
+        "config_path": config_path,
+        "overrides": overrides,
+        "sampled_scene_ids": sampled_scene_ids,
+        "episode_sequences": episode_sequences,
+    }
+
+
+def build_habitat_overrides(cfg, *, max_episode_steps: int) -> list[str]:
+    overrides = [
+        f"habitat.dataset.split={cfg.split}",
+        f"habitat.dataset.data_path={cfg.data_path}",
+        f"habitat.dataset.scenes_dir={cfg.scenes_dir}",
+        f"habitat.environment.max_episode_steps={max_episode_steps}",
+        "habitat.environment.iterator_options.shuffle=False",
+        "habitat.environment.iterator_options.group_by_scene=False",
+    ]
+    ndtw_gt_path = getattr(cfg, "ndtw_gt_path", None)
+    if ndtw_gt_path is not None:
+        overrides.extend(
+            [
+                f"habitat.task.measurements.ndtw.SPLIT={cfg.split}",
+                f"habitat.task.measurements.ndtw.GT_PATH={ndtw_gt_path}",
+            ]
+        )
+    return overrides
+
+
+def get_sampled_habitat_scene_ids(
+    episodes, sample_num_scenes: Optional[int], seed: int
+):
+    if sample_num_scenes is None:
+        return None
+    scene_ids = list(dict.fromkeys(ep.scene_id for ep in episodes))
+    if sample_num_scenes > len(scene_ids):
+        raise ValueError(
+            f"sample_num_scenes={sample_num_scenes} exceeds available scenes={len(scene_ids)}"
+        )
+    scene_rng = np.random.default_rng(seed)
+    return scene_rng.choice(scene_ids, size=sample_num_scenes, replace=False).tolist()
 
 
 @dataclass
@@ -226,7 +311,9 @@ class HabitatEnv(gym.Env):
         infos = self._record_metrics(infos, terminations)
 
         truncations = self._elapsed_steps >= self.max_episode_steps
-        step_reward = self._calc_step_reward(infos["episode"], terminations, truncations)
+        step_reward = self._calc_step_reward(
+            infos["episode"], terminations, truncations
+        )
         dones_for_metric_save = terminations | truncations
         # Only save episode metrics once: at the first time an env becomes done.
         metric_save_masks = dones_for_metric_save & (~self.dones_once)
@@ -583,55 +670,18 @@ class HabitatEnv(gym.Env):
 
     def _get_env_fn_params(self):
         env_fn_params = []
-
-        # Habitat uses hydra to load the config,
-        # but the hydra maybe initialized somewhere else,
-        # so we need to clear it to avoid conflicts
-        hydra_initialized = GlobalHydra.instance().is_initialized()
-        if hydra_initialized:
-            GlobalHydra.instance().clear()
-
-        config_path = self.cfg.init_params.config_path
-        overrides = [
-            f"habitat.dataset.split={self.cfg.split}",
-            f"habitat.dataset.data_path={self.cfg.data_path}",
-            f"habitat.dataset.scenes_dir={self.cfg.scenes_dir}",
-            f"habitat.environment.max_episode_steps={self.max_episode_steps}",
-            "habitat.environment.iterator_options.shuffle=False",
-            "habitat.environment.iterator_options.group_by_scene=False",
-        ]
-        ndtw_gt_path = getattr(self.cfg, "ndtw_gt_path", None)
-        if ndtw_gt_path is not None:
-            overrides.extend(
-                [
-                    f"habitat.task.measurements.ndtw.SPLIT={self.cfg.split}",
-                    f"habitat.task.measurements.ndtw.GT_PATH={ndtw_gt_path}",
-                ]
+        global_plan = getattr(self.cfg, "global_plan", None)
+        if global_plan is None:
+            global_plan = build_habitat_global_plan(
+                self.cfg,
+                num_group=self.num_group,
+                total_num_processes=self.total_num_processes,
+                max_episode_steps=self.max_episode_steps,
             )
-        habitat_config = get_config(config_path, overrides=overrides)
 
-        habitat_dataset = habitat.datasets.make_dataset(
-            habitat_config.habitat.dataset.type,
-            config=habitat_config.habitat.dataset,
-        )
-
-        self._sample_habitat_dataset_scenes(
-            habitat_dataset,
-            getattr(self.cfg, "sample_num_scenes", None),
-            self.cfg.seed,
-        )
-
-        # Load episodes to GPUs in a balanced way according to scene vram profile
-        process_group_episode_ids = vram_balance_episode_ids(
-            habitat_dataset.episodes,
-            auto_reset=self.auto_reset,
-            total_num_processes=self.total_num_processes,
-            num_group=self.num_group,
-            total_num_envs=self.cfg.total_num_envs,
-            max_steps_per_rollout_epoch=self.cfg.max_steps_per_rollout_epoch,
-            max_episode_steps=self.max_episode_steps,
-            seed_offset=self.seed_offset,
-        )
+        config_path = global_plan["config_path"]
+        overrides = global_plan["overrides"]
+        process_group_episode_ids = global_plan["episode_sequences"][self.seed_offset]
 
         for env_id in range(self.num_envs):
             group_id = env_id // self.group_size
@@ -647,29 +697,3 @@ class HabitatEnv(gym.Env):
             )
 
         return env_fn_params
-
-    def _sample_habitat_dataset_scenes(
-        self,
-        habitat_dataset,
-        sample_num_scenes: Optional[int],
-        seed: int,
-    ) -> None:
-        """Subsample episodes to those belonging to a random subset of scenes."""
-        if sample_num_scenes is None:
-            return
-        scene_ids = list(dict.fromkeys(ep.scene_id for ep in habitat_dataset.episodes))
-        if sample_num_scenes > len(scene_ids):
-            raise ValueError(
-                f"sample_num_scenes={sample_num_scenes} exceeds available scenes={len(scene_ids)}"
-            )
-        scene_rng = np.random.default_rng(seed)
-        sampled_scene_ids = set(
-            scene_rng.choice(scene_ids, size=sample_num_scenes, replace=False).tolist()
-        )
-        habitat_dataset.episodes = [
-            ep for ep in habitat_dataset.episodes if ep.scene_id in sampled_scene_ids
-        ]
-        logger.info(
-            f"[HabitatEnv] sampled {sample_num_scenes}/{len(scene_ids)} scenes "
-            f"with seed={seed}, kept {len(habitat_dataset.episodes)} episodes"
-        )

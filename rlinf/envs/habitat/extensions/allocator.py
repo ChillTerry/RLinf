@@ -55,7 +55,7 @@ def get_assignment_mode(auto_reset: bool) -> str:
     return "train"
 
 
-def vram_balance_episode_ids(
+def vram_balance_episode_sequences(
     episodes,
     *,
     auto_reset: bool,
@@ -64,9 +64,8 @@ def vram_balance_episode_ids(
     total_num_envs: int,
     max_steps_per_rollout_epoch: int,
     max_episode_steps: int,
-    seed_offset: int,
     scene_weights: dict[str, int] | None = None,
-) -> list[list[EpisodeId]]:
+) -> EpisodeSequences:
     if scene_weights is None:
         scene_weights = load_scene_vram_profile()
     episode_records = build_episode_records(episodes, scene_weights)
@@ -88,7 +87,7 @@ def vram_balance_episode_ids(
         total_num_envs=total_num_envs,
         dropped_episode_count=dropped_episode_count,
     )
-    return episode_sequences[seed_offset]
+    return episode_sequences
 
 
 def build_episode_records(

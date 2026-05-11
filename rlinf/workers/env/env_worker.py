@@ -226,8 +226,42 @@ class EnvWorker(Worker):
         override_cfg["reward_image_key"] = env_cfg.main_image_key
         setattr(env_cfg, "override_cfg", OmegaConf.create(override_cfg))
 
+    def _inject_habitat_global_plan(self, env_cfg, num_envs_per_stage: int):
+        if env_cfg.env_type != "habitat":
+            return env_cfg
+
+        from rlinf.envs.habitat.habitat_env import build_habitat_global_plan
+
+        group_size = env_cfg.group_size
+        num_group = num_envs_per_stage // group_size
+        total_num_processes = self._world_size * self.stage_num
+        max_episode_steps = env_cfg.max_episode_steps
+
+        habitat_plan = None
+        if self._rank == 0:
+            habitat_plan = build_habitat_global_plan(
+                env_cfg,
+                num_group=num_group,
+                total_num_processes=total_num_processes,
+                max_episode_steps=max_episode_steps,
+            )
+
+        habitat_plan = self.broadcast(
+            habitat_plan,
+            groups=[(self._group_name, list(range(self._world_size)))],
+            src=(self._group_name, 0),
+        )
+
+        override_cfg = OmegaConf.to_container(env_cfg, resolve=True)
+        override_cfg["global_plan"] = habitat_plan
+        return OmegaConf.create(override_cfg)
+
     def _setup_env_and_wrappers(self, env_cls, env_cfg, num_envs_per_stage: int):
         env_list = []
+        env_cfg = self._inject_habitat_global_plan(
+            env_cfg=env_cfg,
+            num_envs_per_stage=num_envs_per_stage,
+        )
 
         for stage_id in range(self.stage_num):
             env = env_cls(
