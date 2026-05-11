@@ -34,55 +34,6 @@ def euclidean_distance(
     return np.linalg.norm(np.array(pos_b) - np.array(pos_a), ord=2)
 
 
-def _format_ndtw_gt_path(config: Any) -> str:
-    gt_path = str(config.GT_PATH)
-    split = str(config.SPLIT)
-    return gt_path.format(split=split)
-
-
-def _load_ndtw_gt_json(config: Any) -> dict[str, Any]:
-    gt_path = _format_ndtw_gt_path(config)
-    if not os.path.exists(gt_path):
-        raise FileNotFoundError(f"NDTW GT_PATH does not exist: {gt_path}")
-
-    with gzip.open(gt_path, "rt", encoding="utf-8") as f:
-        gt_json = json.load(f)
-
-    if not isinstance(gt_json, dict):
-        raise ValueError(f"NDTW GT_PATH must contain a JSON object: {gt_path}")
-    return gt_json
-
-
-def _validate_ndtw_locations(episode_id: str, gt_entry: Any) -> list[list[float]]:
-    if not isinstance(gt_entry, dict) or "locations" not in gt_entry:
-        raise ValueError(
-            f"Episode {episode_id} NDTW ground-truth must contain `locations`."
-        )
-
-    locations = gt_entry["locations"]
-    if not isinstance(locations, list) or len(locations) == 0:
-        raise ValueError(f"Episode {episode_id} NDTW ground-truth locations are empty.")
-
-    validated = []
-    for idx, position in enumerate(locations):
-        try:
-            position_array = np.asarray(position, dtype=np.float64)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Episode {episode_id} NDTW location {idx} must be numeric."
-            ) from exc
-        if position_array.shape != (3,):
-            raise ValueError(
-                f"Episode {episode_id} NDTW location {idx} must be a 3D position."
-            )
-        if not np.isfinite(position_array).all():
-            raise ValueError(
-                f"Episode {episode_id} NDTW location {idx} must contain finite values."
-            )
-        validated.append(position_array.tolist())
-    return validated
-
-
 def _dtw_distance(path: list[list[float]], gt_path: list[list[float]]) -> float:
     costs = np.full(len(gt_path) + 1, np.inf, dtype=np.float64)
     costs[0] = 0.0
@@ -148,7 +99,11 @@ class NDTW(Measure):
                 ) from exc
             self._fastdtw = fastdtw
 
-        self.gt_json = _load_ndtw_gt_json(config)
+        gt_path = str(config.GT_PATH).format(split=str(config.SPLIT))
+        if not os.path.exists(gt_path):
+            raise FileNotFoundError(f"NDTW GT_PATH does not exist: {gt_path}")
+        with gzip.open(gt_path, "rt", encoding="utf-8") as f:
+            self.gt_json = json.load(f)
         self.locations: list[list[float]] = []
         self.gt_locations: list[list[float]] = []
         super().__init__()
@@ -161,9 +116,7 @@ class NDTW(Measure):
         if episode_id not in self.gt_json:
             raise KeyError(f"Episode {episode_id} missing NDTW ground-truth.")
         self.locations = []
-        self.gt_locations = _validate_ndtw_locations(
-            episode_id, self.gt_json[episode_id]
-        )
+        self.gt_locations = self.gt_json[episode_id]["locations"]
         self.update_metric()
 
     def update_metric(self, *args: Any, **kwargs: Any):
