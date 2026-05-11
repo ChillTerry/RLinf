@@ -132,33 +132,6 @@ class HabitatEnv(gym.Env):
         obs_list = []
         infos_list = []
 
-        # Truncate chunk if it contains "stop" and pad with "no_op"
-        for env_idx, chunk_action in enumerate(chunk_actions):
-            stop_idx = np.where(chunk_action == "stop")[0]
-            if len(stop_idx) > 0:
-                stop_idx = stop_idx[0] + 1
-                truncated_chunk = chunk_action[:stop_idx].copy()
-                chunk_actions[env_idx] = np.concatenate(
-                    [truncated_chunk, ["no_op"] * (chunk_size - len(truncated_chunk))]
-                )
-
-        # Truncate chunk if it would exceed max_episode_steps and pad with "no_op"
-        for env_idx, elapsed_step in enumerate(self._elapsed_steps):
-            if elapsed_step + chunk_size >= self.max_episode_steps:
-                reserved_idx = self.max_episode_steps - elapsed_step
-                assert reserved_idx > 0, (
-                    f"Executed step {elapsed_step} exceeds max_episode_steps {self.max_episode_steps}, "
-                    "reset env before executing next step."
-                )
-                truncated_chunk = chunk_actions[env_idx][:reserved_idx].copy()
-                truncated_chunk[reserved_idx - 1] = "stop"
-                chunk_actions[env_idx] = np.concatenate(
-                    [
-                        truncated_chunk,
-                        ["no_op"] * (chunk_size - len(truncated_chunk)),
-                    ]
-                )
-
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
