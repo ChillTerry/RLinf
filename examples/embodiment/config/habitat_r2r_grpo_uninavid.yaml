@@ -17,7 +17,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: all
+    actor,env,rollout: 0-7
 
 runner:
   task_type: embodied
@@ -28,12 +28,12 @@ runner:
     experiment_name: "habitat_r2r_grpo_uninavid"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1
+  max_epochs: 1000
   max_steps: -1
 
   only_eval: False
   val_check_interval: -1
-  save_interval: -1
+  save_interval: 10
 
   resume_dir: null
   ckpt_path: null
@@ -41,16 +41,16 @@ runner:
 algorithm:
   normalize_advantages: True
   kl_penalty: kl
-  group_size: 4
-  reward_coef: 5.0
-  rollout_epoch: 1
-  eval_rollout_epoch: 1
+
+  update_epoch: 1
+  rollout_epoch: 2
+  eval_rollout_epoch: -1
+  group_size: 8
 
   reward_type: chunk_level
   logprob_type: token_level
   entropy_type: token_level
 
-  update_epoch: 1
   adv_type: grpo
   loss_type: actor
   loss_agg_func: "token-mean"
@@ -65,9 +65,10 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
 
+  reward_coef: 10.0
   filter_rewards: False
-  rewards_lower_bound: 0.0
-  rewards_upper_bound: 1.0
+  rewards_lower_bound: 1.0
+  rewards_upper_bound: 9.0
 
   sampling_params:
     do_sample: True
@@ -79,9 +80,7 @@ algorithm:
     add_BOS: False
 
   length_params:
-    max_new_token: 1024
-    max_length: 2048
-    min_length: 1
+    max_new_token: 256
 
 env:
   group_name: "EnvGroup"
@@ -90,10 +89,12 @@ env:
   scenes_dir: "VLN-CE/scene_dataset"
 
   train:
-    total_num_envs: ${env.eval.total_num_envs}
+    total_num_envs: 128
+    max_episode_steps: 128
+    max_steps_per_rollout_epoch: 128
+    group_size: ${algorithm.group_size}
     model_type: ${actor.model.model_type}
     reward_coef: ${algorithm.reward_coef}
-    group_size: ${algorithm.group_size}
     use_rel_reward: True
     split: train
     data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}.json.gz
@@ -115,7 +116,6 @@ env:
     auto_reset: True
     ignore_terminations: True
     model_type: ${actor.model.model_type}
-    use_rel_reward: True
     split: val_unseen
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
     scenes_dir: ${env.scenes_dir}
@@ -133,7 +133,7 @@ rollout:
   generation_backend: "huggingface"
   collect_prev_infos: True
   recompute_logprobs: False
-  enable_offload: False
+  enable_offload: True
   pipeline_stage_num: 1
 
   model:
@@ -143,16 +143,10 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 1
-  global_batch_size: 4
+  micro_batch_size: 16
+  global_batch_size: 256
   seed: 42
-  enable_offload: False
-
-  model:
-    model_type: "uninavid"
-    rollout_mode: "batched_feature_cache"
-    action_dim: 1
-    num_action_chunks: 4
+  enable_offload: True
 
   optim:
     lr: 1.0e-5
@@ -166,7 +160,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "full_shard"
-    gradient_checkpointing: False
+    gradient_checkpointing: True
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
