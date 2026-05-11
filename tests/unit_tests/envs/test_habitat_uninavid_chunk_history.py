@@ -89,6 +89,29 @@ def test_habitat_grpo_uninavid_uses_weighted_reward_config():
     )
 
 
+def test_habitat_eval_uninavid_uses_weighted_reward_config():
+    cfg = OmegaConf.load("examples/embodiment/config/habitat_r2r_eval_uninavid.yaml")
+    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
+
+    assert "reward_coef" not in raw_cfg["algorithm"]
+    assert raw_cfg["algorithm"]["success_reward_coef"] == 10.0
+    assert raw_cfg["algorithm"]["ndtw_reward_coef"] == 5.0
+    assert raw_cfg["env"]["train"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
+    assert raw_cfg["env"]["train"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
+    assert raw_cfg["env"]["train"]["split"] == "train"
+    assert (
+        raw_cfg["env"]["train"]["ndtw_gt_path"]
+        == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
+    )
+    assert raw_cfg["env"]["eval"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
+    assert raw_cfg["env"]["eval"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
+    assert raw_cfg["env"]["eval"]["use_rel_reward"] is False
+    assert (
+        raw_cfg["env"]["eval"]["ndtw_gt_path"]
+        == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
+    )
+
+
 def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
     dummy_dataset = SimpleNamespace(
         episodes=[

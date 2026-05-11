@@ -42,7 +42,8 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl
   group_size: 4
-  reward_coef: 5.0
+  success_reward_coef: 10.0
+  ndtw_reward_coef: 5.0
   rollout_epoch: 1
   eval_rollout_epoch: 1
 
@@ -92,7 +93,10 @@ env:
   train:
     total_num_envs: ${env.eval.total_num_envs}
     model_type: ${actor.model.model_type}
-    reward_coef: ${algorithm.reward_coef}
+    split: train
+    success_reward_coef: ${algorithm.success_reward_coef}
+    ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
+    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     group_size: ${algorithm.group_size}
 
   eval:
@@ -105,6 +109,10 @@ env:
     model_type: ${actor.model.model_type}
     split: val_unseen
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
+    success_reward_coef: ${algorithm.success_reward_coef}
+    ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
+    use_rel_reward: False
+    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
     scenes_dir: ${env.scenes_dir}
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
