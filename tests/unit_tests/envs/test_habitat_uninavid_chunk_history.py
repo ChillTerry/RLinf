@@ -15,6 +15,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+from omegaconf import OmegaConf
 import torch
 
 import rlinf.envs.habitat.habitat_env as habitat_env_module
@@ -50,6 +51,39 @@ def test_uninavid_habitat_extension_config_composes_with_local_schema():
     )
     assert cfg.habitat.task.measurements.ndtw.SUCCESS_DISTANCE == 3.0
     assert cfg.habitat.task.measurements.ndtw.FDTW is False
+
+
+def test_habitat_r2r_env_default_exposes_weighted_reward_config():
+    cfg = OmegaConf.load("examples/embodiment/config/env/habitat_r2r.yaml")
+
+    assert "reward_coef" not in cfg
+    assert cfg.success_reward_coef == 10.0
+    assert cfg.ndtw_reward_coef == 5.0
+    assert cfg.ndtw_gt_path is None
+    assert cfg.use_rel_reward is False
+
+
+def test_habitat_grpo_uninavid_uses_weighted_reward_config():
+    cfg = OmegaConf.load("examples/embodiment/config/habitat_r2r_grpo_uninavid.yaml")
+    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
+
+    assert "reward_coef" not in raw_cfg["algorithm"]
+    assert raw_cfg["algorithm"]["success_reward_coef"] == 10.0
+    assert raw_cfg["algorithm"]["ndtw_reward_coef"] == 5.0
+    assert raw_cfg["env"]["train"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
+    assert raw_cfg["env"]["train"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
+    assert raw_cfg["env"]["train"]["use_rel_reward"] is False
+    assert (
+        raw_cfg["env"]["train"]["ndtw_gt_path"]
+        == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
+    )
+    assert raw_cfg["env"]["eval"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
+    assert raw_cfg["env"]["eval"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
+    assert raw_cfg["env"]["eval"]["use_rel_reward"] is False
+    assert (
+        raw_cfg["env"]["eval"]["ndtw_gt_path"]
+        == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
+    )
 
 
 def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):

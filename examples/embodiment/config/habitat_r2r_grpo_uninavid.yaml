@@ -65,7 +65,8 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
 
-  reward_coef: 10.0
+  success_reward_coef: 10.0
+  ndtw_reward_coef: 5.0
   filter_rewards: False
   rewards_lower_bound: 1.0
   rewards_upper_bound: 9.0
@@ -94,10 +95,12 @@ env:
     max_steps_per_rollout_epoch: 128
     group_size: ${algorithm.group_size}
     model_type: ${actor.model.model_type}
-    reward_coef: ${algorithm.reward_coef}
-    use_rel_reward: True
+    success_reward_coef: ${algorithm.success_reward_coef}
+    ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
+    use_rel_reward: False
     split: train
     data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}.json.gz
+    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     scenes_dir: ${env.scenes_dir}
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
@@ -116,8 +119,12 @@ env:
     auto_reset: True
     ignore_terminations: True
     model_type: ${actor.model.model_type}
+    success_reward_coef: ${algorithm.success_reward_coef}
+    ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
+    use_rel_reward: False
     split: val_unseen
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
+    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
     scenes_dir: ${env.scenes_dir}
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
