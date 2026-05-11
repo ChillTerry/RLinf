@@ -16,6 +16,7 @@ import copy
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import cv2
@@ -25,7 +26,9 @@ import numpy as np
 import torch
 from habitat.core.embodied_task import SimulatorTaskAction
 from habitat.core.registry import registry
+from habitat.config.default_structured_configs import MeasurementConfig
 from habitat_baselines.config.default import get_config
+from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
 
 from rlinf.envs.habitat.extensions import measures
@@ -40,6 +43,23 @@ from rlinf.envs.utils import (
 measures.pass_format_check()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NDTWMeasurementConfig(MeasurementConfig):
+    type: str = "NDTW"
+    SPLIT: str = ""
+    GT_PATH: str = ""
+    SUCCESS_DISTANCE: float = 3.0
+    FDTW: bool = False
+
+
+ConfigStore.instance().store(
+    package="habitat.task.measurements.ndtw",
+    group="habitat/task/measurements",
+    name="ndtw",
+    node=NDTWMeasurementConfig,
+)
 
 
 @registry.register_task_action
@@ -556,6 +576,14 @@ class HabitatEnv(gym.Env):
             "habitat.environment.iterator_options.shuffle=False",
             "habitat.environment.iterator_options.group_by_scene=False",
         ]
+        ndtw_gt_path = getattr(self.cfg, "ndtw_gt_path", None)
+        if ndtw_gt_path is not None:
+            overrides.extend(
+                [
+                    f"habitat.task.measurements.ndtw.SPLIT={self.cfg.split}",
+                    f"habitat.task.measurements.ndtw.GT_PATH={ndtw_gt_path}",
+                ]
+            )
         habitat_config = get_config(config_path, overrides=overrides)
 
         habitat_dataset = habitat.datasets.make_dataset(

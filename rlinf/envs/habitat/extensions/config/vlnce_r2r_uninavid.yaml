@@ -2,6 +2,8 @@
 
 defaults:
   - /benchmark/nav/vln_r2r
+  - /habitat/task/measurements:
+    - ndtw
   - _self_
 
 habitat:
@@ -40,6 +42,12 @@ habitat:
         type: OracleNavigationError
       oracle_success:
         type: OracleSuccess
+      ndtw:
+        type: NDTW
+        SPLIT: ${habitat.dataset.split}
+        GT_PATH: "VLN-CE/datasets/r2r/{split}/{split}_gt.json.gz"
+        SUCCESS_DISTANCE: 3.0
+        FDTW: False
 
   dataset:
     type: R2RVLN-v1
