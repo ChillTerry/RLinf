@@ -58,12 +58,12 @@ def test_habitat_r2r_env_default_does_not_opt_into_weighted_reward():
     cfg = OmegaConf.load("examples/embodiment/config/env/habitat_r2r.yaml")
     raw_cfg = OmegaConf.to_container(cfg, resolve=False)
 
-    assert "reward_coef" not in cfg
+    assert cfg.reward_coef == 5.0
     assert "reward_mode" not in raw_cfg
     assert cfg.success_reward_coef == 10.0
     assert cfg.ndtw_reward_coef == 5.0
     assert cfg.ndtw_gt_path is None
-    assert cfg.use_rel_reward is False
+    assert cfg.use_rel_reward is True
 
 
 def test_habitat_grpo_uninavid_uses_weighted_reward_config():
@@ -102,6 +102,7 @@ def test_habitat_eval_uninavid_uses_weighted_reward_config():
     assert raw_cfg["env"]["train"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_cfg["env"]["train"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
     assert raw_cfg["env"]["train"]["split"] == "train"
+    assert raw_cfg["env"]["train"]["use_rel_reward"] is False
     assert (
         raw_cfg["env"]["train"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"

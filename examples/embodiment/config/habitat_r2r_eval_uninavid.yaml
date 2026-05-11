@@ -97,6 +97,7 @@ env:
     split: train
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
+    use_rel_reward: False
     ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     group_size: ${algorithm.group_size}
 
