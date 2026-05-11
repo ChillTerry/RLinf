@@ -14,6 +14,9 @@
 
 from types import SimpleNamespace
 
+import numpy as np
+import torch
+
 import rlinf.envs.habitat.habitat_env as habitat_env_module
 from rlinf.envs.habitat.habitat_env import HabitatEnv
 
@@ -100,3 +103,77 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
         "habitat.task.measurements.ndtw.GT_PATH=/tmp/r2r/train/train_gt.json.gz"
         in env_fn_params[0]["overrides"]
     )
+
+
+def _make_reward_test_env(num_envs):
+    env = object.__new__(HabitatEnv)
+    env.num_envs = num_envs
+    env.cfg = SimpleNamespace(success_reward_coef=10.0, ndtw_reward_coef=5.0)
+    env.env_config = SimpleNamespace(
+        task=SimpleNamespace(
+            measurements=SimpleNamespace(success=SimpleNamespace(success_distance=3.0))
+        )
+    )
+    return env
+
+
+def test_habitat_reward_uses_weighted_success_ndtw_only_for_first_normal_terminal():
+    env = _make_reward_test_env(num_envs=4)
+    env.dones_once = np.array([False, False, False, True])
+    episode = {
+        "success": torch.tensor([1.0, 0.0, 1.0, 1.0]),
+        "distance_to_goal": torch.tensor([1.5, 4.0, 0.0, 0.0]),
+        "ndtw": torch.tensor([0.2, 0.8, 1.0, 0.9]),
+    }
+
+    reward = env._calc_step_reward(
+        episode,
+        terminations=np.array([True, True, False, True]),
+        truncations=np.array([False, False, True, False]),
+    )
+
+    assert reward.tolist() == [6.0, 4.0, 0.0, 0.0]
+
+
+def test_habitat_reward_is_zero_for_non_terminal_steps():
+    env = _make_reward_test_env(num_envs=2)
+    env.dones_once = np.array([False, False])
+    episode = {
+        "success": torch.tensor([1.0, 0.0]),
+        "distance_to_goal": torch.tensor([0.0, 1.0]),
+        "ndtw": torch.tensor([1.0, 0.5]),
+    }
+
+    reward = env._calc_step_reward(
+        episode,
+        terminations=np.array([False, False]),
+        truncations=np.array([False, False]),
+    )
+
+    assert reward.tolist() == [0.0, 0.0]
+
+
+def test_habitat_record_metrics_includes_ndtw_and_seeds_initial_distance_to_goal():
+    env = object.__new__(HabitatEnv)
+    env.env_config = SimpleNamespace(
+        task=SimpleNamespace(
+            measurements=SimpleNamespace(success=SimpleNamespace(success_distance=4.0))
+        )
+    )
+    env._elapsed_steps = np.array([1, 2], dtype=np.int32)
+    env.initial_distance_to_goal = np.array([np.nan, 5.0], dtype=np.float32)
+
+    infos = {
+        "distance_to_goal": [3.5, 3.0],
+        "ndtw": [0.25, 0.75],
+        "trajectory_Length": [2.0, 2.0],
+        "oracle_success": [0.0, 1.0],
+        "oracle_navigation_error": [3.5, 0.5],
+    }
+
+    recorded_infos = env._record_metrics(infos, np.array([False, True]))
+
+    assert env.initial_distance_to_goal.tolist() == [3.5, 5.0]
+    assert recorded_infos["episode"]["success"].tolist() == [0.0, 1.0]
+    assert recorded_infos["episode"]["spl"].tolist() == [0.0, 1.0]
+    assert recorded_infos["episode"]["ndtw"].tolist() == [0.25, 0.75]

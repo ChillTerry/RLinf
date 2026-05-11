@@ -226,9 +226,9 @@ class HabitatEnv(gym.Env):
         # TODO: what if termination means failure? (e.g. robot falling down)
         infos = list_of_dict_to_dict_of_list(info_lists)
         infos = self._record_metrics(infos, terminations)
-        step_reward = self._calc_step_reward(infos["episode"]["success"])
 
         truncations = self._elapsed_steps >= self.max_episode_steps
+        step_reward = self._calc_step_reward(infos["episode"], terminations, truncations)
         dones_for_metric_save = terminations | truncations
         # Only save episode metrics once: at the first time an env becomes done.
         metric_save_masks = dones_for_metric_save & (~self.dones_once)
@@ -395,15 +395,37 @@ class HabitatEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return obs, infos
 
-    def _calc_step_reward(self, success):
-        reward = self.cfg.reward_coef * success
-        reward_diff = reward - self.prev_step_reward
-        self.prev_step_reward = reward
+    @staticmethod
+    def _metric_to_numpy(value):
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
 
-        if self.use_rel_reward:
-            return reward_diff
-        else:
+    def _calc_step_reward(self, episode, terminations, truncations):
+        reward = np.zeros(self.num_envs, dtype=np.float32)
+        terminations = np.asarray(terminations, dtype=bool)
+        truncations = np.asarray(truncations, dtype=bool)
+        first_terminal = np.logical_or(terminations, truncations) & (~self.dones_once)
+        normal_termination = first_terminal & terminations & (~truncations)
+        if not normal_termination.any():
             return reward
+
+        success = self._metric_to_numpy(episode["success"]).astype(np.float32)
+        distance_to_goal = self._metric_to_numpy(episode["distance_to_goal"]).astype(
+            np.float32
+        )
+        ndtw = self._metric_to_numpy(episode["ndtw"]).astype(np.float32)
+        success_distance = float(
+            self.env_config.task.measurements.success.success_distance
+        )
+
+        success_scale = 1.0 - np.minimum(distance_to_goal / success_distance, 1.0)
+        success_reward = success * float(self.cfg.success_reward_coef) * success_scale
+        ndtw_reward = ndtw * float(self.cfg.ndtw_reward_coef)
+        reward[normal_termination] = (
+            success_reward[normal_termination] + ndtw_reward[normal_termination]
+        )
+        return reward
 
     def _record_metrics(self, infos, terminations):
         episode_info = {}
@@ -413,6 +435,11 @@ class HabitatEnv(gym.Env):
         episode_info["distance_to_goal"] = np.array(
             infos["distance_to_goal"], dtype=np.float32
         ).copy()
+        if "ndtw" not in infos:
+            raise KeyError(
+                "Habitat NDTW metric is required for weighted_success_ndtw reward."
+            )
+        episode_info["ndtw"] = np.array(infos["ndtw"], dtype=np.float32).copy()
 
         # Record initial distance to goal at the first step of each episode
         is_first_step = self._elapsed_steps == 1
