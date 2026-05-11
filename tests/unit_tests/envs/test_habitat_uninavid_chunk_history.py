@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from omegaconf import OmegaConf
+import pytest
 import torch
 
 import rlinf.envs.habitat.habitat_env as habitat_env_module
@@ -55,8 +56,10 @@ def test_uninavid_habitat_extension_config_composes_with_local_schema():
 
 def test_habitat_r2r_env_default_exposes_weighted_reward_config():
     cfg = OmegaConf.load("examples/embodiment/config/env/habitat_r2r.yaml")
+    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
 
     assert "reward_coef" not in cfg
+    assert raw_cfg["reward_mode"] == "weighted_success_ndtw"
     assert cfg.success_reward_coef == 10.0
     assert cfg.ndtw_reward_coef == 5.0
     assert cfg.ndtw_gt_path is None
@@ -137,6 +140,24 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
         "habitat.task.measurements.ndtw.GT_PATH=/tmp/r2r/train/train_gt.json.gz"
         in env_fn_params[0]["overrides"]
     )
+
+
+def test_habitat_weighted_reward_validation_requires_required_fields():
+    env = object.__new__(HabitatEnv)
+    env.reward_mode = "weighted_success_ndtw"
+    env.cfg = SimpleNamespace(success_reward_coef=10.0, ndtw_reward_coef=5.0)
+
+    with pytest.raises(ValueError, match="ndtw_gt_path"):
+        env._validate_reward_config()
+
+
+def test_habitat_weighted_reward_validation_rejects_unsupported_mode():
+    env = object.__new__(HabitatEnv)
+    env.reward_mode = None
+    env.cfg = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="reward_mode.*weighted_success_ndtw"):
+        env._validate_reward_config()
 
 
 def _make_reward_test_env(num_envs):

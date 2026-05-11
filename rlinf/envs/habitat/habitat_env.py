@@ -90,6 +90,8 @@ class HabitatEnv(gym.Env):
         self.ignore_terminations = cfg.ignore_terminations
         self.dones_once = np.zeros(self.num_envs, dtype=bool)
         self.first_done_infos = None
+        self.reward_mode = getattr(cfg, "reward_mode", None)
+        self._validate_reward_config()
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -400,6 +402,28 @@ class HabitatEnv(gym.Env):
         if torch.is_tensor(value):
             return value.detach().cpu().numpy()
         return np.asarray(value)
+
+    def _validate_reward_config(self):
+        if self.reward_mode != "weighted_success_ndtw":
+            raise ValueError(
+                "Habitat reward_mode must be 'weighted_success_ndtw' for this "
+                "implementation. Set cfg.reward_mode='weighted_success_ndtw' "
+                "to explicitly opt in."
+            )
+
+        required_fields = (
+            "success_reward_coef",
+            "ndtw_reward_coef",
+            "ndtw_gt_path",
+        )
+        missing_fields = [
+            field for field in required_fields if getattr(self.cfg, field, None) is None
+        ]
+        if missing_fields:
+            raise ValueError(
+                "Habitat reward_mode 'weighted_success_ndtw' requires non-None "
+                f"config fields: {', '.join(missing_fields)}."
+            )
 
     def _calc_step_reward(self, episode, terminations, truncations):
         reward = np.zeros(self.num_envs, dtype=np.float32)
