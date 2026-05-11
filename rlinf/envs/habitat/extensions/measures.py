@@ -75,6 +75,10 @@ def _validate_ndtw_locations(episode_id: str, gt_entry: Any) -> list[list[float]
             raise ValueError(
                 f"Episode {episode_id} NDTW location {idx} must be a 3D position."
             )
+        if not np.isfinite(position_array).all():
+            raise ValueError(
+                f"Episode {episode_id} NDTW location {idx} must contain finite values."
+            )
         validated.append(position_array.tolist())
     return validated
 
@@ -130,6 +134,9 @@ class NDTW(Measure):
     def __init__(self, *args: Any, sim: Simulator, config: Any, **kwargs: Any):
         self._sim = sim
         self._config = config
+        self._success_distance = float(config.SUCCESS_DISTANCE)
+        if self._success_distance <= 0.0:
+            raise ValueError("NDTW SUCCESS_DISTANCE must be greater than 0.")
         self._fastdtw = None
         if bool(getattr(config, "FDTW", False)):
             try:
@@ -174,8 +181,7 @@ class NDTW(Measure):
 
         self._metric = float(
             np.exp(
-                -dtw_distance
-                / (len(self.gt_locations) * float(self._config.SUCCESS_DISTANCE))
+                -dtw_distance / (len(self.gt_locations) * self._success_distance)
             )
         )
 

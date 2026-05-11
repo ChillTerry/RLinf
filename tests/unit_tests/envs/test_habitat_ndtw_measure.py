@@ -43,11 +43,11 @@ def _write_gt(tmp_path, payload):
     return gt_path
 
 
-def _config(gt_path, *, fdtw=False):
+def _config(gt_path, *, fdtw=False, success_distance=3.0):
     return SimpleNamespace(
         SPLIT="train",
         GT_PATH=str(gt_path),
-        SUCCESS_DISTANCE=3.0,
+        SUCCESS_DISTANCE=success_distance,
         FDTW=fdtw,
     )
 
@@ -91,6 +91,48 @@ def test_ndtw_measure_fails_when_episode_id_is_missing(tmp_path):
 
     with pytest.raises(KeyError, match="missing NDTW ground-truth"):
         measure.reset_metric(episode=SimpleNamespace(episode_id="episode-404"))
+
+
+def test_ndtw_measure_fails_when_gt_path_has_non_finite_coordinate(tmp_path):
+    gt_path = _write_gt(
+        tmp_path,
+        {"episode-1": {"locations": [[0.0, float("nan"), 0.0]]}},
+    )
+    measure = NDTW(sim=SimStub([0.0, 0.0, 0.0]), config=_config(gt_path))
+
+    with pytest.raises(ValueError, match="finite"):
+        measure.reset_metric(episode=SimpleNamespace(episode_id="episode-1"))
+
+
+@pytest.mark.parametrize("success_distance", [0.0, -1.0])
+def test_ndtw_measure_fails_when_success_distance_is_not_positive(
+    tmp_path, success_distance
+):
+    gt_path = _write_gt(
+        tmp_path,
+        {"episode-1": {"locations": [[0.0, 0.0, 0.0]]}},
+    )
+
+    with pytest.raises(ValueError, match="SUCCESS_DISTANCE"):
+        NDTW(
+            sim=SimStub([0.0, 0.0, 0.0]),
+            config=_config(gt_path, success_distance=success_distance),
+        )
+
+
+def test_ndtw_measure_matches_hand_computed_dtw_value(tmp_path):
+    gt_path = _write_gt(
+        tmp_path,
+        {"episode-1": {"locations": [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]}},
+    )
+    sim = SimStub([0.0, 0.0, 0.0])
+    measure = NDTW(sim=sim, config=_config(gt_path, success_distance=2.0))
+
+    measure.reset_metric(episode=SimpleNamespace(episode_id="episode-1"))
+    sim.position = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    measure.update_metric()
+
+    assert math.isclose(measure.get_metric(), math.exp(-0.25), rel_tol=1e-6)
 
 
 @pytest.mark.parametrize(
