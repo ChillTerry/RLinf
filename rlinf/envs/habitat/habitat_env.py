@@ -404,12 +404,8 @@ class HabitatEnv(gym.Env):
         return np.asarray(value)
 
     def _validate_reward_config(self):
-        if self.reward_mode != "weighted_success_ndtw":
-            raise ValueError(
-                "Habitat reward_mode must be 'weighted_success_ndtw' for this "
-                "implementation. Set cfg.reward_mode='weighted_success_ndtw' "
-                "to explicitly opt in."
-            )
+        if not self._uses_weighted_success_ndtw_reward():
+            return
 
         required_fields = (
             "success_reward_coef",
@@ -425,7 +421,18 @@ class HabitatEnv(gym.Env):
                 f"config fields: {', '.join(missing_fields)}."
             )
 
+    def _uses_weighted_success_ndtw_reward(self):
+        return self.reward_mode == "weighted_success_ndtw"
+
     def _calc_step_reward(self, episode, terminations, truncations):
+        if not self._uses_weighted_success_ndtw_reward():
+            reward = self.cfg.reward_coef * self._metric_to_numpy(episode["success"])
+            reward_diff = reward - self.prev_step_reward
+            self.prev_step_reward = reward
+            if self.use_rel_reward:
+                return reward_diff
+            return reward
+
         reward = np.zeros(self.num_envs, dtype=np.float32)
         terminations = np.asarray(terminations, dtype=bool)
         truncations = np.asarray(truncations, dtype=bool)
@@ -459,11 +466,12 @@ class HabitatEnv(gym.Env):
         episode_info["distance_to_goal"] = np.array(
             infos["distance_to_goal"], dtype=np.float32
         ).copy()
-        if "ndtw" not in infos:
-            raise KeyError(
-                "Habitat NDTW metric is required for weighted_success_ndtw reward."
-            )
-        episode_info["ndtw"] = np.array(infos["ndtw"], dtype=np.float32).copy()
+        if self._uses_weighted_success_ndtw_reward():
+            if "ndtw" not in infos:
+                raise KeyError(
+                    "Habitat NDTW metric is required for weighted_success_ndtw reward."
+                )
+            episode_info["ndtw"] = np.array(infos["ndtw"], dtype=np.float32).copy()
 
         # Record initial distance to goal at the first step of each episode
         is_first_step = self._elapsed_steps == 1

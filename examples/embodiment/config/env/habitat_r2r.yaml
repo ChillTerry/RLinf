@@ -3,7 +3,6 @@ task_suite_name: vln_r2r
 
 seed: 0
 group_size: 1
-reward_mode: weighted_success_ndtw
 success_reward_coef: 10.0
 ndtw_reward_coef: 5.0
 ndtw_gt_path: null

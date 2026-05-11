@@ -95,6 +95,7 @@ env:
     max_steps_per_rollout_epoch: 128
     group_size: ${algorithm.group_size}
     model_type: ${actor.model.model_type}
+    reward_mode: weighted_success_ndtw
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
     use_rel_reward: False
@@ -119,6 +120,7 @@ env:
     auto_reset: True
     ignore_terminations: True
     model_type: ${actor.model.model_type}
+    reward_mode: weighted_success_ndtw
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
     use_rel_reward: False
