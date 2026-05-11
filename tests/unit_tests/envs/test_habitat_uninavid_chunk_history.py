@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import numpy as np
 from omegaconf import OmegaConf
-import pytest
 import torch
 
 import rlinf.envs.habitat.habitat_env as habitat_env_module
@@ -54,16 +53,15 @@ def test_uninavid_habitat_extension_config_composes_with_local_schema():
     assert cfg.habitat.task.measurements.ndtw.FDTW is False
 
 
-def test_habitat_r2r_env_default_does_not_opt_into_weighted_reward():
+def test_habitat_r2r_env_default_uses_weighted_reward_config():
     cfg = OmegaConf.load("examples/embodiment/config/env/habitat_r2r.yaml")
     raw_cfg = OmegaConf.to_container(cfg, resolve=False)
 
-    assert cfg.reward_coef == 5.0
+    assert "reward_coef" not in raw_cfg
     assert "reward_mode" not in raw_cfg
     assert cfg.success_reward_coef == 10.0
     assert cfg.ndtw_reward_coef == 5.0
     assert cfg.ndtw_gt_path is None
-    assert cfg.use_rel_reward is True
 
 
 def test_habitat_grpo_uninavid_uses_weighted_reward_config():
@@ -73,18 +71,16 @@ def test_habitat_grpo_uninavid_uses_weighted_reward_config():
     assert "reward_coef" not in raw_cfg["algorithm"]
     assert raw_cfg["algorithm"]["success_reward_coef"] == 10.0
     assert raw_cfg["algorithm"]["ndtw_reward_coef"] == 5.0
-    assert raw_cfg["env"]["train"]["reward_mode"] == "weighted_success_ndtw"
+    assert "reward_mode" not in raw_cfg["env"]["train"]
     assert raw_cfg["env"]["train"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_cfg["env"]["train"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
-    assert raw_cfg["env"]["train"]["use_rel_reward"] is False
     assert (
         raw_cfg["env"]["train"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
     )
-    assert raw_cfg["env"]["eval"]["reward_mode"] == "weighted_success_ndtw"
+    assert "reward_mode" not in raw_cfg["env"]["eval"]
     assert raw_cfg["env"]["eval"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_cfg["env"]["eval"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
-    assert raw_cfg["env"]["eval"]["use_rel_reward"] is False
     assert (
         raw_cfg["env"]["eval"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
@@ -98,19 +94,17 @@ def test_habitat_eval_uninavid_uses_weighted_reward_config():
     assert "reward_coef" not in raw_cfg["algorithm"]
     assert raw_cfg["algorithm"]["success_reward_coef"] == 10.0
     assert raw_cfg["algorithm"]["ndtw_reward_coef"] == 5.0
-    assert raw_cfg["env"]["train"]["reward_mode"] == "weighted_success_ndtw"
+    assert "reward_mode" not in raw_cfg["env"]["train"]
     assert raw_cfg["env"]["train"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_cfg["env"]["train"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
     assert raw_cfg["env"]["train"]["split"] == "train"
-    assert raw_cfg["env"]["train"]["use_rel_reward"] is False
     assert (
         raw_cfg["env"]["train"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
     )
-    assert raw_cfg["env"]["eval"]["reward_mode"] == "weighted_success_ndtw"
+    assert "reward_mode" not in raw_cfg["env"]["eval"]
     assert raw_cfg["env"]["eval"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_cfg["env"]["eval"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
-    assert raw_cfg["env"]["eval"]["use_rel_reward"] is False
     assert (
         raw_cfg["env"]["eval"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
@@ -170,35 +164,9 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
     )
 
 
-def test_habitat_weighted_reward_validation_requires_required_fields():
-    env = object.__new__(HabitatEnv)
-    env.reward_mode = "weighted_success_ndtw"
-    env.cfg = SimpleNamespace(success_reward_coef=10.0, ndtw_reward_coef=5.0)
-
-    with pytest.raises(ValueError, match="ndtw_gt_path"):
-        env._validate_reward_config()
-
-
-def test_habitat_weighted_reward_validation_preserves_legacy_absent_mode():
-    env = object.__new__(HabitatEnv)
-    env.reward_mode = None
-    env.cfg = SimpleNamespace()
-
-    env._validate_reward_config()
-
-
-def test_habitat_weighted_reward_validation_preserves_legacy_non_weighted_mode():
-    env = object.__new__(HabitatEnv)
-    env.reward_mode = "legacy_success"
-    env.cfg = SimpleNamespace()
-
-    env._validate_reward_config()
-
-
 def _make_reward_test_env(num_envs):
     env = object.__new__(HabitatEnv)
     env.num_envs = num_envs
-    env.reward_mode = "weighted_success_ndtw"
     env.cfg = SimpleNamespace(success_reward_coef=10.0, ndtw_reward_coef=5.0)
     env.env_config = SimpleNamespace(
         task=SimpleNamespace(
@@ -262,28 +230,8 @@ def test_habitat_weighted_reward_is_zero_for_simultaneous_termination_and_trunca
     assert reward.tolist() == [0.0]
 
 
-def test_habitat_legacy_reward_preserves_reward_coef_and_relative_diff():
-    env = object.__new__(HabitatEnv)
-    env.num_envs = 2
-    env.reward_mode = None
-    env.cfg = SimpleNamespace(reward_coef=3.0)
-    env.prev_step_reward = np.array([0.0, 1.5], dtype=np.float32)
-    env.use_rel_reward = True
-    episode = {"success": torch.tensor([1.0, 0.0])}
-
-    reward = env._calc_step_reward(
-        episode,
-        terminations=np.array([False, True]),
-        truncations=np.array([False, False]),
-    )
-
-    assert reward.tolist() == [3.0, -1.5]
-    assert env.prev_step_reward.tolist() == [3.0, 0.0]
-
-
 def test_habitat_record_metrics_includes_ndtw_and_seeds_initial_distance_to_goal():
     env = object.__new__(HabitatEnv)
-    env.reward_mode = "weighted_success_ndtw"
     env.env_config = SimpleNamespace(
         task=SimpleNamespace(
             measurements=SimpleNamespace(success=SimpleNamespace(success_distance=4.0))
@@ -306,27 +254,3 @@ def test_habitat_record_metrics_includes_ndtw_and_seeds_initial_distance_to_goal
     assert recorded_infos["episode"]["success"].tolist() == [0.0, 1.0]
     assert recorded_infos["episode"]["spl"].tolist() == [0.0, 1.0]
     assert recorded_infos["episode"]["ndtw"].tolist() == [0.25, 0.75]
-
-
-def test_habitat_record_metrics_does_not_require_ndtw_in_legacy_mode():
-    env = object.__new__(HabitatEnv)
-    env.reward_mode = None
-    env.env_config = SimpleNamespace(
-        task=SimpleNamespace(
-            measurements=SimpleNamespace(success=SimpleNamespace(success_distance=4.0))
-        )
-    )
-    env._elapsed_steps = np.array([1], dtype=np.int32)
-    env.initial_distance_to_goal = np.array([np.nan], dtype=np.float32)
-
-    infos = {
-        "distance_to_goal": [3.5],
-        "trajectory_Length": [2.0],
-        "oracle_success": np.array([0.0], dtype=np.float32),
-        "oracle_navigation_error": np.array([3.5], dtype=np.float32),
-    }
-
-    recorded_infos = env._record_metrics(infos, np.array([False]))
-
-    assert "ndtw" not in recorded_infos["episode"]
-    assert recorded_infos["episode"]["success"].tolist() == [0.0]

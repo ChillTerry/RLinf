@@ -82,16 +82,12 @@ class HabitatEnv(gym.Env):
         self.num_envs = num_envs
         self.group_size = self.cfg.group_size
         self.num_group = self.num_envs // self.group_size
-        self.prev_step_reward = np.zeros(self.num_envs)
-        self.use_rel_reward = cfg.use_rel_reward
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
         self.auto_reset = cfg.auto_reset
         self.max_episode_steps = cfg.max_episode_steps
         self.ignore_terminations = cfg.ignore_terminations
         self.dones_once = np.zeros(self.num_envs, dtype=bool)
         self.first_done_infos = None
-        self.reward_mode = getattr(cfg, "reward_mode", None)
-        self._validate_reward_config()
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -266,7 +262,6 @@ class HabitatEnv(gym.Env):
 
         raw_obs = self.env.reset(env_idx)
         self._elapsed_steps[env_idx] = 0
-        self.prev_step_reward[env_idx] = 0.0
         self.dones_once[env_idx] = False
         self.initial_distance_to_goal[env_idx] = np.nan
         current_metrics = self.env.get_current_metrics(env_idx)
@@ -403,36 +398,7 @@ class HabitatEnv(gym.Env):
             return value.detach().cpu().numpy()
         return np.asarray(value)
 
-    def _validate_reward_config(self):
-        if not self._uses_weighted_success_ndtw_reward():
-            return
-
-        required_fields = (
-            "success_reward_coef",
-            "ndtw_reward_coef",
-            "ndtw_gt_path",
-        )
-        missing_fields = [
-            field for field in required_fields if getattr(self.cfg, field, None) is None
-        ]
-        if missing_fields:
-            raise ValueError(
-                "Habitat reward_mode 'weighted_success_ndtw' requires non-None "
-                f"config fields: {', '.join(missing_fields)}."
-            )
-
-    def _uses_weighted_success_ndtw_reward(self):
-        return self.reward_mode == "weighted_success_ndtw"
-
     def _calc_step_reward(self, episode, terminations, truncations):
-        if not self._uses_weighted_success_ndtw_reward():
-            reward = self.cfg.reward_coef * self._metric_to_numpy(episode["success"])
-            reward_diff = reward - self.prev_step_reward
-            self.prev_step_reward = reward
-            if self.use_rel_reward:
-                return reward_diff
-            return reward
-
         reward = np.zeros(self.num_envs, dtype=np.float32)
         terminations = np.asarray(terminations, dtype=bool)
         truncations = np.asarray(truncations, dtype=bool)
@@ -466,12 +432,11 @@ class HabitatEnv(gym.Env):
         episode_info["distance_to_goal"] = np.array(
             infos["distance_to_goal"], dtype=np.float32
         ).copy()
-        if self._uses_weighted_success_ndtw_reward():
-            if "ndtw" not in infos:
-                raise KeyError(
-                    "Habitat NDTW metric is required for weighted_success_ndtw reward."
-                )
-            episode_info["ndtw"] = np.array(infos["ndtw"], dtype=np.float32).copy()
+        if "ndtw" not in infos:
+            raise KeyError(
+                "Habitat NDTW metric is required for weighted_success_ndtw reward."
+            )
+        episode_info["ndtw"] = np.array(infos["ndtw"], dtype=np.float32).copy()
 
         # Record initial distance to goal at the first step of each episode
         is_first_step = self._elapsed_steps == 1

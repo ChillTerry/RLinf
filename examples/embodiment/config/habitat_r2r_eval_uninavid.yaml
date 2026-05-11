@@ -93,11 +93,9 @@ env:
   train:
     total_num_envs: ${env.eval.total_num_envs}
     model_type: ${actor.model.model_type}
-    reward_mode: weighted_success_ndtw
     split: train
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    use_rel_reward: False
     ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     group_size: ${algorithm.group_size}
 
@@ -109,12 +107,10 @@ env:
     auto_reset: True
     ignore_terminations: True
     model_type: ${actor.model.model_type}
-    reward_mode: weighted_success_ndtw
     split: val_unseen
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    use_rel_reward: False
     ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
     scenes_dir: ${env.scenes_dir}
     init_params:

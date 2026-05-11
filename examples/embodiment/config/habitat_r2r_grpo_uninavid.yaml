@@ -95,10 +95,8 @@ env:
     max_steps_per_rollout_epoch: 128
     group_size: ${algorithm.group_size}
     model_type: ${actor.model.model_type}
-    reward_mode: weighted_success_ndtw
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    use_rel_reward: False
     split: train
     data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}.json.gz
     ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
@@ -120,10 +118,8 @@ env:
     auto_reset: True
     ignore_terminations: True
     model_type: ${actor.model.model_type}
-    reward_mode: weighted_success_ndtw
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    use_rel_reward: False
     split: val_unseen
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
     ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
