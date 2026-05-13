@@ -171,8 +171,8 @@ class HabitatEnv(gym.Env):
         self.auto_reset = cfg.auto_reset
         self.max_episode_steps = cfg.max_episode_steps
         self.ignore_terminations = cfg.ignore_terminations
-        self.first_done_cache = np.zeros(self.num_envs, dtype=bool)
-        self.first_done_episode = None
+        self.first_done_cached_mask = np.zeros(self.num_envs, dtype=bool)
+        self.episode_info = None
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -309,15 +309,13 @@ class HabitatEnv(gym.Env):
         terminations[is_stop] = True
         truncations = self._elapsed_steps >= self.max_episode_steps
         done_mask = terminations | truncations
-        first_done_mask = done_mask & (~self.first_done_cache)
+        first_done_mask = done_mask & (~self.first_done_cached_mask)
         first_done_reward_mask = first_done_mask & terminations & (~truncations)
 
         infos = list_of_dict_to_dict_of_list(info_lists)
-        infos = self._record_metrics(infos, terminations)
-
-        step_reward = self._calc_step_reward(infos["episode"], first_done_reward_mask)
-        self._update_first_done_metrics(infos["episode"], first_done_mask)
+        infos = self._record_metrics(infos, terminations, first_done_mask)
         self._write_first_done_metrics(infos["episode"], first_done_mask)
+        step_reward = self._calc_step_reward(infos["episode"], first_done_reward_mask)
 
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs, info_lists)
@@ -346,18 +344,18 @@ class HabitatEnv(gym.Env):
 
         raw_obs = self.env.reset(env_idx)
         self._elapsed_steps[env_idx] = 0
-        self.first_done_cache[env_idx] = False
+        self.first_done_cached_mask[env_idx] = False
         self.initial_distance_to_goal[env_idx] = np.nan
         current_metrics = self.env.get_current_metrics(env_idx)
         distance_to_goal = current_metrics.get("distance_to_goal", None)
         if distance_to_goal is not None:
             distance_to_goal = np.asarray(distance_to_goal, dtype=np.float32)
             self.initial_distance_to_goal[env_idx] = distance_to_goal
-        if self.first_done_episode is not None:
-            device = next(iter(self.first_done_episode.values())).device
+        if self.episode_info is not None:
+            device = next(iter(self.episode_info.values())).device
             mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
             mask[env_idx] = True
-            for v in self.first_done_episode.values():
+            for v in self.episode_info.values():
                 v[mask] = 0
         infos = {}
 
@@ -475,28 +473,28 @@ class HabitatEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return obs, infos
 
-    @staticmethod
-    def _metric_to_numpy(value):
-        if torch.is_tensor(value):
-            return value.detach().cpu().numpy()
-        return np.asarray(value)
-
     def _calc_step_reward(self, episode, first_done_reward_mask):
-        reward = np.zeros(self.num_envs, dtype=np.float32)
-        first_done_reward_mask = np.asarray(first_done_reward_mask, dtype=bool)
+        device = episode["success"].device
+        reward = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
+        first_done_reward_mask = torch.as_tensor(
+            first_done_reward_mask,
+            dtype=torch.bool,
+            device=device,
+        )
         if not first_done_reward_mask.any():
             return reward
 
-        success = self._metric_to_numpy(episode["success"]).astype(np.float32)
-        distance_to_goal = self._metric_to_numpy(episode["distance_to_goal"]).astype(
-            np.float32
-        )
-        ndtw = self._metric_to_numpy(episode["ndtw"]).astype(np.float32)
+        success = episode["success"].to(dtype=torch.float32)
+        distance_to_goal = episode["distance_to_goal"].to(dtype=torch.float32)
+        ndtw = episode["ndtw"].to(dtype=torch.float32)
         success_distance = float(
             self.env_config.task.measurements.success.success_distance
         )
 
-        success_scale = 1.0 - np.minimum(distance_to_goal / success_distance, 1.0)
+        success_scale = 1.0 - torch.minimum(
+            distance_to_goal / success_distance,
+            torch.ones_like(distance_to_goal),
+        )
         success_reward = success * float(self.cfg.success_reward_coef) * success_scale
         ndtw_reward = ndtw * float(self.cfg.ndtw_reward_coef)
         reward[first_done_reward_mask] = (
@@ -504,19 +502,19 @@ class HabitatEnv(gym.Env):
         )
         return reward
 
-    def _record_metrics(self, infos, terminations):
+    def _record_metrics(self, infos, terminations, first_done_mask):
         episode_info = {}
         dist_threshold = self.env_config.task.measurements.success.success_distance
         terminations = np.array(terminations, dtype=bool, copy=True)
+        first_done_mask = np.asarray(first_done_mask, dtype=bool)
 
-        episode_info["distance_to_goal"] = np.array(
+        episode_info["distance_to_goal"] = np.asarray(
             infos["distance_to_goal"], dtype=np.float32
-        ).copy()
-        episode_info["ndtw"] = np.array(infos["ndtw"], dtype=np.float32).copy()
+        )
 
-        # Record initial distance to goal at the first step of each episode
-        is_first_step = self._elapsed_steps == 1
-        needs_seed = is_first_step & np.isnan(self.initial_distance_to_goal)
+        episode_info["ndtw"] = np.asarray(infos["ndtw"], dtype=np.float32)
+
+        needs_seed = np.isnan(self.initial_distance_to_goal)
         if needs_seed.any():
             self.initial_distance_to_goal[needs_seed] = episode_info[
                 "distance_to_goal"
@@ -526,9 +524,9 @@ class HabitatEnv(gym.Env):
             terminations & (episode_info["distance_to_goal"] < dist_threshold)
         ).astype(np.float32)
 
-        episode_info["trajectory_Length"] = np.array(
+        episode_info["trajectory_Length"] = np.asarray(
             infos["trajectory_Length"], dtype=np.float32
-        ).copy()
+        )
 
         episode_info["spl"] = episode_info["success"] * (
             self.initial_distance_to_goal
@@ -537,51 +535,28 @@ class HabitatEnv(gym.Env):
             )
         )
 
-        episode_info["oracle_success"] = infos["oracle_success"].copy()
+        episode_info["oracle_success"] = np.asarray(
+            infos["oracle_success"], dtype=np.float32
+        )
 
-        episode_info["oracle_navigation_error"] = infos[
-            "oracle_navigation_error"
-        ].copy()
+        episode_info["oracle_navigation_error"] = np.asarray(
+            infos["oracle_navigation_error"], dtype=np.float32
+        )
 
-        infos["episode"] = to_tensor(episode_info)
+        latest_episode = to_tensor(episode_info)
+        if self.episode_info is None:
+            self.episode_info = {k: torch.zeros_like(v) for k, v in latest_episode.items()}
+
+        update_mask = torch.as_tensor(~self.first_done_cached_mask, dtype=torch.bool)
+        for k, v in latest_episode.items():
+            mask = update_mask.to(device=v.device)
+            self.episode_info[k][mask] = v[mask]
+
+        self.first_done_cached_mask[first_done_mask] = True
+
+        infos["episode"] = {k: v.clone() for k, v in self.episode_info.items()}
 
         return infos
-
-    def _update_first_done_metrics(self, episode, first_done_mask):
-        first_done_mask = np.asarray(first_done_mask, dtype=bool)
-        if first_done_mask.any():
-            if self.first_done_episode is None:
-                self.first_done_episode = {
-                    k: torch.zeros_like(v) for k, v in episode.items()
-                }
-
-            for k, v in episode.items():
-                cached_v = self.first_done_episode[k]
-                mask = torch.as_tensor(
-                    first_done_mask,
-                    dtype=torch.bool,
-                    device=v.device,
-                )
-                cached_v[mask] = v[mask]
-
-            self.first_done_cache[first_done_mask] = True
-
-        if not self.first_done_cache.any() or self.first_done_episode is None:
-            return
-
-        first_done_cache = torch.from_numpy(self.first_done_cache)
-        shared_keys = set(episode.keys()) & set(self.first_done_episode.keys())
-        for key in shared_keys:
-            live_v = episode[key]
-            cached_v = self.first_done_episode[key]
-            if not (torch.is_tensor(live_v) and torch.is_tensor(cached_v)):
-                continue
-            if live_v.shape[0] != self.num_envs or cached_v.shape[0] != self.num_envs:
-                continue
-
-            mask = first_done_cache.to(device=live_v.device)
-            cached_v = cached_v.to(device=live_v.device, dtype=live_v.dtype)
-            live_v[mask] = cached_v[mask]
 
     def _write_first_done_metrics(self, episode, first_done_mask):
         if not self.metrics_cfg.save_metrics:
