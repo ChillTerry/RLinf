@@ -451,13 +451,21 @@ class HabitatEnv(gym.Env):
         return obs
 
     def _attach_rgb_chunk_history(self, obs_list):
-        if not obs_list:
+        if not obs_list or self.cfg.model_type != "uninavid":
             return
         if any("wrist_images" not in obs for obs in obs_list):
             return
-        obs_list[-1]["wrist_images"] = torch.stack(
+
+        frame_history = torch.stack(
             [obs["wrist_images"] for obs in obs_list],
             dim=1,
+        )
+        obs_list[-1]["rgb_frame_history"] = frame_history
+        obs_list[-1]["rgb_frame_history_lengths"] = torch.full(
+            (frame_history.shape[0],),
+            frame_history.shape[1],
+            dtype=torch.long,
+            device=frame_history.device,
         )
 
     def _handle_auto_reset(self, dones, _final_obs, infos):

@@ -176,6 +176,38 @@ def _make_reward_test_env(num_envs):
     return env
 
 
+def _make_chunk_history_test_env(model_type="uninavid"):
+    env = object.__new__(HabitatEnv)
+    env.cfg = SimpleNamespace(model_type=model_type)
+    env.num_envs = 2
+    return env
+
+
+def test_attach_rgb_frame_history_keeps_wrist_images_single_frame():
+    env = _make_chunk_history_test_env()
+    obs_list = []
+    for step_id in range(3):
+        obs_list.append(
+            {
+                "wrist_images": torch.full(
+                    (2, 2, 2, 3),
+                    fill_value=step_id,
+                    dtype=torch.uint8,
+                )
+            }
+        )
+
+    env._attach_rgb_chunk_history(obs_list)
+
+    final_obs = obs_list[-1]
+    assert final_obs["wrist_images"].shape == (2, 2, 2, 3)
+    assert final_obs["rgb_frame_history"].shape == (2, 3, 2, 2, 3)
+    assert final_obs["rgb_frame_history_lengths"].tolist() == [3, 3]
+    assert torch.equal(final_obs["rgb_frame_history"][:, 0], obs_list[0]["wrist_images"])
+    assert torch.equal(final_obs["rgb_frame_history"][:, 1], obs_list[1]["wrist_images"])
+    assert torch.equal(final_obs["rgb_frame_history"][:, 2], obs_list[2]["wrist_images"])
+
+
 def test_habitat_reward_uses_weighted_success_ndtw_only_for_first_normal_terminal():
     env = _make_reward_test_env(num_envs=4)
     env.dones_once = np.array([False, False, False, True])
