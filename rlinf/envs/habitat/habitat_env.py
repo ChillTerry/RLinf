@@ -462,7 +462,7 @@ class HabitatEnv(gym.Env):
         return obs
 
     def _attach_rgb_chunk_history(self, obs_list):
-        if not obs_list or self.cfg.model_type != "uninavid":
+        if not obs_list or getattr(self.cfg, "model_type", None) != "uninavid":
             return
         if any("wrist_images" not in obs for obs in obs_list):
             return
