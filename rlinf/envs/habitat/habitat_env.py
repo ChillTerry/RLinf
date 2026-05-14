@@ -258,11 +258,21 @@ class HabitatEnv(gym.Env):
         self._attach_rgb_chunk_history(obs_list)
 
         if past_dones.any() and self.auto_reset:
-            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+            final_obs = obs_list[-1]
+            reset_obs, reset_infos = self._handle_auto_reset(
                 past_dones.cpu().numpy(),
-                obs_list[-1],
+                final_obs,
                 infos_list[-1],
             )
+            self._update_rgb_frame_history_after_auto_reset(
+                final_obs,
+                reset_obs,
+                past_dones.cpu().numpy(),
+            )
+            for key in ("rgb_frame_history", "rgb_frame_history_lengths"):
+                if key in final_obs:
+                    reset_obs[key] = final_obs[key]
+            obs_list[-1], infos_list[-1] = reset_obs, reset_infos
 
         # [num_envs, chunk_steps]
         chunk_rewards = torch.stack(chunk_rewards, dim=1)
@@ -467,6 +477,33 @@ class HabitatEnv(gym.Env):
             dtype=torch.long,
             device=frame_history.device,
         )
+
+    def _update_rgb_frame_history_after_auto_reset(self, final_obs, reset_obs, dones):
+        if self.cfg.model_type != "uninavid":
+            return
+        if "rgb_frame_history" not in final_obs:
+            return
+        if "wrist_images" not in reset_obs:
+            return
+
+        done_mask = torch.as_tensor(
+            dones,
+            dtype=torch.bool,
+            device=final_obs["rgb_frame_history"].device,
+        )
+        if not done_mask.any():
+            return
+
+        reset_frames = reset_obs["wrist_images"].to(
+            device=final_obs["rgb_frame_history"].device
+        )
+        history = final_obs["rgb_frame_history"]
+        history[done_mask] = reset_frames[done_mask].unsqueeze(1).expand(
+            -1,
+            history.shape[1],
+            *history.shape[2:],
+        )
+        final_obs["rgb_frame_history_lengths"][done_mask] = 1
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)

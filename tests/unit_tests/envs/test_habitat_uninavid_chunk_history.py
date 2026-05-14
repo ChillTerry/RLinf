@@ -208,6 +208,41 @@ def test_attach_rgb_frame_history_keeps_wrist_images_single_frame():
     assert torch.equal(final_obs["rgb_frame_history"][:, 2], obs_list[2]["wrist_images"])
 
 
+def test_update_rgb_frame_history_after_auto_reset_masks_done_envs_only():
+    env = _make_chunk_history_test_env()
+    original_history = torch.tensor(
+        [
+            [[[[1]]], [[[2]]], [[[3]]]],
+            [[[[4]]], [[[5]]], [[[6]]]],
+        ],
+        dtype=torch.uint8,
+    )
+    final_obs = {
+        "wrist_images": torch.tensor(
+            [[[[30]]], [[[60]]]],
+            dtype=torch.uint8,
+        ),
+        "rgb_frame_history": original_history.clone(),
+        "rgb_frame_history_lengths": torch.tensor([3, 3], dtype=torch.long),
+    }
+    reset_obs = {
+        "wrist_images": torch.tensor(
+            [[[[30]]], [[[99]]]],
+            dtype=torch.uint8,
+        ),
+    }
+
+    env._update_rgb_frame_history_after_auto_reset(
+        final_obs,
+        reset_obs,
+        np.array([False, True]),
+    )
+
+    assert final_obs["rgb_frame_history_lengths"].tolist() == [3, 1]
+    assert final_obs["rgb_frame_history"][0].tolist() == original_history[0].tolist()
+    assert final_obs["rgb_frame_history"][1].tolist() == [[[[99]]], [[[99]]], [[[99]]]]
+
+
 def test_habitat_reward_uses_weighted_success_ndtw_only_for_first_normal_terminal():
     env = _make_reward_test_env(num_envs=4)
     env.dones_once = np.array([False, False, False, True])
