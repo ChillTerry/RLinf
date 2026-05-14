@@ -111,10 +111,18 @@ def tensor_to_rgb_numpy(frame: torch.Tensor | np.ndarray) -> np.ndarray:
 
 
 def select_slot_rgb_frames(env_obs: dict[str, Any], slot_id: int) -> list[np.ndarray]:
-    slot_images = env_obs["wrist_images"][slot_id]
-    if getattr(slot_images, "ndim", None) == 4:
-        return [tensor_to_rgb_numpy(frame) for frame in slot_images]
-    return [tensor_to_rgb_numpy(slot_images)]
+    if "rgb_frame_history" not in env_obs:
+        raise KeyError("Uni-NaVid env_obs must include rgb_frame_history.")
+    if "rgb_frame_history_lengths" not in env_obs:
+        raise KeyError("Uni-NaVid env_obs must include rgb_frame_history_lengths.")
+
+    slot_images = env_obs["rgb_frame_history"][slot_id]
+    history_length = env_obs["rgb_frame_history_lengths"][slot_id]
+    if isinstance(history_length, torch.Tensor):
+        history_length = int(history_length.detach().cpu().item())
+    else:
+        history_length = int(history_length)
+    return [tensor_to_rgb_numpy(frame) for frame in slot_images[:history_length]]
 
 
 def episode_id_from_obs(env_obs: dict[str, Any], slot_id: int) -> int:
