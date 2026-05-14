@@ -208,6 +208,20 @@ def test_attach_rgb_frame_history_keeps_wrist_images_single_frame():
     assert torch.equal(final_obs["rgb_frame_history"][:, 2], obs_list[2]["wrist_images"])
 
 
+def test_attach_rgb_frame_history_is_uninavid_only():
+    env = _make_chunk_history_test_env(model_type="cma")
+    obs_list = [
+        {"wrist_images": torch.zeros((2, 2, 2, 3), dtype=torch.uint8)},
+        {"wrist_images": torch.ones((2, 2, 2, 3), dtype=torch.uint8)},
+    ]
+
+    env._attach_rgb_chunk_history(obs_list)
+
+    assert "rgb_frame_history" not in obs_list[-1]
+    assert "rgb_frame_history_lengths" not in obs_list[-1]
+    assert obs_list[-1]["wrist_images"].shape == (2, 2, 2, 3)
+
+
 def test_update_rgb_frame_history_after_auto_reset_masks_done_envs_only():
     env = _make_chunk_history_test_env()
     original_history = torch.tensor(
