@@ -375,6 +375,7 @@ class HabitatEnv(gym.Env):
         for i, idx in enumerate(env_idx):
             self.current_raw_obs[idx] = raw_obs[i]
         obs = self._wrap_obs(self.current_raw_obs)
+        self._attach_rgb_chunk_history([obs])
 
         return obs, infos
 

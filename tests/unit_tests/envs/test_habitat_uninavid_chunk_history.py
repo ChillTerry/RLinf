@@ -184,6 +184,38 @@ def _make_chunk_history_test_env(model_type="uninavid"):
     return env
 
 
+def test_uninavid_reset_attaches_single_rgb_frame_history():
+    env = object.__new__(HabitatEnv)
+    env.cfg = SimpleNamespace(
+        model_type="uninavid",
+        video_cfg=SimpleNamespace(save_video=False),
+    )
+    env.num_envs = 2
+    env._elapsed_steps = np.ones(2, dtype=np.int32)
+    env.first_done_cached_mask = np.ones(2, dtype=bool)
+    env.initial_distance_to_goal = np.full(2, np.nan, dtype=np.float32)
+    env.episode_info = None
+    env.current_raw_obs = None
+
+    rgb = np.arange(2 * 2 * 3, dtype=np.uint8).reshape(2, 2, 3)
+    raw_obs = [
+        {"instruction": {"text": "go left", "tokens": [1]}, "rgb": rgb},
+        {"instruction": {"text": "go right", "tokens": [2]}, "rgb": rgb + 1},
+    ]
+    env.env = SimpleNamespace(
+        reset=lambda env_idx: [raw_obs[int(idx)] for idx in env_idx],
+        get_current_metrics=lambda env_idx: {},
+        get_current_episode_metadata=lambda: {"episode_id": ["10", "11"]},
+    )
+
+    obs, _ = env.reset()
+
+    assert obs["wrist_images"].shape == (2, 2, 2, 3)
+    assert obs["rgb_frame_history"].shape == (2, 1, 2, 2, 3)
+    assert obs["rgb_frame_history_lengths"].tolist() == [1, 1]
+    assert torch.equal(obs["rgb_frame_history"][:, 0], obs["wrist_images"])
+
+
 def test_attach_rgb_frame_history_keeps_wrist_images_single_frame():
     env = _make_chunk_history_test_env()
     obs_list = []

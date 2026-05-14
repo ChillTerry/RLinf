@@ -141,3 +141,24 @@ def test_merge_env_outputs_with_partial_optional_fields():
     assert torch.equal(
         merged["intervene_flags"][:2], torch.zeros((2, 1), dtype=torch.bool)
     )
+
+
+def test_env_output_preserves_uninavid_rgb_frame_history_fields():
+    obs = {
+        "main_images": None,
+        "wrist_images": torch.zeros((2, 2, 2, 3), dtype=torch.uint8),
+        "rgb_frame_history": torch.ones((2, 1, 2, 2, 3), dtype=torch.uint8),
+        "rgb_frame_history_lengths": torch.tensor([1, 1], dtype=torch.long),
+        "states": torch.tensor([10, 11], dtype=torch.long),
+        "task_descriptions": ["go left", "go right"],
+    }
+
+    prepared_obs = EnvOutput(obs=obs).to_dict()["obs"]
+
+    assert torch.equal(prepared_obs["rgb_frame_history"], obs["rgb_frame_history"])
+    assert prepared_obs["rgb_frame_history"].device.type == "cpu"
+    assert torch.equal(
+        prepared_obs["rgb_frame_history_lengths"],
+        obs["rgb_frame_history_lengths"],
+    )
+    assert prepared_obs["rgb_frame_history_lengths"].device.type == "cpu"

@@ -113,6 +113,12 @@ class EnvOutput:
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
+        } | {
+            # UniNavID Habitat explicit fields through shared EnvOutput boundary,
+            # isolated by key presence.
+            key: obs[key]
+            for key in ("rgb_frame_history", "rgb_frame_history_lengths")
+            if key in obs
         }
 
     @staticmethod
