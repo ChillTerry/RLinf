@@ -130,8 +130,8 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
     )
     monkeypatch.setattr(
         habitat_env_module,
-        "vram_balance_episode_ids",
-        lambda *args, **kwargs: [["7", "19"]],
+        "vram_balance_episode_sequences",
+        lambda *args, **kwargs: [[["7", "19"]]],
     )
 
     env = object.__new__(HabitatEnv)
@@ -142,6 +142,7 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
         ndtw_gt_path="/tmp/r2r/train/train_gt.json.gz",
         scenes_dir="/tmp/scenes",
         seed=42,
+        auto_reset=True,
         total_num_envs=4,
         max_steps_per_rollout_epoch=12800,
     )
@@ -336,8 +337,7 @@ def test_habitat_reward_uses_weighted_success_ndtw_only_for_first_normal_termina
 
     reward = env._calc_step_reward(
         episode,
-        terminations=np.array([True, True, False, True]),
-        truncations=np.array([False, False, True, False]),
+        first_done_reward_mask=np.array([True, True, False, False]),
     )
 
     assert reward.tolist() == [6.0, 4.0, 0.0, 0.0]
@@ -354,8 +354,7 @@ def test_habitat_reward_is_zero_for_non_terminal_steps():
 
     reward = env._calc_step_reward(
         episode,
-        terminations=np.array([False, False]),
-        truncations=np.array([False, False]),
+        first_done_reward_mask=np.array([False, False]),
     )
 
     assert reward.tolist() == [0.0, 0.0]
@@ -372,8 +371,7 @@ def test_habitat_weighted_reward_is_zero_for_simultaneous_termination_and_trunca
 
     reward = env._calc_step_reward(
         episode,
-        terminations=np.array([True]),
-        truncations=np.array([True]),
+        first_done_reward_mask=np.array([False]),
     )
 
     assert reward.tolist() == [0.0]
@@ -388,6 +386,8 @@ def test_habitat_record_metrics_includes_ndtw_and_seeds_initial_distance_to_goal
     )
     env._elapsed_steps = np.array([1, 2], dtype=np.int32)
     env.initial_distance_to_goal = np.array([np.nan, 5.0], dtype=np.float32)
+    env.first_done_cached_mask = np.array([False, False])
+    env.episode_info = None
 
     infos = {
         "distance_to_goal": [3.5, 3.0],
@@ -397,7 +397,11 @@ def test_habitat_record_metrics_includes_ndtw_and_seeds_initial_distance_to_goal
         "oracle_navigation_error": [3.5, 0.5],
     }
 
-    recorded_infos = env._record_metrics(infos, np.array([False, True]))
+    recorded_infos = env._record_metrics(
+        infos,
+        terminations=np.array([False, True]),
+        first_done_mask=np.array([False, True]),
+    )
 
     assert env.initial_distance_to_goal.tolist() == [3.5, 5.0]
     assert recorded_infos["episode"]["success"].tolist() == [0.0, 1.0]
