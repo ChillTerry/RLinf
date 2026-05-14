@@ -480,7 +480,7 @@ class HabitatEnv(gym.Env):
         )
 
     def _update_rgb_frame_history_after_auto_reset(self, final_obs, reset_obs, dones):
-        if self.cfg.model_type != "uninavid":
+        if getattr(self.cfg, "model_type", None) != "uninavid":
             return
         if "rgb_frame_history" not in final_obs:
             return

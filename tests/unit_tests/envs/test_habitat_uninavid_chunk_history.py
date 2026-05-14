@@ -374,6 +374,58 @@ def test_chunk_step_copies_reset_rgb_frame_history_after_auto_reset(monkeypatch)
     assert infos_list[-1]["final_observation"] is handler_final_observation
 
 
+def test_chunk_step_auto_reset_skips_rgb_history_when_model_type_missing(monkeypatch):
+    env = object.__new__(HabitatEnv)
+    env.cfg = SimpleNamespace()
+    env.auto_reset = True
+    env.ignore_terminations = False
+    env.action_map = {0: "forward"}
+    env.num_envs = 2
+
+    step_frames = [
+        torch.tensor([[[[10]]], [[[20]]]], dtype=torch.uint8),
+        torch.tensor([[[[11]]], [[[21]]]], dtype=torch.uint8),
+    ]
+    terminations = [
+        torch.tensor([False, False]),
+        torch.tensor([False, True]),
+    ]
+    truncations = [
+        torch.tensor([False, False]),
+        torch.tensor([False, False]),
+    ]
+
+    def fake_step(actions, auto_reset=True):
+        step_idx = fake_step.calls
+        fake_step.calls += 1
+        return (
+            {"wrist_images": step_frames[step_idx].clone()},
+            torch.zeros(2),
+            terminations[step_idx],
+            truncations[step_idx],
+            {"step_idx": step_idx},
+        )
+
+    fake_step.calls = 0
+
+    def fake_handle_auto_reset(dones, final_obs, infos):
+        assert dones.tolist() == [False, True]
+        return (
+            {"wrist_images": torch.tensor([[[[50]]], [[[99]]]], dtype=torch.uint8)},
+            {"final_info": infos},
+        )
+
+    monkeypatch.setattr(env, "step", fake_step)
+    monkeypatch.setattr(env, "_handle_auto_reset", fake_handle_auto_reset)
+
+    obs_list, _, _, _, _ = env.chunk_step(np.zeros((2, 2, 1), dtype=np.int64))
+
+    returned_obs = obs_list[-1]
+    assert "rgb_frame_history" not in returned_obs
+    assert "rgb_frame_history_lengths" not in returned_obs
+    assert returned_obs["wrist_images"].tolist() == [[[[50]]], [[[99]]]]
+
+
 def test_habitat_reward_uses_weighted_success_ndtw_only_for_first_normal_terminal():
     env = _make_reward_test_env(num_envs=4)
     env.dones_once = np.array([False, False, False, True])
