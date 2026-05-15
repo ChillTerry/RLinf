@@ -10,6 +10,7 @@ mm_projector_type: "mlp2x_gelu"
 mm_vision_select_layer: -2
 mm_use_im_start_end: false
 mm_use_im_patch_token: false
+freeze_mm_mlp_adapter: true
 image_aspect_ratio: "pad"
 video_fps: 1
 compress_type: "grid:2"
