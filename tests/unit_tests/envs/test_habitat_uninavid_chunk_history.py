@@ -230,7 +230,7 @@ def test_attach_rgb_frame_history_keeps_wrist_images_single_frame():
             }
         )
 
-    env._attach_rgb_chunk_history(obs_list)
+    env._attach_rgb_frame_history(obs_list)
 
     final_obs = obs_list[-1]
     assert final_obs["wrist_images"].shape == (2, 2, 2, 3)
@@ -248,7 +248,7 @@ def test_attach_rgb_frame_history_is_uninavid_only():
         {"wrist_images": torch.ones((2, 2, 2, 3), dtype=torch.uint8)},
     ]
 
-    env._attach_rgb_chunk_history(obs_list)
+    env._attach_rgb_frame_history(obs_list)
 
     assert "rgb_frame_history" not in obs_list[-1]
     assert "rgb_frame_history_lengths" not in obs_list[-1]
@@ -264,7 +264,7 @@ def test_attach_rgb_frame_history_skips_missing_model_type():
         {"wrist_images": torch.ones((2, 2, 2, 3), dtype=torch.uint8)},
     ]
 
-    env._attach_rgb_chunk_history(obs_list)
+    env._attach_rgb_frame_history(obs_list)
 
     assert "rgb_frame_history" not in obs_list[-1]
     assert "rgb_frame_history_lengths" not in obs_list[-1]
@@ -295,7 +295,7 @@ def test_update_rgb_frame_history_after_auto_reset_masks_done_envs_only():
         ),
     }
 
-    env._update_rgb_frame_history_after_auto_reset(
+    env._update_rgb_frame_history(
         final_obs,
         reset_obs,
         np.array([False, True]),

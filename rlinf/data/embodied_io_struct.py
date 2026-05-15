@@ -91,11 +91,10 @@ class EnvOutput:
         )
 
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
+        prepared_obs = dict(obs)
+
         image_tensor = obs["main_images"] if "main_images" in obs else None
         wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
-        wrist_image_history_tensor = (
-            obs["wrist_images_history"] if "wrist_images_history" in obs else None
-        )
         extra_view_image_tensor = (
             obs["extra_view_images"] if "extra_view_images" in obs else None
         )
@@ -106,20 +105,16 @@ class EnvOutput:
             else None
         )
 
-        return {
-            "main_images": image_tensor,  # [N_ENV, H, W, C]
-            "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
-            "wrist_images_history": wrist_image_history_tensor,  # [N_ENV, T, H, W, C]
-            "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
-            "states": states,
-            "task_descriptions": task_descriptions,
-        } | {
-            # UniNavID Habitat explicit fields through shared EnvOutput boundary,
-            # isolated by key presence.
-            key: obs[key]
-            for key in ("rgb_frame_history", "rgb_frame_history_lengths")
-            if key in obs
-        }
+        prepared_obs.update(
+            {
+                "main_images": image_tensor,
+                "wrist_images": wrist_image_tensor,
+                "extra_view_images": extra_view_image_tensor,
+                "states": states,
+                "task_descriptions": task_descriptions,
+            }
+        )
+        return prepared_obs
 
     @staticmethod
     def merge_env_outputs(env_outputs: list[dict]) -> dict[str, Any]:

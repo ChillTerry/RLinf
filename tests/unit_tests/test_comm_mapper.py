@@ -162,3 +162,20 @@ def test_env_output_preserves_uninavid_rgb_frame_history_fields():
         obs["rgb_frame_history_lengths"],
     )
     assert prepared_obs["rgb_frame_history_lengths"].device.type == "cpu"
+
+
+def test_env_output_preserves_extra_observation_fields():
+    obs = {
+        "main_images": None,
+        "wrist_images": None,
+        "states": torch.tensor([10, 11], dtype=torch.long),
+        "task_descriptions": ["go left", "go right"],
+        "custom_sensor": torch.ones((2, 4), dtype=torch.float32),
+        "custom_metadata": ["left", "right"],
+    }
+
+    prepared_obs = EnvOutput(obs=obs).to_dict()["obs"]
+
+    assert torch.equal(prepared_obs["custom_sensor"], obs["custom_sensor"])
+    assert prepared_obs["custom_sensor"].device.type == "cpu"
+    assert prepared_obs["custom_metadata"] == ["left", "right"]

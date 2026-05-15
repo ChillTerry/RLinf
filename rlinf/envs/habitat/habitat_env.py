@@ -255,23 +255,21 @@ class HabitatEnv(gym.Env):
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
-        self._attach_rgb_chunk_history(obs_list)
+        self._attach_rgb_frame_history(obs_list)
 
         if past_dones.any() and self.auto_reset:
             final_obs = obs_list[-1]
+            final_info = infos_list[-1]
             reset_obs, reset_infos = self._handle_auto_reset(
                 past_dones.cpu().numpy(),
                 final_obs,
-                infos_list[-1],
+                final_info,
             )
-            self._update_rgb_frame_history_after_auto_reset(
+            self._update_rgb_frame_history(
                 final_obs,
                 reset_obs,
                 past_dones.cpu().numpy(),
             )
-            for key in ("rgb_frame_history", "rgb_frame_history_lengths"):
-                if key in final_obs:
-                    reset_obs[key] = final_obs[key]
             obs_list[-1], infos_list[-1] = reset_obs, reset_infos
 
         # [num_envs, chunk_steps]
@@ -375,7 +373,7 @@ class HabitatEnv(gym.Env):
         for i, idx in enumerate(env_idx):
             self.current_raw_obs[idx] = raw_obs[i]
         obs = self._wrap_obs(self.current_raw_obs)
-        self._attach_rgb_chunk_history([obs])
+        self._attach_rgb_frame_history([obs])
 
         return obs, infos
 
@@ -461,10 +459,8 @@ class HabitatEnv(gym.Env):
 
         return obs
 
-    def _attach_rgb_chunk_history(self, obs_list):
-        if not obs_list or getattr(self.cfg, "model_type", None) != "uninavid":
-            return
-        if any("wrist_images" not in obs for obs in obs_list):
+    def _attach_rgb_frame_history(self, obs_list):
+        if getattr(self.cfg, "model_type", None) != "uninavid":
             return
 
         frame_history = torch.stack(
@@ -479,12 +475,8 @@ class HabitatEnv(gym.Env):
             device=frame_history.device,
         )
 
-    def _update_rgb_frame_history_after_auto_reset(self, final_obs, reset_obs, dones):
+    def _update_rgb_frame_history(self, final_obs, reset_obs, dones):
         if getattr(self.cfg, "model_type", None) != "uninavid":
-            return
-        if "rgb_frame_history" not in final_obs:
-            return
-        if "wrist_images" not in reset_obs:
             return
 
         done_mask = torch.as_tensor(
@@ -492,19 +484,21 @@ class HabitatEnv(gym.Env):
             dtype=torch.bool,
             device=final_obs["rgb_frame_history"].device,
         )
-        if not done_mask.any():
-            return
-
-        reset_frames = reset_obs["wrist_images"].to(
-            device=final_obs["rgb_frame_history"].device
-        )
-        history = final_obs["rgb_frame_history"]
-        history[done_mask] = reset_frames[done_mask].unsqueeze(1).expand(
-            -1,
-            history.shape[1],
-            *history.shape[2:],
-        )
-        final_obs["rgb_frame_history_lengths"][done_mask] = 1
+        if done_mask.any() and "wrist_images" in reset_obs:
+            reset_frames = reset_obs["wrist_images"].to(
+                device=final_obs["rgb_frame_history"].device
+            )
+            history = final_obs["rgb_frame_history"]
+            history[done_mask] = reset_frames[done_mask].unsqueeze(1).expand(
+                -1,
+                history.shape[1],
+                *history.shape[2:],
+            )
+            final_obs["rgb_frame_history_lengths"][done_mask] = 1
+        reset_obs["rgb_frame_history"] = final_obs["rgb_frame_history"]
+        reset_obs["rgb_frame_history_lengths"] = final_obs[
+            "rgb_frame_history_lengths"
+        ]
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
