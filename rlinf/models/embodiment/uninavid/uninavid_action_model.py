@@ -1167,14 +1167,21 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 **generate_kwargs,
             )
             if return_scores:
+                if not getattr(outputs, "scores", None):
+                    raise ValueError(
+                        "UniNaVid train generation expected non-empty output scores."
+                    )
                 generated_scores = torch.stack(tuple(outputs.scores), dim=1).float()
                 response_ids = outputs.sequences[
                     :, 1 : 1 + generated_scores.shape[1]
                 ]
             else:
                 generated_scores = None
+                output_ids = (
+                    outputs.sequences if hasattr(outputs, "sequences") else outputs
+                )
                 response_ids = self._response_ids_from_inputs_embeds_generation(
-                    outputs
+                    output_ids
                 )
             output_texts = self.tokenizer.batch_decode(
                 response_ids,
