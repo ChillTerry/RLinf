@@ -940,6 +940,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         prev_logprobs: torch.Tensor,
         target_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if response_ids.dim() != 2:
+            raise ValueError("UniNaVid response ids must have shape [batch, response_len].")
         current_len = int(response_ids.shape[1])
         if response_mask.shape != response_ids.shape:
             raise ValueError("UniNaVid response mask must match response ids shape.")
