@@ -73,11 +73,11 @@ def test_uninavid_generation_scores_compute_prev_logprobs_and_response_mask():
     )
     scores = torch.tensor(
         [
-            [[0.0, 2.0, -1.0], [1.0, 0.0, 3.0]],
+            [[0.0, 2.0, -1.0], [1.0, 0.0, 3.0], [4.0, 0.0, -1.0]],
         ],
         dtype=torch.float32,
     )
-    response_ids = torch.tensor([[1, 2]], dtype=torch.long)
+    response_ids = torch.tensor([[1, 2, 0]], dtype=torch.long)
 
     prev_logprobs, response_mask = policy._compute_generation_score_logprobs(
         generated_scores=scores,
@@ -88,8 +88,91 @@ def test_uninavid_generation_scores_compute_prev_logprobs_and_response_mask():
         -1,
         response_ids.unsqueeze(-1),
     )
+    expected = expected * response_mask.unsqueeze(-1)
     torch.testing.assert_close(prev_logprobs, expected)
-    assert response_mask.tolist() == [[True, True]]
+    assert response_mask.tolist() == [[True, True, False]]
+    assert prev_logprobs[0, 2, 0].item() == 0.0
+
+
+def test_uninavid_generate_batched_navigation_outputs_can_return_scores(monkeypatch):
+    score_step_1 = torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float32)
+    score_step_2 = torch.tensor([[3.0, 4.0, 5.0]], dtype=torch.float32)
+    model = _GenerateModel(
+        outputs=SimpleNamespace(
+            sequences=torch.tensor([[9, 1, 2]], dtype=torch.long),
+            scores=(score_step_1, score_step_2),
+        )
+    )
+    policy = UniNaVidForActionPrediction(
+        tokenizer=_Tokenizer(),
+        model=model,
+        image_processor=None,
+    )
+
+    monkeypatch.setattr(
+        policy,
+        "_build_navigation_input_ids",
+        lambda navigation_prompt: torch.tensor([[9, 8, 7]], dtype=torch.long),
+    )
+    monkeypatch.setattr(
+        policy,
+        "_encode_rgb_frames_for_slot",
+        lambda rgb_frames: torch.ones((1, 2, 2), dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        policy,
+        "_update_slot_feature_cache",
+        lambda cache, visual_features, new_frames: torch.ones((1, 2), dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        "rlinf.models.embodiment.uninavid.uninavid_action_model.build_navigation_visual_tokens",
+        lambda cache, nav_size: (
+            torch.ones((1, 2), dtype=torch.float32),
+            [1],
+        ),
+    )
+    monkeypatch.setattr(
+        policy,
+        "_build_navigation_inputs_embeds",
+        lambda input_ids, history_tokens, history_lengths, current_tokens: torch.ones(
+            (3, 2),
+            dtype=torch.float32,
+        ),
+    )
+    monkeypatch.setattr(
+        policy,
+        "_pad_navigation_embeds",
+        lambda embeds: (
+            torch.stack(embeds, dim=0),
+            torch.ones((len(embeds), embeds[0].shape[0]), dtype=torch.long),
+        ),
+    )
+
+    env_obs = {
+        "task_descriptions": ["go to the chair"],
+        "states": torch.tensor([1], dtype=torch.long),
+        "rgb_frame_history": torch.zeros((1, 1, 1, 1, 3), dtype=torch.uint8),
+        "rgb_frame_history_lengths": torch.tensor([1], dtype=torch.long),
+    }
+
+    output_texts, inputs_embeds, attention_mask, response_ids, generated_scores = (
+        policy._generate_batched_navigation_outputs(
+            env_obs,
+            generation_kwargs={"max_new_tokens": 2},
+            return_scores=True,
+        )
+    )
+
+    assert model.generate_kwargs["return_dict_in_generate"] is True
+    assert model.generate_kwargs["output_scores"] is True
+    assert output_texts == ["stop"]
+    assert inputs_embeds.shape == (1, 3, 2)
+    assert attention_mask.tolist() == [[1, 1, 1]]
+    assert response_ids.tolist() == [[1, 2]]
+    torch.testing.assert_close(
+        generated_scores,
+        torch.stack((score_step_1, score_step_2), dim=1),
+    )
 
 
 def test_uninavid_pads_response_ids_masks_and_generation_logprobs_together():
