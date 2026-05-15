@@ -103,6 +103,7 @@ def test_uninavid_generate_batched_navigation_outputs_can_return_scores(monkeypa
             scores=(score_step_1, score_step_2),
         )
     )
+    model.config.compress_type = "mean"
     policy = UniNaVidForActionPrediction(
         tokenizer=_Tokenizer(),
         model=model,
