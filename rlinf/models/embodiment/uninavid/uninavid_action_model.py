@@ -777,8 +777,16 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         env_obs: dict[str, Any],
         generation_kwargs: dict[str, Any],
     ):
-        output_texts, prompt_inputs_embeds, prompt_attention_mask, response_ids = (
-            self._generate_batched_navigation_outputs(env_obs, generation_kwargs)
+        (
+            output_texts,
+            prompt_inputs_embeds,
+            prompt_attention_mask,
+            response_ids,
+            generated_scores,
+        ) = self._generate_batched_navigation_outputs(
+            env_obs,
+            generation_kwargs,
+            return_scores=True,
         )
         action_chunks = []
         for output_text in output_texts:
@@ -803,17 +811,20 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 target_len=prompt_len,
             )
         )
-        response_ids, response_mask = self._pad_response_forward_inputs(
-            response_ids,
-            target_len=response_len,
+        if generated_scores is None:
+            raise ValueError("UniNaVid train generation expected output scores.")
+        prev_logprobs, response_mask = self._compute_generation_score_logprobs(
+            generated_scores=generated_scores,
+            response_ids=response_ids,
         )
-        with torch.no_grad():
-            prev_logprobs = self._compute_response_logprobs_from_embeds(
-                prompt_inputs_embeds=prompt_inputs_embeds,
-                prompt_attention_mask=prompt_attention_mask,
+        response_ids, response_mask, prev_logprobs = (
+            self._pad_response_forward_inputs_with_logprobs(
                 response_ids=response_ids,
                 response_mask=response_mask,
+                prev_logprobs=prev_logprobs,
+                target_len=response_len,
             )
+        )
         metadata = {
             "prev_logprobs": prev_logprobs.detach(),
             "prev_values": None,
@@ -1087,7 +1098,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         env_obs,
         generation_kwargs: dict[str, Any],
     ) -> list[str]:
-        output_texts, _, _, _ = self._generate_batched_navigation_outputs(
+        output_texts, _, _, _, _ = self._generate_batched_navigation_outputs(
             env_obs,
             generation_kwargs,
         )
@@ -1097,6 +1108,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         self,
         env_obs: dict[str, Any],
         generation_kwargs: dict[str, Any],
+        *,
+        return_scores: bool = False,
     ):
         batch_size = len(env_obs["task_descriptions"])
         prompts: list[str] = []
@@ -1143,18 +1156,37 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
 
             inputs_embeds, attention_mask = self._pad_navigation_embeds(embeds)
             self.model.update_prompt([[prompt] for prompt in prompts])
-            output_ids = self.model.generate(
+            generate_kwargs = dict(generation_kwargs)
+            if return_scores:
+                generate_kwargs["return_dict_in_generate"] = True
+                generate_kwargs["output_scores"] = True
+            outputs = self.model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 use_cache=True,
-                **generation_kwargs,
+                **generate_kwargs,
             )
-            response_ids = self._response_ids_from_inputs_embeds_generation(output_ids)
+            if return_scores:
+                generated_scores = torch.stack(tuple(outputs.scores), dim=1).float()
+                response_ids = outputs.sequences[
+                    :, 1 : 1 + generated_scores.shape[1]
+                ]
+            else:
+                generated_scores = None
+                response_ids = self._response_ids_from_inputs_embeds_generation(
+                    outputs
+                )
             output_texts = self.tokenizer.batch_decode(
                 response_ids,
                 skip_special_tokens=True,
             )
-            return output_texts, inputs_embeds, attention_mask, response_ids
+            return (
+                output_texts,
+                inputs_embeds,
+                attention_mask,
+                response_ids,
+                generated_scores,
+            )
         finally:
             if original_run_type is missing_run_type:
                 if hasattr(self.model.config, "run_type"):
