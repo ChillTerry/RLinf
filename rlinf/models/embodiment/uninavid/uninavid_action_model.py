@@ -43,6 +43,7 @@ from rlinf.models.embodiment.uninavid.nav_rollout import (
     parse_uninavid_actions,
     select_slot_rgb_frames,
 )
+from rlinf.utils.utils import compute_logprobs_from_logits
 
 
 class UniNaVidForActionPrediction(nn.Module, BasePolicy):
@@ -931,6 +932,52 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             torch.cat([response_mask, mask_pad], dim=1),
         )
 
+    def _pad_response_forward_inputs_with_logprobs(
+        self,
+        *,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        prev_logprobs: torch.Tensor,
+        target_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        current_len = int(response_ids.shape[1])
+        if response_mask.shape != response_ids.shape:
+            raise ValueError("UniNaVid response mask must match response ids shape.")
+        if prev_logprobs.shape != (*response_ids.shape, 1):
+            raise ValueError(
+                "UniNaVid generation prev_logprobs must have shape [batch, response_len, 1]."
+            )
+        if current_len > target_len:
+            raise ValueError(
+                "UniNaVid train metadata response length exceeds max_new_tokens."
+            )
+        if current_len == target_len:
+            return response_ids, response_mask, prev_logprobs
+
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+        pad_len = target_len - current_len
+        id_pad = torch.full(
+            (response_ids.shape[0], pad_len),
+            int(pad_token_id),
+            dtype=response_ids.dtype,
+            device=response_ids.device,
+        )
+        mask_pad = torch.zeros(
+            (response_ids.shape[0], pad_len),
+            dtype=torch.bool,
+            device=response_ids.device,
+        )
+        logprob_pad = prev_logprobs.new_zeros(
+            (prev_logprobs.shape[0], pad_len, prev_logprobs.shape[2])
+        )
+        return (
+            torch.cat([response_ids, id_pad], dim=1),
+            torch.cat([response_mask.to(torch.bool), mask_pad], dim=1),
+            torch.cat([prev_logprobs, logprob_pad], dim=1),
+        )
+
     def _nav_size(self) -> int:
         compress_type = getattr(self.model.config, "compress_type", None)
         nav_sizes = {"grid:2": 4, "grid:4": 16, "mean": 1}
@@ -1127,6 +1174,31 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         if pad_token_id is None:
             return torch.ones_like(response_ids, dtype=torch.bool)
         return response_ids.ne(pad_token_id)
+
+    def _compute_generation_score_logprobs(
+        self,
+        *,
+        generated_scores: torch.Tensor,
+        response_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if generated_scores.dim() != 3:
+            raise ValueError(
+                "UniNaVid generation scores must have shape [batch, response_len, vocab]."
+            )
+        if response_ids.shape != generated_scores.shape[:2]:
+            raise ValueError(
+                "UniNaVid response ids must match generation score batch and length."
+            )
+
+        response_mask = self._build_response_mask(response_ids)
+        prev_logprobs = compute_logprobs_from_logits(
+            logits=generated_scores.float(),
+            target=response_ids,
+        ).unsqueeze(-1)
+        prev_logprobs = prev_logprobs * response_mask.unsqueeze(-1).to(
+            prev_logprobs.dtype
+        )
+        return prev_logprobs, response_mask
 
     def _embed_response_ids(self, response_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.model, "get_input_embeddings"):
