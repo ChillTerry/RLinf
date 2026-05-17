@@ -322,7 +322,6 @@ class HabitatEnv(gym.Env):
 
         infos = list_of_dict_to_dict_of_list(info_lists)
         infos = self._record_metrics(infos, terminations, first_done_mask)
-        self._write_first_done_metrics(infos["episode"], first_done_mask)
         step_reward = self._calc_step_reward(infos["episode"], first_done_reward_mask)
 
         self.current_raw_obs = raw_obs
@@ -592,6 +591,8 @@ class HabitatEnv(gym.Env):
             mask = update_mask.to(device=v.device)
             self.episode_info[k][mask] = v[mask]
 
+        if self.metrics_cfg.save_metrics:
+            self._write_first_done_metrics(self.episode_info, first_done_mask)
         self.first_done_cached_mask[first_done_mask] = True
 
         infos["episode"] = {k: v.clone() for k, v in self.episode_info.items()}
@@ -599,9 +600,6 @@ class HabitatEnv(gym.Env):
         return infos
 
     def _write_first_done_metrics(self, episode, first_done_mask):
-        if not self.metrics_cfg.save_metrics:
-            return
-
         episode_ids = self.env.get_current_episode_metadata()["episode_id"]
         for i in range(len(first_done_mask)):
             if not first_done_mask[i]:
