@@ -94,6 +94,36 @@ def test_uninavid_generation_scores_compute_prev_logprobs_and_response_mask():
     assert prev_logprobs[0, 2, 0].item() == 0.0
 
 
+def test_uninavid_masked_logprob_gather_skips_negative_infinity_pad_logits():
+    policy = UniNaVidForActionPrediction(
+        tokenizer=_Tokenizer(),
+        model=_GenerateModel(outputs=None),
+        image_processor=None,
+    )
+    logits = torch.tensor(
+        [
+            [[0.0, 2.0, -1.0], [0.0, float("-inf"), 3.0]],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    target = torch.tensor([[1, 1]], dtype=torch.long)
+    mask = torch.tensor([[True, False]])
+
+    token_logprobs = policy._gather_masked_token_logprobs(
+        logits=logits,
+        target=target,
+        mask=mask,
+    )
+    loss = token_logprobs.sum()
+    loss.backward()
+
+    assert torch.isfinite(token_logprobs).all()
+    assert token_logprobs[0, 1, 0].item() == 0.0
+    assert torch.isfinite(logits.grad).all()
+    assert logits.grad[0, 1].eq(0).all()
+
+
 def test_uninavid_generate_batched_navigation_outputs_can_return_scores(monkeypatch):
     score_step_1 = torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float32)
     score_step_2 = torch.tensor([[3.0, 4.0, 5.0]], dtype=torch.float32)

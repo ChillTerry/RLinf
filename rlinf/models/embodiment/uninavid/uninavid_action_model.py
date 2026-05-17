@@ -494,12 +494,10 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
 
         logprobs = None
         if compute_logprobs:
-            token_logprobs = torch.log_softmax(response_logits.float(), dim=-1).gather(
-                -1,
-                response_ids.unsqueeze(-1),
-            )
-            logprobs = token_logprobs * response_mask.unsqueeze(-1).to(
-                token_logprobs.dtype
+            logprobs = self._gather_masked_token_logprobs(
+                logits=response_logits.float(),
+                target=response_ids,
+                mask=response_mask,
             )
 
         entropy = None
@@ -1232,14 +1230,31 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             )
 
         response_mask = self._build_response_mask(response_ids)
-        prev_logprobs = compute_logprobs_from_logits(
+        prev_logprobs = self._gather_masked_token_logprobs(
             logits=generated_scores.float(),
             target=response_ids,
-        ).unsqueeze(-1)
-        prev_logprobs = prev_logprobs * response_mask.unsqueeze(-1).to(
-            prev_logprobs.dtype
+            mask=response_mask,
         )
         return prev_logprobs, response_mask
+
+    def _gather_masked_token_logprobs(
+        self,
+        *,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = mask.to(torch.bool)
+        token_logprobs = logits.new_zeros((*target.shape, 1), dtype=torch.float32)
+        if mask.any():
+            active_logits = logits[mask].float()
+            active_targets = target[mask]
+            active_logprobs = compute_logprobs_from_logits(
+                logits=active_logits.unsqueeze(1),
+                target=active_targets.unsqueeze(1),
+            ).squeeze(1)
+            token_logprobs[mask] = active_logprobs.unsqueeze(-1)
+        return token_logprobs
 
     def _embed_response_ids(self, response_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.model, "get_input_embeddings"):
