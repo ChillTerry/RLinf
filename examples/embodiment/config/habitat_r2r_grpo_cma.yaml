@@ -3,7 +3,9 @@ defaults:
   - env/habitat_r2r@env.eval
   - model/cma@actor.model
   - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
+  - _self_
 
 hydra:
   run:
@@ -76,7 +78,6 @@ env:
   enable_offload: False
   data_path_dir: "VLN-CE/datasets/r2r"
   scenes_dir: "VLN-CE/scene_dataset"
-  ndtw_gt_path: ""
   train:
     total_num_envs: 128
     max_episode_steps: 120
@@ -85,11 +86,13 @@ env:
     group_size: ${algorithm.group_size}
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    ndtw_gt_path: ${env.ndtw_gt_path}
     model_type: ${actor.model.model_type}
     split: train
     data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}.json.gz
+    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     scenes_dir: ${env.scenes_dir}
+    init_params:
+      config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
     video_cfg:
       fps: 5
       save_video: False
@@ -107,11 +110,13 @@ env:
     ignore_terminations: True
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    ndtw_gt_path: ${env.ndtw_gt_path}
     model_type: ${actor.model.model_type}
     split: val_unseen
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
+    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
     scenes_dir: ${env.scenes_dir}
+    init_params:
+      config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
     video_cfg:
       fps: 5
       save_video: False
