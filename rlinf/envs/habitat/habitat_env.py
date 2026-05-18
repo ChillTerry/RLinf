@@ -24,9 +24,9 @@ import gym
 import habitat
 import numpy as np
 import torch
+from habitat.config.default_structured_configs import MeasurementConfig
 from habitat.core.embodied_task import SimulatorTaskAction
 from habitat.core.registry import registry
-from habitat.config.default_structured_configs import MeasurementConfig
 from habitat_baselines.config.default import get_config
 from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
@@ -206,31 +206,9 @@ class HabitatEnv(gym.Env):
     def is_start(self, value):
         self._is_start = value
 
-    @staticmethod
-    def _format_habitat_actions(actions):
-        formatted_actions = []
-        for action in actions:
-            action_array = np.asarray(action)
-            if action_array.shape:
-                if action_array.size != 1:
-                    raise ValueError(
-                        "Habitat navigation expects one discrete action per env."
-                    )
-                action = action_array.reshape(-1)[0]
-            formatted_actions.append({"action": str(action)})
-        return formatted_actions
-
-    @staticmethod
-    def _squeeze_singleton_action_dim(actions):
-        actions = np.asarray(actions)
-        if actions.ndim > 1 and actions.shape[-1] == 1:
-            return np.squeeze(actions, axis=-1)
-        return actions
-
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_actions = np.vectorize(lambda x: self.action_map[x])(chunk_actions)
-        chunk_actions = self._squeeze_singleton_action_dim(chunk_actions)
         chunk_size = chunk_actions.shape[1]
         obs_list = []
         infos_list = []
@@ -296,7 +274,6 @@ class HabitatEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
-        actions = self._squeeze_singleton_action_dim(actions)
         self._elapsed_steps += 1
 
         # Habitat cannot execute STOP and continue stepping the same episode, so forward
@@ -322,7 +299,6 @@ class HabitatEnv(gym.Env):
 
         infos = list_of_dict_to_dict_of_list(info_lists)
         infos = self._record_metrics(infos, terminations, first_done_mask)
-        self._write_first_done_metrics(infos["episode"], first_done_mask)
         step_reward = self._calc_step_reward(infos["episode"], first_done_reward_mask)
 
         self.current_raw_obs = raw_obs
@@ -379,6 +355,19 @@ class HabitatEnv(gym.Env):
 
     def update_reset_state_ids(self):
         pass
+
+    def _format_habitat_actions(self, actions):
+        formatted_actions = []
+        for action in actions:
+            action_array = np.asarray(action)
+            if action_array.shape:
+                if action_array.size != 1:
+                    raise ValueError(
+                        "Habitat navigation expects one discrete action per env."
+                    )
+                action = action_array.reshape(-1)[0]
+            formatted_actions.append({"action": str(action)})
+        return formatted_actions
 
     def _normalize_depth(self, actions, raw_obs):
         """Normalize depth for envs whose action is 'no_op', following
@@ -489,16 +478,18 @@ class HabitatEnv(gym.Env):
                 device=final_obs["rgb_frame_history"].device
             )
             history = final_obs["rgb_frame_history"]
-            history[done_mask] = reset_frames[done_mask].unsqueeze(1).expand(
-                -1,
-                history.shape[1],
-                *history.shape[2:],
+            history[done_mask] = (
+                reset_frames[done_mask]
+                .unsqueeze(1)
+                .expand(
+                    -1,
+                    history.shape[1],
+                    *history.shape[2:],
+                )
             )
             final_obs["rgb_frame_history_lengths"][done_mask] = 1
         reset_obs["rgb_frame_history"] = final_obs["rgb_frame_history"]
-        reset_obs["rgb_frame_history_lengths"] = final_obs[
-            "rgb_frame_history_lengths"
-        ]
+        reset_obs["rgb_frame_history_lengths"] = final_obs["rgb_frame_history_lengths"]
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
@@ -585,13 +576,17 @@ class HabitatEnv(gym.Env):
 
         latest_episode = to_tensor(episode_info)
         if self.episode_info is None:
-            self.episode_info = {k: torch.zeros_like(v) for k, v in latest_episode.items()}
+            self.episode_info = {
+                k: torch.zeros_like(v) for k, v in latest_episode.items()
+            }
 
         update_mask = torch.as_tensor(~self.first_done_cached_mask, dtype=torch.bool)
         for k, v in latest_episode.items():
             mask = update_mask.to(device=v.device)
             self.episode_info[k][mask] = v[mask]
 
+        if self.metrics_cfg.save_metrics:
+            self._write_first_done_metrics(self.episode_info, first_done_mask)
         self.first_done_cached_mask[first_done_mask] = True
 
         infos["episode"] = {k: v.clone() for k, v in self.episode_info.items()}
@@ -599,9 +594,6 @@ class HabitatEnv(gym.Env):
         return infos
 
     def _write_first_done_metrics(self, episode, first_done_mask):
-        if not self.metrics_cfg.save_metrics:
-            return
-
         episode_ids = self.env.get_current_episode_metadata()["episode_id"]
         for i in range(len(first_done_mask)):
             if not first_done_mask[i]:
