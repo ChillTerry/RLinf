@@ -206,31 +206,9 @@ class HabitatEnv(gym.Env):
     def is_start(self, value):
         self._is_start = value
 
-    @staticmethod
-    def _format_habitat_actions(actions):
-        formatted_actions = []
-        for action in actions:
-            action_array = np.asarray(action)
-            if action_array.shape:
-                if action_array.size != 1:
-                    raise ValueError(
-                        "Habitat navigation expects one discrete action per env."
-                    )
-                action = action_array.reshape(-1)[0]
-            formatted_actions.append({"action": str(action)})
-        return formatted_actions
-
-    @staticmethod
-    def _squeeze_singleton_action_dim(actions):
-        actions = np.asarray(actions)
-        if actions.ndim > 1 and actions.shape[-1] == 1:
-            return np.squeeze(actions, axis=-1)
-        return actions
-
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_actions = np.vectorize(lambda x: self.action_map[x])(chunk_actions)
-        chunk_actions = self._squeeze_singleton_action_dim(chunk_actions)
         chunk_size = chunk_actions.shape[1]
         obs_list = []
         infos_list = []
@@ -296,7 +274,6 @@ class HabitatEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
-        actions = self._squeeze_singleton_action_dim(actions)
         self._elapsed_steps += 1
 
         # Habitat cannot execute STOP and continue stepping the same episode, so forward
@@ -378,6 +355,19 @@ class HabitatEnv(gym.Env):
 
     def update_reset_state_ids(self):
         pass
+
+    def _format_habitat_actions(self, actions):
+        formatted_actions = []
+        for action in actions:
+            action_array = np.asarray(action)
+            if action_array.shape:
+                if action_array.size != 1:
+                    raise ValueError(
+                        "Habitat navigation expects one discrete action per env."
+                    )
+                action = action_array.reshape(-1)[0]
+            formatted_actions.append({"action": str(action)})
+        return formatted_actions
 
     def _normalize_depth(self, actions, raw_obs):
         """Normalize depth for envs whose action is 'no_op', following

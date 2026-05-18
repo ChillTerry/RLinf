@@ -183,6 +183,13 @@ def prepare_actions_for_mujoco(raw_chunk_actions, model_type):
     return chunk_actions
 
 
+def prepare_actions_for_habitat(raw_chunk_actions) -> np.ndarray:
+    chunk_actions = np.asarray(raw_chunk_actions)
+    if chunk_actions.ndim == 3 and chunk_actions.shape[-1] == 1:
+        return np.squeeze(chunk_actions, axis=-1)
+    return chunk_actions
+
+
 def prepare_actions_for_d4rl(
     raw_chunk_actions,
     action_dim: int,
@@ -290,6 +297,10 @@ def prepare_actions(
         chunk_actions = prepare_actions_for_roboverse(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
+        )
+    elif env_type == SupportedEnvType.HABITAT:
+        chunk_actions = prepare_actions_for_habitat(
+            raw_chunk_actions=raw_chunk_actions,
         )
     else:
         chunk_actions = raw_chunk_actions
