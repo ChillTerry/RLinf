@@ -88,46 +88,21 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
     def _no_split_names(self) -> list[str]:
         return list(self._UNINAVID_FSDP_WRAP_NAMES)
 
-    def _initialize_fsdp_wrap_metadata(self) -> None:
-        llm_backbone = getattr(self.model, "model", None)
-        if llm_backbone is None:
-            return
+    @property
+    def num_action_chunks(self) -> int:
+        cfg = getattr(self, "cfg", None)
+        return int(self._cfg_get(cfg, "num_action_chunks", default=4))
 
-        self._set_fsdp_wrap_name(
-            self._resolve_module(getattr(llm_backbone, "vision_tower", None)),
-            "uninavid_vision_tower",
+    @property
+    def rollout_mode(self) -> str:
+        cfg = getattr(self, "cfg", None)
+        return str(
+            self._cfg_get(
+                cfg,
+                "rollout_mode",
+                default="batched_feature_cache",
+            )
         )
-        self._set_fsdp_wrap_name(
-            self._resolve_module(getattr(llm_backbone, "mm_projector", None)),
-            "uninavid_mm_projector",
-        )
-        self._set_fsdp_wrap_name(
-            getattr(self.model, "lm_head", None),
-            "uninavid_lm_head",
-        )
-
-    @staticmethod
-    def _resolve_module(module: Any) -> nn.Module | None:
-        if isinstance(module, nn.Module):
-            return module
-        if isinstance(module, (list, tuple)) and module:
-            first_module = module[0]
-            if isinstance(first_module, nn.Module):
-                return first_module
-        return None
-
-    @staticmethod
-    def _set_fsdp_wrap_name(module: nn.Module | None, wrap_name: str) -> None:
-        if module is not None:
-            module._fsdp_wrap_name = wrap_name
-
-    def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            self.model.gradient_checkpointing_enable(**kwargs)
-
-    def gradient_checkpointing_disable(self) -> None:
-        if hasattr(self.model, "gradient_checkpointing_disable"):
-            self.model.gradient_checkpointing_disable()
 
     @classmethod
     def from_pretrained(
@@ -255,6 +230,828 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             image_processor=image_processor,
             torch_dtype=dtype,
         )
+
+    def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
+        if forward_type == ForwardType.SFT:
+            return self.sft_forward(**kwargs)
+        if forward_type == ForwardType.DEFAULT:
+            return self.default_forward(**kwargs)
+        raise NotImplementedError
+
+    def sft_forward(self, data: dict[str, Any] | None = None, **kwargs):
+        if data is None:
+            data = kwargs.get("data")
+        if data is None and "input_ids" in kwargs:
+            data = kwargs
+
+        device = self._get_device()
+        input_ids = data["input_ids"].to(device=device)
+        attention_mask = data["attention_mask"].to(device=device)
+        labels = data["labels"].to(device=device)
+        images = self._move_images(data.get("images"), device=device)
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            images=images,
+            prompts=data.get("prompts"),
+            use_cache=False,
+            return_dict=True,
+        )
+        loss = getattr(outputs, "loss", None)
+        return loss
+
+    def default_forward(
+        self,
+        forward_inputs: dict[str, torch.Tensor] | None = None,
+        compute_logprobs: bool = True,
+        compute_entropy: bool = False,
+        compute_values: bool = False,
+        **kwargs,
+    ) -> dict[str, torch.Tensor | None]:
+        if compute_values:
+            raise NotImplementedError(
+                "UniNaVid GRPO training does not use critic values."
+            )
+
+        prompt_inputs_embeds = forward_inputs["prompt_inputs_embeds"]
+        prompt_attention_mask = forward_inputs["prompt_attention_mask"]
+        response_ids = forward_inputs["response_ids"]
+        response_mask = forward_inputs["response_mask"].to(torch.bool)
+
+        response_logits = self._compute_logits_from_embeds(
+            prompt_inputs_embeds=prompt_inputs_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            response_ids=response_ids,
+            response_mask=response_mask,
+        )
+
+        logprobs = None
+        if compute_logprobs:
+            logprobs = self._gather_masked_token_logprobs(
+                logits=response_logits.float(),
+                target=response_ids,
+                mask=response_mask,
+            )
+
+        entropy = None
+        if compute_entropy:
+            response_logits = response_logits.float()
+            probs = torch.softmax(response_logits, dim=-1)
+            token_logprobs_all = torch.log_softmax(response_logits, dim=-1)
+            entropy = -(probs * token_logprobs_all).sum(dim=-1, keepdim=True)
+            entropy = entropy * response_mask.unsqueeze(-1).to(entropy.dtype)
+
+        return {"logprobs": logprobs, "entropy": entropy, "values": None}
+
+    def predict_action_batch(
+        self,
+        env_obs,
+        calculate_logprobs: bool = False,
+        calculate_values: bool = False,
+        mode: str = "eval",
+        **kwargs,
+    ):
+        if calculate_values:
+            raise NotImplementedError(
+                "UniNaVid does not provide critic values for GRPO training."
+            )
+
+        if mode == "train":
+            if self.rollout_mode != "batched_feature_cache":
+                raise NotImplementedError(
+                    "UniNaVid train rollout metadata is supported only for "
+                    "rollout_mode='batched_feature_cache'."
+                )
+            return self._predict_train_batch_cached(
+                env_obs,
+                kwargs,
+            )
+
+        if self.rollout_mode == "sequential_cache":
+            return self._predict_batch_sequential(env_obs, **kwargs)
+        if self.rollout_mode == "batched_feature_cache":
+            return self._predict_batch_cached(env_obs, **kwargs)
+
+    def _predict_batch_sequential(self, env_obs, **generation_kwargs):
+        batch_size = len(env_obs["task_descriptions"])
+        action_chunks = []
+
+        missing_run_type = object()
+        original_run_type = getattr(self.model.config, "run_type", missing_run_type)
+        self.model.config.run_type = "eval"
+        try:
+            for slot_id in range(batch_size):
+                episode_id = episode_id_from_obs(env_obs, slot_id)
+                cache = get_slot_cache(
+                    self._nav_caches,
+                    slot_id=slot_id,
+                    episode_id=episode_id,
+                )
+                self._load_model_cache(cache)
+
+                instruction = env_obs["task_descriptions"][slot_id]
+                navigation_prompt = build_navigation_prompt(instruction)
+                input_ids = self._build_navigation_input_ids(navigation_prompt)
+                rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
+                self.model.get_model().new_frames = len(rgb_frames)
+                images = self._preprocess_navigation_images(rgb_frames)
+                self.model.update_prompt(
+                    [
+                        [
+                            navigation_prompt.replace(
+                                DEFAULT_IMAGE_TOKEN,
+                                "",
+                            ).replace("\n", "")
+                        ]
+                    ]
+                )
+
+                output_ids = self.model.generate(
+                    input_ids,
+                    images=images,
+                    use_cache=True,
+                    **generation_kwargs,
+                )
+                input_token_len = input_ids.shape[1]
+                output_text = self.tokenizer.batch_decode(
+                    output_ids[:, input_token_len:],
+                    skip_special_tokens=True,
+                )[0].strip()
+                parsed_actions = parse_uninavid_actions(
+                    output_text,
+                    self.num_action_chunks,
+                )
+                action_chunks.append(parsed_actions)
+                self._save_model_cache(cache)
+        finally:
+            self._clear_model_cache()
+            if original_run_type is missing_run_type:
+                if hasattr(self.model.config, "run_type"):
+                    delattr(self.model.config, "run_type")
+            else:
+                self.model.config.run_type = original_run_type
+
+        actions = torch.stack(action_chunks, dim=0)
+        return actions, empty_rollout_metadata()
+
+    def _predict_batch_cached(self, env_obs, **generation_kwargs):
+        output_texts, _, _, _, _ = self._generate_batch_outputs(
+            env_obs,
+            generation_kwargs,
+        )
+        action_chunks = []
+        for output_text in output_texts:
+            normalized_output_text = output_text.strip()
+            parsed_actions = parse_uninavid_actions(
+                normalized_output_text,
+                self.num_action_chunks,
+            )
+            action_chunks.append(parsed_actions)
+        actions = torch.stack(action_chunks, dim=0)
+        return actions, empty_rollout_metadata()
+
+    def _predict_train_batch_cached(
+        self,
+        env_obs: dict[str, Any],
+        generation_kwargs: dict[str, Any],
+    ):
+        (
+            output_texts,
+            prompt_inputs_embeds,
+            prompt_attention_mask,
+            response_ids,
+            generated_scores,
+        ) = self._generate_batch_outputs(
+            env_obs,
+            generation_kwargs,
+            return_scores=True,
+        )
+        action_chunks = []
+        for output_text in output_texts:
+            parsed_actions = parse_uninavid_actions(
+                output_text.strip(),
+                self.num_action_chunks,
+            )
+            action_chunks.append(parsed_actions)
+        actions = torch.stack(action_chunks, dim=0)
+        max_new_tokens = generation_kwargs.get("max_new_tokens")
+        if max_new_tokens is None:
+            response_len = int(response_ids.shape[1])
+        else:
+            response_len = int(max_new_tokens)
+        cfg = getattr(self, "cfg", None)
+        model_max_length = int(
+            self._cfg_get(
+                cfg,
+                "model_max_length",
+                default=getattr(self.model, "model_max_length", 0),
+            )
+        )
+        if model_max_length <= 0:
+            prompt_len = int(prompt_inputs_embeds.shape[1])
+        else:
+            prompt_len = model_max_length - response_len
+            if prompt_len <= 0:
+                raise ValueError(
+                    "UniNaVid train metadata requires model_max_length > max_new_tokens."
+                )
+        prompt_inputs_embeds, prompt_attention_mask = (
+            self._left_pad_prompt_forward_inputs(
+                prompt_inputs_embeds,
+                prompt_attention_mask,
+                target_len=prompt_len,
+            )
+        )
+        prev_logprobs, response_mask = self._compute_generation_score_logprobs(
+            generated_scores=generated_scores,
+            response_ids=response_ids,
+        )
+        response_ids, response_mask, prev_logprobs = (
+            self._pad_response_inputs_with_logprobs(
+                response_ids=response_ids,
+                response_mask=response_mask,
+                prev_logprobs=prev_logprobs,
+                target_len=response_len,
+            )
+        )
+        metadata = {
+            "prev_logprobs": prev_logprobs.detach(),
+            "prev_values": None,
+            "forward_inputs": {
+                "prompt_inputs_embeds": prompt_inputs_embeds.detach(),
+                "prompt_attention_mask": prompt_attention_mask.detach(),
+                "response_ids": response_ids.detach(),
+                "response_mask": response_mask.detach(),
+            },
+        }
+        return actions, metadata
+
+    def _generate_batch_outputs(
+        self,
+        env_obs: dict[str, Any],
+        generation_kwargs: dict[str, Any],
+        *,
+        return_scores: bool = False,
+    ):
+        batch_size = len(env_obs["task_descriptions"])
+        prompts: list[str] = []
+        embeds: list[torch.Tensor] = []
+
+        missing_run_type = object()
+        original_run_type = getattr(self.model.config, "run_type", missing_run_type)
+        self.model.config.run_type = "eval"
+        try:
+            for slot_id in range(batch_size):
+                episode_id = episode_id_from_obs(env_obs, slot_id)
+                cache = get_slot_cache(
+                    self._nav_caches,
+                    slot_id=slot_id,
+                    episode_id=episode_id,
+                )
+                instruction = env_obs["task_descriptions"][slot_id]
+                navigation_prompt = build_navigation_prompt(instruction)
+                prompts.append(
+                    navigation_prompt.replace(DEFAULT_IMAGE_TOKEN, "").replace("\n", "")
+                )
+                full_input_ids = self._build_navigation_input_ids(navigation_prompt)
+                input_ids = full_input_ids[0]
+
+                rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
+                visual_features = self._encode_rgb_frames_for_slot(rgb_frames)
+                current_tokens = self._update_slot_feature_cache(
+                    cache,
+                    visual_features,
+                    new_frames=len(rgb_frames),
+                )
+                compress_type = getattr(self.model.config, "compress_type", None)
+                nav_sizes = {"grid:2": 4, "grid:4": 16, "mean": 1}
+                history_tokens, history_lengths = build_navigation_visual_tokens(
+                    cache,
+                    nav_sizes[compress_type],
+                )
+                embeds.append(
+                    self._build_navigation_inputs_embeds(
+                        input_ids,
+                        history_tokens,
+                        history_lengths,
+                        current_tokens,
+                    )
+                )
+
+            inputs_embeds, attention_mask = self._pad_navigation_embeds(embeds)
+            self.model.update_prompt([[prompt] for prompt in prompts])
+            generate_kwargs = dict(generation_kwargs)
+            if return_scores:
+                generate_kwargs["return_dict_in_generate"] = True
+                generate_kwargs["output_scores"] = True
+            outputs = self.model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                use_cache=True,
+                **generate_kwargs,
+            )
+            if return_scores:
+                generated_scores = torch.stack(tuple(outputs.scores), dim=1).float()
+                response_ids = outputs.sequences[
+                    :, 1 : 1 + generated_scores.shape[1]
+                ]
+            else:
+                generated_scores = None
+                output_ids = (
+                    outputs.sequences if hasattr(outputs, "sequences") else outputs
+                )
+                # HF generation starts from a synthetic one-token sequence when
+                # inputs_embeds are provided without input_ids. Exclude that seed from
+                # response-only rollout metadata and old-logprob recomputation.
+                response_ids = output_ids[:, 1:]
+            output_texts = self.tokenizer.batch_decode(
+                response_ids,
+                skip_special_tokens=True,
+            )
+            return (
+                output_texts,
+                inputs_embeds,
+                attention_mask,
+                response_ids,
+                generated_scores,
+            )
+        finally:
+            if original_run_type is missing_run_type:
+                if hasattr(self.model.config, "run_type"):
+                    delattr(self.model.config, "run_type")
+            else:
+                self.model.config.run_type = original_run_type
+
+    def _build_navigation_input_ids(self, navigation_prompt: str) -> torch.Tensor:
+        from rlinf.models.embodiment.uninavid import conversation as conversation_lib
+        from rlinf.models.embodiment.uninavid.constants import (
+            IAMGE_SEPARATOR,
+            IMAGE_END_TOKEN,
+            IMAGE_START_TOKEN,
+            NAVIGATION_SPECIAL_TOKEN,
+            VIDEO_END_SPECIAL_TOKEN,
+            VIDEO_START_SPECIAL_TOKEN,
+        )
+
+        if self.model.config.mm_use_im_start_end:
+            qs = (
+                DEFAULT_IM_START_TOKEN
+                + DEFAULT_IMAGE_TOKEN
+                + DEFAULT_IM_END_TOKEN
+                + "\n"
+                + navigation_prompt.replace("<image>", "")
+            )
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + "\n" + navigation_prompt.replace("<image>", "")
+        conv_mode = self._cfg_get(
+            getattr(self, "cfg", None),
+            "conv_mode",
+            default="vicuna_v1",
+        )
+        conv = conversation_lib.conv_templates[conv_mode].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        token_prompt = tokenizer_image_token(
+            prompt,
+            self.tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        )
+        device = self._get_device()
+        token_prompt = token_prompt.to(device=device)
+
+        video_start = self.tokenizer(
+            VIDEO_START_SPECIAL_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        image_separator = self.tokenizer(
+            IAMGE_SEPARATOR,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        video_end = self.tokenizer(
+            VIDEO_END_SPECIAL_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        image_start = self.tokenizer(
+            IMAGE_START_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        image_end = self.tokenizer(
+            IMAGE_END_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+        navigation = self.tokenizer(
+            NAVIGATION_SPECIAL_TOKEN,
+            return_tensors="pt",
+        ).input_ids[0][1:].to(device)
+
+        pieces: list[torch.Tensor] = []
+        while True:
+            indices = torch.where(token_prompt == IMAGE_TOKEN_INDEX)[0]
+            if indices.numel() == 0:
+                if token_prompt.numel() > 0:
+                    pieces.append(token_prompt)
+                break
+            idx = indices[0]
+            pieces.extend(
+                [
+                    token_prompt[:idx],
+                    video_start,
+                    image_separator,
+                    token_prompt[idx : idx + 1],
+                    video_end,
+                    image_start,
+                    image_end,
+                    navigation,
+                ]
+            )
+            token_prompt = token_prompt[idx + 1 :]
+
+        nonempty_pieces = [piece for piece in pieces if piece.numel() > 0]
+        return torch.cat(nonempty_pieces, dim=0).unsqueeze(0)
+
+    def _build_navigation_inputs_embeds(
+        self,
+        input_ids: torch.Tensor,
+        history_tokens: torch.Tensor,
+        history_lengths: list[int],
+        current_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        image_token_indices = torch.where(input_ids == IMAGE_TOKEN_INDEX)[0]
+        if image_token_indices.numel() != 1:
+            raise ValueError(
+                "Uni-NaVid navigation prompt must contain exactly one image token."
+            )
+
+        image_token_start = int(image_token_indices[0].item())
+        embed_tokens = self.model.get_model().embed_tokens
+        pieces = [
+            embed_tokens(input_ids[:image_token_start]),
+        ]
+
+        separator_token = embed_tokens(input_ids[image_token_start - 1, None])
+        video_index = 0
+        for idx, token_length in enumerate(history_lengths):
+            pieces.append(history_tokens[video_index : video_index + token_length])
+            video_index += token_length
+            if idx != len(history_lengths) - 1:
+                pieces.append(separator_token)
+
+        pieces.append(
+            embed_tokens(input_ids[image_token_start + 1 : image_token_start + 3])
+        )
+        pieces.append(current_tokens)
+        pieces.append(embed_tokens(input_ids[image_token_start + 3 :]))
+        return torch.cat(pieces, dim=0)
+
+    def _encode_rgb_frames_for_slot(self, rgb_frames: list[Any]) -> torch.Tensor:
+        images = self._preprocess_navigation_images(rgb_frames)[0]
+        return self._encode_preprocessed_rgb_frames(images)
+
+    def _encode_preprocessed_rgb_frames(
+        self,
+        images: torch.Tensor,
+    ) -> torch.Tensor:
+        vision_tower = self.model.get_vision_tower()
+        visual_features = vision_tower(images)
+        if (
+            getattr(self.model.config, "mm_vision_select_feature", "patch") == "patch"
+            and visual_features.shape[1] % 2 == 1
+        ):
+            visual_features = visual_features[:, 1:]
+        return visual_features
+
+    def _update_slot_feature_cache(
+        self,
+        cache: UniNaVidNavCache,
+        visual_features: torch.Tensor,
+        new_frames: int,
+    ) -> torch.Tensor:
+        compress_type = getattr(self.model.config, "compress_type", None)
+        history_tokens = process_grid(
+            visual_features,
+            int(compress_type.split("grid:")[-1]),
+        )
+        history_tokens = self.model.get_model().mm_projector(history_tokens)
+        update_online_nav_cache(cache, history_tokens, new_frames=new_frames)
+
+        current_tokens = process_grid(visual_features[-1:], 8)
+        current_tokens = self.model.get_model().mm_projector(current_tokens)[0]
+        return current_tokens
+
+    def _preprocess_navigation_images(
+        self,
+        rgb_frames: list[Any],
+    ) -> list[torch.Tensor]:
+        import numpy as np
+
+        batch_image = np.asarray(rgb_frames)
+        pixel_values = self.image_processor.preprocess(
+            batch_image,
+            return_tensors="pt",
+        )["pixel_values"]
+        if self.torch_dtype is None:
+            pixel_values = pixel_values.to(device=self._get_device())
+        else:
+            pixel_values = pixel_values.to(
+                device=self._get_device(),
+                dtype=self.torch_dtype,
+            )
+        return [pixel_values]
+
+    def _pad_navigation_embeds(
+        self,
+        embeds: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_len = max(embed.shape[0] for embed in embeds)
+        hidden_size = embeds[0].shape[-1]
+        batch = embeds[0].new_zeros((len(embeds), max_len, hidden_size))
+        attention_mask = torch.zeros(
+            (len(embeds), max_len),
+            dtype=torch.long,
+            device=embeds[0].device,
+        )
+        for idx, embed in enumerate(embeds):
+            start = max_len - embed.shape[0]
+            batch[idx, start:] = embed
+            attention_mask[idx, start:] = 1
+        return batch, attention_mask
+
+    def _left_pad_prompt_forward_inputs(
+        self,
+        prompt_inputs_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        target_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current_len = int(prompt_inputs_embeds.shape[1])
+        if current_len > target_len:
+            raise ValueError(
+                "UniNaVid train metadata prompt length exceeds "
+                "model_max_length - max_new_tokens."
+            )
+        if current_len == target_len:
+            return prompt_inputs_embeds, prompt_attention_mask
+
+        pad_len = target_len - current_len
+        embed_pad = prompt_inputs_embeds.new_zeros(
+            (
+                prompt_inputs_embeds.shape[0],
+                pad_len,
+                prompt_inputs_embeds.shape[2],
+            )
+        )
+        mask_pad = prompt_attention_mask.new_zeros(
+            (prompt_attention_mask.shape[0], pad_len)
+        )
+        return (
+            torch.cat([embed_pad, prompt_inputs_embeds], dim=1),
+            torch.cat([mask_pad, prompt_attention_mask], dim=1),
+        )
+
+    def _pad_response_forward_inputs(
+        self,
+        response_ids: torch.Tensor,
+        target_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if target_len < 0:
+            raise ValueError(
+                "UniNaVid train metadata requires non-negative max_new_tokens."
+            )
+        current_len = int(response_ids.shape[1])
+        if current_len > target_len:
+            raise ValueError(
+                "UniNaVid train metadata response length exceeds max_new_tokens."
+            )
+
+        response_mask = self._build_response_mask(response_ids)
+        if current_len == target_len:
+            return response_ids, response_mask
+
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+        pad_len = target_len - current_len
+        id_pad = torch.full(
+            (response_ids.shape[0], pad_len),
+            int(pad_token_id),
+            dtype=response_ids.dtype,
+            device=response_ids.device,
+        )
+        mask_pad = torch.zeros(
+            (response_ids.shape[0], pad_len),
+            dtype=torch.bool,
+            device=response_ids.device,
+        )
+        return (
+            torch.cat([response_ids, id_pad], dim=1),
+            torch.cat([response_mask, mask_pad], dim=1),
+        )
+
+    def _pad_response_inputs_with_logprobs(
+        self,
+        *,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+        prev_logprobs: torch.Tensor,
+        target_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        current_len = int(response_ids.shape[1])
+        if current_len > target_len:
+            raise ValueError(
+                "UniNaVid train metadata response length exceeds max_new_tokens."
+            )
+        if current_len == target_len:
+            return response_ids, response_mask, prev_logprobs
+
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+        pad_len = target_len - current_len
+        id_pad = torch.full(
+            (response_ids.shape[0], pad_len),
+            int(pad_token_id),
+            dtype=response_ids.dtype,
+            device=response_ids.device,
+        )
+        mask_pad = torch.zeros(
+            (response_ids.shape[0], pad_len),
+            dtype=torch.bool,
+            device=response_ids.device,
+        )
+        logprob_pad = prev_logprobs.new_zeros(
+            (prev_logprobs.shape[0], pad_len, prev_logprobs.shape[2])
+        )
+        return (
+            torch.cat([response_ids, id_pad], dim=1),
+            torch.cat([response_mask.to(torch.bool), mask_pad], dim=1),
+            torch.cat([prev_logprobs, logprob_pad], dim=1),
+        )
+
+    def _build_response_mask(self, response_ids: torch.Tensor) -> torch.Tensor:
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            return torch.ones_like(response_ids, dtype=torch.bool)
+        return response_ids.ne(pad_token_id)
+
+    def _compute_generation_score_logprobs(
+        self,
+        *,
+        generated_scores: torch.Tensor,
+        response_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        response_mask = self._build_response_mask(response_ids)
+        prev_logprobs = self._gather_masked_token_logprobs(
+            logits=generated_scores.float(),
+            target=response_ids,
+            mask=response_mask,
+        )
+        return prev_logprobs, response_mask
+
+    def _gather_masked_token_logprobs(
+        self,
+        *,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = mask.to(torch.bool)
+        token_logprobs = logits.new_zeros((*target.shape, 1), dtype=torch.float32)
+        if mask.any():
+            active_logits = logits[mask].float()
+            active_targets = target[mask]
+            active_logprobs = compute_logprobs_from_logits(
+                logits=active_logits.unsqueeze(1),
+                target=active_targets.unsqueeze(1),
+            ).squeeze(1)
+            token_logprobs[mask] = active_logprobs.unsqueeze(-1)
+        return token_logprobs
+
+    def _embed_response_ids(self, response_ids: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.model, "get_input_embeddings"):
+            return self.model.get_input_embeddings()(response_ids)
+        if hasattr(self.model, "get_model") and hasattr(
+            self.model.get_model(),
+            "embed_tokens",
+        ):
+            return self.model.get_model().embed_tokens(response_ids)
+        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
+            return self.model.model.embed_tokens(response_ids)
+        raise AttributeError("UniNaVid language model does not expose token embeddings.")
+
+    def _compute_logits_from_embeds(
+        self,
+        *,
+        prompt_inputs_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        response_embeds = self._embed_response_ids(response_ids)
+        full_inputs_embeds = torch.cat([prompt_inputs_embeds, response_embeds], dim=1)
+        full_attention_mask = torch.cat(
+            [prompt_attention_mask, response_mask.to(prompt_attention_mask.dtype)],
+            dim=1,
+        )
+        outputs = self.model(
+            inputs_embeds=full_inputs_embeds,
+            attention_mask=full_attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        prompt_len = prompt_inputs_embeds.shape[1]
+        return outputs.logits[:, prompt_len - 1 : -1, :]
+
+    def _load_model_cache(self, cache: UniNaVidNavCache) -> None:
+        backbone = self.model.get_model()
+        backbone.feat_cache = cache.feat_cache
+        backbone.long_feat_cache = cache.long_feat_cache
+        backbone.weight = cache.weight
+        backbone.new_frames = cache.new_frames
+
+    def _save_model_cache(self, cache: UniNaVidNavCache) -> None:
+        backbone = self.model.get_model()
+        cache.feat_cache = getattr(backbone, "feat_cache", None)
+        cache.long_feat_cache = getattr(backbone, "long_feat_cache", None)
+        cache.weight = int(getattr(backbone, "weight", 1))
+        cache.new_frames = int(getattr(backbone, "new_frames", 0))
+
+    def _clear_model_cache(self) -> None:
+        backbone = self.model.get_model()
+        if hasattr(backbone, "initialize_online_inference_nav_feat_cache"):
+            backbone.initialize_online_inference_nav_feat_cache()
+        else:
+            backbone.feat_cache = None
+            backbone.long_feat_cache = None
+            backbone.weight = 1
+            backbone.new_frames = 0
+
+    def _move_images(self, images, *, device: torch.device):
+        if images is None:
+            return None
+        if isinstance(images, torch.Tensor):
+            if self.torch_dtype is None:
+                return images.to(device=device)
+            return images.to(device=device, dtype=self.torch_dtype)
+        if isinstance(images, list):
+            return [
+                (
+                    image.to(device=device)
+                    if self.torch_dtype is None
+                    else image.to(device=device, dtype=self.torch_dtype)
+                )
+                if isinstance(image, torch.Tensor)
+                else image
+                for image in images
+            ]
+        return images
+
+    def _get_device(self) -> torch.device:
+        return next(self.model.parameters()).device
+
+    def _initialize_fsdp_wrap_metadata(self) -> None:
+        llm_backbone = getattr(self.model, "model", None)
+        if llm_backbone is None:
+            return
+
+        self._set_fsdp_wrap_name(
+            self._resolve_module(getattr(llm_backbone, "vision_tower", None)),
+            "uninavid_vision_tower",
+        )
+        self._set_fsdp_wrap_name(
+            self._resolve_module(getattr(llm_backbone, "mm_projector", None)),
+            "uninavid_mm_projector",
+        )
+        self._set_fsdp_wrap_name(
+            getattr(self.model, "lm_head", None),
+            "uninavid_lm_head",
+        )
+
+    @staticmethod
+    def _resolve_module(module: Any) -> nn.Module | None:
+        if isinstance(module, nn.Module):
+            return module
+        if isinstance(module, (list, tuple)) and module:
+            first_module = module[0]
+            if isinstance(first_module, nn.Module):
+                return first_module
+        return None
+
+    @staticmethod
+    def _set_fsdp_wrap_name(module: nn.Module | None, wrap_name: str) -> None:
+        if module is not None:
+            module._fsdp_wrap_name = wrap_name
+
+    def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable(**kwargs)
+
+    def gradient_checkpointing_disable(self) -> None:
+        if hasattr(self.model, "gradient_checkpointing_disable"):
+            self.model.gradient_checkpointing_disable()
 
     @staticmethod
     def _resolve_torch_dtype(torch_dtype: torch.dtype | None) -> torch.dtype:
@@ -400,912 +1197,3 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             joined_keys = ", ".join(keys)
             raise ValueError(f"Uni-NaVid config requires one of: {joined_keys}")
         return default
-
-    def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
-        if forward_type == ForwardType.SFT:
-            return self.sft_forward(**kwargs)
-        if forward_type == ForwardType.DEFAULT:
-            return self.default_forward(**kwargs)
-        raise NotImplementedError
-
-    def sft_forward(self, data: dict[str, Any] | None = None, **kwargs):
-        if data is None:
-            data = kwargs.get("data")
-        if data is None and "input_ids" in kwargs:
-            data = kwargs
-        if data is None:
-            raise ValueError("Uni-NaVid sft_forward requires data.")
-
-        device = self._get_device()
-        input_ids = data["input_ids"].to(device=device)
-        attention_mask = data["attention_mask"].to(device=device)
-        labels = data["labels"].to(device=device)
-        images = self._move_images(data.get("images"), device=device)
-
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            images=images,
-            prompts=data.get("prompts"),
-            use_cache=False,
-            return_dict=True,
-        )
-        loss = getattr(outputs, "loss", None)
-        if loss is None:
-            raise ValueError("Uni-NaVid SFT forward expected outputs.loss.")
-        return loss
-
-    def _move_images(self, images, *, device: torch.device):
-        if images is None:
-            return None
-        if isinstance(images, torch.Tensor):
-            return self._move_image_tensor(images, device=device)
-        if isinstance(images, list):
-            return [
-                self._move_image_tensor(image, device=device)
-                if isinstance(image, torch.Tensor)
-                else image
-                for image in images
-            ]
-        return images
-
-    def _move_image_tensor(
-        self,
-        image: torch.Tensor,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if self.torch_dtype is None:
-            return image.to(device=device)
-        return image.to(device=device, dtype=self.torch_dtype)
-
-    def _get_device(self) -> torch.device:
-        return next(self.model.parameters()).device
-
-    def default_forward(
-        self,
-        forward_inputs: dict[str, torch.Tensor] | None = None,
-        compute_logprobs: bool = True,
-        compute_entropy: bool = False,
-        compute_values: bool = False,
-        **kwargs,
-    ) -> dict[str, torch.Tensor | None]:
-        if compute_values:
-            raise NotImplementedError(
-                "UniNaVid GRPO training does not use critic values."
-            )
-        if forward_inputs is None:
-            raise ValueError(
-                "UniNaVid default_forward requires response-token forward_inputs."
-            )
-
-        prompt_inputs_embeds = forward_inputs["prompt_inputs_embeds"]
-        prompt_attention_mask = forward_inputs["prompt_attention_mask"]
-        response_ids = forward_inputs["response_ids"]
-        response_mask = forward_inputs["response_mask"].to(torch.bool)
-
-        response_logits = self._compute_response_logits_from_embeds(
-            prompt_inputs_embeds=prompt_inputs_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            response_ids=response_ids,
-            response_mask=response_mask,
-        )
-
-        logprobs = None
-        if compute_logprobs:
-            logprobs = self._gather_masked_token_logprobs(
-                logits=response_logits.float(),
-                target=response_ids,
-                mask=response_mask,
-            )
-
-        entropy = None
-        if compute_entropy:
-            response_logits = response_logits.float()
-            probs = torch.softmax(response_logits, dim=-1)
-            token_logprobs_all = torch.log_softmax(response_logits, dim=-1)
-            entropy = -(probs * token_logprobs_all).sum(dim=-1, keepdim=True)
-            entropy = entropy * response_mask.unsqueeze(-1).to(entropy.dtype)
-
-        return {"logprobs": logprobs, "entropy": entropy, "values": None}
-
-    @property
-    def num_action_chunks(self) -> int:
-        cfg = getattr(self, "cfg", None)
-        return int(self._cfg_get(cfg, "num_action_chunks", default=4))
-
-    @property
-    def rollout_mode(self) -> str:
-        cfg = getattr(self, "cfg", None)
-        return str(
-            self._cfg_get(
-                cfg,
-                "rollout_mode",
-                default="batched_feature_cache",
-            )
-        )
-
-    def _load_nav_cache_into_model(self, cache: UniNaVidNavCache) -> None:
-        backbone = self.model.get_model()
-        backbone.feat_cache = cache.feat_cache
-        backbone.long_feat_cache = cache.long_feat_cache
-        backbone.weight = cache.weight
-        backbone.new_frames = cache.new_frames
-
-    def _save_model_nav_cache_to_slot(self, cache: UniNaVidNavCache) -> None:
-        backbone = self.model.get_model()
-        cache.feat_cache = getattr(backbone, "feat_cache", None)
-        cache.long_feat_cache = getattr(backbone, "long_feat_cache", None)
-        cache.weight = int(getattr(backbone, "weight", 1))
-        cache.new_frames = int(getattr(backbone, "new_frames", 0))
-
-    def _clear_model_nav_cache(self) -> None:
-        backbone = self.model.get_model()
-        if hasattr(backbone, "initialize_online_inference_nav_feat_cache"):
-            backbone.initialize_online_inference_nav_feat_cache()
-        else:
-            backbone.feat_cache = None
-            backbone.long_feat_cache = None
-            backbone.weight = 1
-            backbone.new_frames = 0
-
-    def _build_navigation_input_ids(self, navigation_prompt: str) -> torch.Tensor:
-        from rlinf.models.embodiment.uninavid import conversation as conversation_lib
-        from rlinf.models.embodiment.uninavid.constants import (
-            IAMGE_SEPARATOR,
-            IMAGE_END_TOKEN,
-            IMAGE_START_TOKEN,
-            NAVIGATION_SPECIAL_TOKEN,
-            VIDEO_END_SPECIAL_TOKEN,
-            VIDEO_START_SPECIAL_TOKEN,
-        )
-
-        if self.model.config.mm_use_im_start_end:
-            qs = (
-                DEFAULT_IM_START_TOKEN
-                + DEFAULT_IMAGE_TOKEN
-                + DEFAULT_IM_END_TOKEN
-                + "\n"
-                + navigation_prompt.replace("<image>", "")
-            )
-        else:
-            qs = DEFAULT_IMAGE_TOKEN + "\n" + navigation_prompt.replace("<image>", "")
-        conv_mode = self._cfg_get(
-            getattr(self, "cfg", None),
-            "conv_mode",
-            default="vicuna_v1",
-        )
-        conv = conversation_lib.conv_templates[conv_mode].copy()
-        conv.append_message(conv.roles[0], qs)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
-
-        token_prompt = tokenizer_image_token(
-            prompt,
-            self.tokenizer,
-            IMAGE_TOKEN_INDEX,
-            return_tensors="pt",
-        )
-        device = self._get_device()
-        token_prompt = token_prompt.to(device=device)
-
-        video_start = self.tokenizer(
-            VIDEO_START_SPECIAL_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        image_separator = self.tokenizer(
-            IAMGE_SEPARATOR,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        video_end = self.tokenizer(
-            VIDEO_END_SPECIAL_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        image_start = self.tokenizer(
-            IMAGE_START_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        image_end = self.tokenizer(
-            IMAGE_END_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        navigation = self.tokenizer(
-            NAVIGATION_SPECIAL_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-
-        pieces: list[torch.Tensor] = []
-        while True:
-            indices = torch.where(token_prompt == IMAGE_TOKEN_INDEX)[0]
-            if indices.numel() == 0:
-                if token_prompt.numel() > 0:
-                    pieces.append(token_prompt)
-                break
-            idx = indices[0]
-            pieces.extend(
-                [
-                    token_prompt[:idx],
-                    video_start,
-                    image_separator,
-                    token_prompt[idx : idx + 1],
-                    video_end,
-                    image_start,
-                    image_end,
-                    navigation,
-                ]
-            )
-            token_prompt = token_prompt[idx + 1 :]
-
-        nonempty_pieces = [piece for piece in pieces if piece.numel() > 0]
-        return torch.cat(nonempty_pieces, dim=0).unsqueeze(0)
-
-    def _preprocess_navigation_images(
-        self,
-        rgb_frames: list[Any],
-    ) -> list[torch.Tensor]:
-        import numpy as np
-
-        batch_image = np.asarray(rgb_frames)
-        pixel_values = self.image_processor.preprocess(
-            batch_image,
-            return_tensors="pt",
-        )["pixel_values"]
-        pixel_values = self._move_image_tensor(pixel_values, device=self._get_device())
-        return [pixel_values]
-
-    def predict_action_batch(
-        self,
-        env_obs,
-        calculate_logprobs: bool = False,
-        calculate_values: bool = False,
-        mode: str = "eval",
-        **kwargs,
-    ):
-        if calculate_values:
-            raise NotImplementedError(
-                "UniNaVid does not provide critic values for GRPO training."
-            )
-        if calculate_logprobs and mode != "train":
-            raise NotImplementedError(
-                "UniNaVid logprob metadata is only available in train mode."
-            )
-
-        if mode == "train":
-            if self.rollout_mode != "batched_feature_cache":
-                raise NotImplementedError(
-                    "UniNaVid train rollout metadata is supported only for "
-                    "rollout_mode='batched_feature_cache'."
-                )
-            return self._predict_action_batch_with_batched_feature_cache_train(
-                env_obs,
-                kwargs,
-            )
-
-        if self.rollout_mode == "sequential_cache":
-            return self._predict_action_batch_sequential_cache(env_obs, **kwargs)
-        if self.rollout_mode == "batched_feature_cache":
-            return self._predict_action_batch_batched_feature_cache(env_obs, **kwargs)
-        raise ValueError(
-            "Unsupported Uni-NaVid rollout_mode "
-            f"{self.rollout_mode!r}; expected 'sequential_cache' or "
-            "'batched_feature_cache'."
-        )
-
-    def _predict_action_batch_sequential_cache(self, env_obs, **generation_kwargs):
-        batch_size = len(env_obs["task_descriptions"])
-        action_chunks = []
-
-        missing_run_type = object()
-        original_run_type = getattr(self.model.config, "run_type", missing_run_type)
-        self.model.config.run_type = "eval"
-        try:
-            for slot_id in range(batch_size):
-                episode_id = episode_id_from_obs(env_obs, slot_id)
-                cache = get_slot_cache(
-                    self._nav_caches,
-                    slot_id=slot_id,
-                    episode_id=episode_id,
-                )
-                self._load_nav_cache_into_model(cache)
-
-                instruction = env_obs["task_descriptions"][slot_id]
-                navigation_prompt = build_navigation_prompt(instruction)
-                input_ids = self._build_navigation_input_ids(navigation_prompt)
-                rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
-                self.model.get_model().new_frames = len(rgb_frames)
-                images = self._preprocess_navigation_images(rgb_frames)
-                self.model.update_prompt(
-                    [
-                        [
-                            navigation_prompt.replace(
-                                DEFAULT_IMAGE_TOKEN,
-                                "",
-                            ).replace("\n", "")
-                        ]
-                    ]
-                )
-
-                output_ids = self.model.generate(
-                    input_ids,
-                    images=images,
-                    use_cache=True,
-                    **generation_kwargs,
-                )
-                input_token_len = input_ids.shape[1]
-                output_text = self.tokenizer.batch_decode(
-                    output_ids[:, input_token_len:],
-                    skip_special_tokens=True,
-                )[0].strip()
-                parsed_actions = parse_uninavid_actions(
-                    output_text,
-                    self.num_action_chunks,
-                )
-                action_chunks.append(parsed_actions)
-                self._save_model_nav_cache_to_slot(cache)
-        finally:
-            self._clear_model_nav_cache()
-            if original_run_type is missing_run_type:
-                if hasattr(self.model.config, "run_type"):
-                    delattr(self.model.config, "run_type")
-            else:
-                self.model.config.run_type = original_run_type
-
-        actions = torch.stack(action_chunks, dim=0)
-        return actions, empty_rollout_metadata()
-
-    def _predict_action_batch_batched_feature_cache(self, env_obs, **generation_kwargs):
-        output_texts = self._generate_batched_navigation_texts(
-            env_obs,
-            generation_kwargs,
-        )
-        action_chunks = []
-        for output_text in output_texts:
-            normalized_output_text = output_text.strip()
-            parsed_actions = parse_uninavid_actions(
-                normalized_output_text,
-                self.num_action_chunks,
-            )
-            action_chunks.append(parsed_actions)
-        actions = torch.stack(action_chunks, dim=0)
-        return actions, empty_rollout_metadata()
-
-    def _predict_action_batch_with_batched_feature_cache_train(
-        self,
-        env_obs: dict[str, Any],
-        generation_kwargs: dict[str, Any],
-    ):
-        (
-            output_texts,
-            prompt_inputs_embeds,
-            prompt_attention_mask,
-            response_ids,
-            generated_scores,
-        ) = self._generate_batched_navigation_outputs(
-            env_obs,
-            generation_kwargs,
-            return_scores=True,
-        )
-        action_chunks = []
-        for output_text in output_texts:
-            parsed_actions = parse_uninavid_actions(
-                output_text.strip(),
-                self.num_action_chunks,
-            )
-            action_chunks.append(parsed_actions)
-        actions = torch.stack(action_chunks, dim=0)
-        response_len = self._resolve_train_response_length(
-            response_ids,
-            generation_kwargs,
-        )
-        prompt_len = self._resolve_train_prompt_length(
-            response_len,
-            current_prompt_len=int(prompt_inputs_embeds.shape[1]),
-        )
-        prompt_inputs_embeds, prompt_attention_mask = (
-            self._left_pad_prompt_forward_inputs(
-                prompt_inputs_embeds,
-                prompt_attention_mask,
-                target_len=prompt_len,
-            )
-        )
-        if generated_scores is None:
-            raise ValueError("UniNaVid train generation expected output scores.")
-        prev_logprobs, response_mask = self._compute_generation_score_logprobs(
-            generated_scores=generated_scores,
-            response_ids=response_ids,
-        )
-        response_ids, response_mask, prev_logprobs = (
-            self._pad_response_forward_inputs_with_logprobs(
-                response_ids=response_ids,
-                response_mask=response_mask,
-                prev_logprobs=prev_logprobs,
-                target_len=response_len,
-            )
-        )
-        metadata = {
-            "prev_logprobs": prev_logprobs.detach(),
-            "prev_values": None,
-            "forward_inputs": {
-                "prompt_inputs_embeds": prompt_inputs_embeds.detach(),
-                "prompt_attention_mask": prompt_attention_mask.detach(),
-                "response_ids": response_ids.detach(),
-                "response_mask": response_mask.detach(),
-            },
-        }
-        return actions, metadata
-
-    def _resolve_train_response_length(
-        self,
-        response_ids: torch.Tensor,
-        generation_kwargs: dict[str, Any],
-    ) -> int:
-        max_new_tokens = generation_kwargs.get("max_new_tokens")
-        if max_new_tokens is None:
-            return int(response_ids.shape[1])
-        return int(max_new_tokens)
-
-    def _resolve_train_prompt_length(
-        self,
-        response_len: int,
-        current_prompt_len: int,
-    ) -> int:
-        cfg = getattr(self, "cfg", None)
-        model_max_length = int(
-            self._cfg_get(
-                cfg,
-                "model_max_length",
-                default=getattr(self.model, "model_max_length", 0),
-            )
-        )
-        if model_max_length <= 0:
-            return current_prompt_len
-        prompt_len = model_max_length - response_len
-        if prompt_len <= 0:
-            raise ValueError(
-                "UniNaVid train metadata requires model_max_length > max_new_tokens."
-            )
-        return prompt_len
-
-    def _left_pad_prompt_forward_inputs(
-        self,
-        prompt_inputs_embeds: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
-        target_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        current_len = int(prompt_inputs_embeds.shape[1])
-        if int(prompt_attention_mask.shape[1]) != current_len:
-            raise ValueError(
-                "UniNaVid train metadata prompt embeds and attention mask lengths differ."
-            )
-        if current_len > target_len:
-            raise ValueError(
-                "UniNaVid train metadata prompt length exceeds "
-                "model_max_length - max_new_tokens."
-            )
-        if current_len == target_len:
-            return prompt_inputs_embeds, prompt_attention_mask
-
-        pad_len = target_len - current_len
-        embed_pad = prompt_inputs_embeds.new_zeros(
-            (
-                prompt_inputs_embeds.shape[0],
-                pad_len,
-                prompt_inputs_embeds.shape[2],
-            )
-        )
-        mask_pad = prompt_attention_mask.new_zeros(
-            (prompt_attention_mask.shape[0], pad_len)
-        )
-        return (
-            torch.cat([embed_pad, prompt_inputs_embeds], dim=1),
-            torch.cat([mask_pad, prompt_attention_mask], dim=1),
-        )
-
-    def _pad_response_forward_inputs(
-        self,
-        response_ids: torch.Tensor,
-        target_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if target_len < 0:
-            raise ValueError(
-                "UniNaVid train metadata requires non-negative max_new_tokens."
-            )
-        current_len = int(response_ids.shape[1])
-        if current_len > target_len:
-            raise ValueError(
-                "UniNaVid train metadata response length exceeds max_new_tokens."
-            )
-
-        response_mask = self._build_response_mask(response_ids)
-        if current_len == target_len:
-            return response_ids, response_mask
-
-        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-        if pad_token_id is None:
-            pad_token_id = 0
-        pad_len = target_len - current_len
-        id_pad = torch.full(
-            (response_ids.shape[0], pad_len),
-            int(pad_token_id),
-            dtype=response_ids.dtype,
-            device=response_ids.device,
-        )
-        mask_pad = torch.zeros(
-            (response_ids.shape[0], pad_len),
-            dtype=torch.bool,
-            device=response_ids.device,
-        )
-        return (
-            torch.cat([response_ids, id_pad], dim=1),
-            torch.cat([response_mask, mask_pad], dim=1),
-        )
-
-    def _pad_response_forward_inputs_with_logprobs(
-        self,
-        *,
-        response_ids: torch.Tensor,
-        response_mask: torch.Tensor,
-        prev_logprobs: torch.Tensor,
-        target_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if response_ids.dim() != 2:
-            raise ValueError("UniNaVid response ids must have shape [batch, response_len].")
-        current_len = int(response_ids.shape[1])
-        if response_mask.shape != response_ids.shape:
-            raise ValueError("UniNaVid response mask must match response ids shape.")
-        if prev_logprobs.shape != (*response_ids.shape, 1):
-            raise ValueError(
-                "UniNaVid generation prev_logprobs must have shape [batch, response_len, 1]."
-            )
-        if current_len > target_len:
-            raise ValueError(
-                "UniNaVid train metadata response length exceeds max_new_tokens."
-            )
-        if current_len == target_len:
-            return response_ids, response_mask, prev_logprobs
-
-        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-        if pad_token_id is None:
-            pad_token_id = 0
-        pad_len = target_len - current_len
-        id_pad = torch.full(
-            (response_ids.shape[0], pad_len),
-            int(pad_token_id),
-            dtype=response_ids.dtype,
-            device=response_ids.device,
-        )
-        mask_pad = torch.zeros(
-            (response_ids.shape[0], pad_len),
-            dtype=torch.bool,
-            device=response_ids.device,
-        )
-        logprob_pad = prev_logprobs.new_zeros(
-            (prev_logprobs.shape[0], pad_len, prev_logprobs.shape[2])
-        )
-        return (
-            torch.cat([response_ids, id_pad], dim=1),
-            torch.cat([response_mask.to(torch.bool), mask_pad], dim=1),
-            torch.cat([prev_logprobs, logprob_pad], dim=1),
-        )
-
-    def _nav_size(self) -> int:
-        compress_type = getattr(self.model.config, "compress_type", None)
-        nav_sizes = {"grid:2": 4, "grid:4": 16, "mean": 1}
-        if compress_type not in nav_sizes:
-            raise ValueError(
-                "Unsupported Uni-NaVid compress_type for Habitat rollout: "
-                f"{compress_type}"
-            )
-        return nav_sizes[compress_type]
-
-    def _navigation_grid_size(self) -> int:
-        compress_type = getattr(self.model.config, "compress_type", None)
-        if not isinstance(compress_type, str) or "grid:" not in compress_type:
-            raise ValueError(
-                "Unsupported Uni-NaVid compress_type for Habitat rollout: "
-                f"{compress_type}"
-            )
-        return int(compress_type.split("grid:")[-1])
-
-    def _encode_rgb_frames_for_slot(self, rgb_frames: list[Any]) -> torch.Tensor:
-        images = self._preprocess_navigation_images(rgb_frames)[0]
-        return self._encode_preprocessed_rgb_frames(images)
-
-    def _encode_preprocessed_rgb_frames(
-        self,
-        images: torch.Tensor,
-    ) -> torch.Tensor:
-        vision_tower = self.model.get_vision_tower()
-        visual_features = vision_tower(images)
-        if (
-            getattr(self.model.config, "mm_vision_select_feature", "patch") == "patch"
-            and visual_features.shape[1] % 2 == 1
-        ):
-            visual_features = visual_features[:, 1:]
-        return visual_features
-
-    def _update_slot_feature_cache(
-        self,
-        cache: UniNaVidNavCache,
-        visual_features: torch.Tensor,
-        new_frames: int,
-    ) -> torch.Tensor:
-        history_tokens = process_grid(visual_features, self._navigation_grid_size())
-        history_tokens = self.model.get_model().mm_projector(history_tokens)
-        update_online_nav_cache(cache, history_tokens, new_frames=new_frames)
-
-        current_tokens = process_grid(visual_features[-1:], 8)
-        current_tokens = self.model.get_model().mm_projector(current_tokens)[0]
-        return current_tokens
-
-    def _build_navigation_inputs_embeds(
-        self,
-        input_ids: torch.Tensor,
-        history_tokens: torch.Tensor,
-        history_lengths: list[int],
-        current_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        image_token_indices = torch.where(input_ids == IMAGE_TOKEN_INDEX)[0]
-        if image_token_indices.numel() != 1:
-            raise ValueError(
-                "Uni-NaVid navigation prompt must contain exactly one image token."
-            )
-
-        image_token_start = int(image_token_indices[0].item())
-        embed_tokens = self.model.get_model().embed_tokens
-        pieces = [
-            embed_tokens(input_ids[:image_token_start]),
-        ]
-
-        separator_token = embed_tokens(input_ids[image_token_start - 1, None])
-        video_index = 0
-        for idx, token_length in enumerate(history_lengths):
-            pieces.append(history_tokens[video_index : video_index + token_length])
-            video_index += token_length
-            if idx != len(history_lengths) - 1:
-                pieces.append(separator_token)
-
-        pieces.append(
-            embed_tokens(input_ids[image_token_start + 1 : image_token_start + 3])
-        )
-        pieces.append(current_tokens)
-        pieces.append(embed_tokens(input_ids[image_token_start + 3 :]))
-        return torch.cat(pieces, dim=0)
-
-    def _pad_navigation_embeds(
-        self,
-        embeds: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        max_len = max(embed.shape[0] for embed in embeds)
-        hidden_size = embeds[0].shape[-1]
-        batch = embeds[0].new_zeros((len(embeds), max_len, hidden_size))
-        attention_mask = torch.zeros(
-            (len(embeds), max_len),
-            dtype=torch.long,
-            device=embeds[0].device,
-        )
-        for idx, embed in enumerate(embeds):
-            start = max_len - embed.shape[0]
-            batch[idx, start:] = embed
-            attention_mask[idx, start:] = 1
-        return batch, attention_mask
-
-    def _generate_batched_navigation_texts(
-        self,
-        env_obs,
-        generation_kwargs: dict[str, Any],
-    ) -> list[str]:
-        output_texts, _, _, _, _ = self._generate_batched_navigation_outputs(
-            env_obs,
-            generation_kwargs,
-        )
-        return output_texts
-
-    def _generate_batched_navigation_outputs(
-        self,
-        env_obs: dict[str, Any],
-        generation_kwargs: dict[str, Any],
-        *,
-        return_scores: bool = False,
-    ):
-        batch_size = len(env_obs["task_descriptions"])
-        prompts: list[str] = []
-        embeds: list[torch.Tensor] = []
-
-        missing_run_type = object()
-        original_run_type = getattr(self.model.config, "run_type", missing_run_type)
-        self.model.config.run_type = "eval"
-        try:
-            for slot_id in range(batch_size):
-                episode_id = episode_id_from_obs(env_obs, slot_id)
-                cache = get_slot_cache(
-                    self._nav_caches,
-                    slot_id=slot_id,
-                    episode_id=episode_id,
-                )
-                instruction = env_obs["task_descriptions"][slot_id]
-                navigation_prompt = build_navigation_prompt(instruction)
-                prompts.append(
-                    navigation_prompt.replace(DEFAULT_IMAGE_TOKEN, "").replace("\n", "")
-                )
-                full_input_ids = self._build_navigation_input_ids(navigation_prompt)
-                input_ids = full_input_ids[0]
-
-                rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
-                visual_features = self._encode_rgb_frames_for_slot(rgb_frames)
-                current_tokens = self._update_slot_feature_cache(
-                    cache,
-                    visual_features,
-                    new_frames=len(rgb_frames),
-                )
-                history_tokens, history_lengths = build_navigation_visual_tokens(
-                    cache,
-                    self._nav_size(),
-                )
-                embeds.append(
-                    self._build_navigation_inputs_embeds(
-                        input_ids,
-                        history_tokens,
-                        history_lengths,
-                        current_tokens,
-                    )
-                )
-
-            inputs_embeds, attention_mask = self._pad_navigation_embeds(embeds)
-            self.model.update_prompt([[prompt] for prompt in prompts])
-            generate_kwargs = dict(generation_kwargs)
-            if return_scores:
-                generate_kwargs["return_dict_in_generate"] = True
-                generate_kwargs["output_scores"] = True
-            outputs = self.model.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **generate_kwargs,
-            )
-            if return_scores:
-                if not getattr(outputs, "scores", None):
-                    raise ValueError(
-                        "UniNaVid train generation expected non-empty output scores."
-                    )
-                generated_scores = torch.stack(tuple(outputs.scores), dim=1).float()
-                response_ids = outputs.sequences[
-                    :, 1 : 1 + generated_scores.shape[1]
-                ]
-            else:
-                generated_scores = None
-                output_ids = (
-                    outputs.sequences if hasattr(outputs, "sequences") else outputs
-                )
-                response_ids = self._response_ids_from_inputs_embeds_generation(
-                    output_ids
-                )
-            output_texts = self.tokenizer.batch_decode(
-                response_ids,
-                skip_special_tokens=True,
-            )
-            return (
-                output_texts,
-                inputs_embeds,
-                attention_mask,
-                response_ids,
-                generated_scores,
-            )
-        finally:
-            if original_run_type is missing_run_type:
-                if hasattr(self.model.config, "run_type"):
-                    delattr(self.model.config, "run_type")
-            else:
-                self.model.config.run_type = original_run_type
-
-    def _response_ids_from_inputs_embeds_generation(
-        self,
-        output_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        # HF generation starts from a synthetic one-token sequence when
-        # inputs_embeds are provided without input_ids. Exclude that seed from
-        # response-only rollout metadata and old-logprob recomputation.
-        return output_ids[:, 1:]
-
-    def _build_response_mask(self, response_ids: torch.Tensor) -> torch.Tensor:
-        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-        if pad_token_id is None:
-            return torch.ones_like(response_ids, dtype=torch.bool)
-        return response_ids.ne(pad_token_id)
-
-    def _compute_generation_score_logprobs(
-        self,
-        *,
-        generated_scores: torch.Tensor,
-        response_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if generated_scores.dim() != 3:
-            raise ValueError(
-                "UniNaVid generation scores must have shape [batch, response_len, vocab]."
-            )
-        if response_ids.shape != generated_scores.shape[:2]:
-            raise ValueError(
-                "UniNaVid response ids must match generation score batch and length."
-            )
-
-        response_mask = self._build_response_mask(response_ids)
-        prev_logprobs = self._gather_masked_token_logprobs(
-            logits=generated_scores.float(),
-            target=response_ids,
-            mask=response_mask,
-        )
-        return prev_logprobs, response_mask
-
-    def _gather_masked_token_logprobs(
-        self,
-        *,
-        logits: torch.Tensor,
-        target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        mask = mask.to(torch.bool)
-        token_logprobs = logits.new_zeros((*target.shape, 1), dtype=torch.float32)
-        if mask.any():
-            active_logits = logits[mask].float()
-            active_targets = target[mask]
-            active_logprobs = compute_logprobs_from_logits(
-                logits=active_logits.unsqueeze(1),
-                target=active_targets.unsqueeze(1),
-            ).squeeze(1)
-            token_logprobs[mask] = active_logprobs.unsqueeze(-1)
-        return token_logprobs
-
-    def _embed_response_ids(self, response_ids: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.model, "get_input_embeddings"):
-            return self.model.get_input_embeddings()(response_ids)
-        if hasattr(self.model, "get_model") and hasattr(
-            self.model.get_model(),
-            "embed_tokens",
-        ):
-            return self.model.get_model().embed_tokens(response_ids)
-        if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
-            return self.model.model.embed_tokens(response_ids)
-        raise AttributeError("UniNaVid language model does not expose token embeddings.")
-
-    def _compute_response_logprobs_from_embeds(
-        self,
-        *,
-        prompt_inputs_embeds: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
-        response_ids: torch.Tensor,
-        response_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        response_mask = response_mask.to(torch.bool)
-        response_logits = self._compute_response_logits_from_embeds(
-            prompt_inputs_embeds=prompt_inputs_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            response_ids=response_ids,
-            response_mask=response_mask,
-        )
-        logprobs = torch.log_softmax(response_logits.float(), dim=-1)
-        token_logprobs = logprobs.gather(-1, response_ids.unsqueeze(-1))
-        return token_logprobs * response_mask.unsqueeze(-1).to(token_logprobs.dtype)
-
-    def _compute_response_logits_from_embeds(
-        self,
-        *,
-        prompt_inputs_embeds: torch.Tensor,
-        prompt_attention_mask: torch.Tensor,
-        response_ids: torch.Tensor,
-        response_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        response_embeds = self._embed_response_ids(response_ids)
-        full_inputs_embeds = torch.cat([prompt_inputs_embeds, response_embeds], dim=1)
-        full_attention_mask = torch.cat(
-            [prompt_attention_mask, response_mask.to(prompt_attention_mask.dtype)],
-            dim=1,
-        )
-        outputs = self.model(
-            inputs_embeds=full_inputs_embeds,
-            attention_mask=full_attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        prompt_len = prompt_inputs_embeds.shape[1]
-        return outputs.logits[:, prompt_len - 1 : -1, :]
