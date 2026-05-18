@@ -38,7 +38,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.float32):
     observation_space = None  # Can be provided if needed
     model = CMAPolicy(cfg=model_config, observation_space=observation_space)
 
-    if cfg.model_path is not None:
+    if cfg.model_path:
         model_dict = torch.load(cfg.model_path, map_location="cpu", weights_only=False)
         model.load_state_dict(model_dict, strict=False)
 

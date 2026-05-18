@@ -574,7 +574,10 @@ class CMAPolicy(nn.Module, BasePolicy):
             "prev_values": chunk_values,
             "forward_inputs": forward_inputs,
         }
-        return action, result
+        rollout_action = action.reshape(
+            batch_size, self.cfg.num_action_chunks, self.cfg.action_dim
+        )
+        return rollout_action, result
 
     def forward(self, forward_type="default_forward", **kwargs):
         """Forward pass dispatcher."""
