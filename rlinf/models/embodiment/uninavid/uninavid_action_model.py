@@ -93,17 +93,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         cfg = getattr(self, "cfg", None)
         return int(self._cfg_get(cfg, "num_action_chunks", default=4))
 
-    @property
-    def rollout_mode(self) -> str:
-        cfg = getattr(self, "cfg", None)
-        return str(
-            self._cfg_get(
-                cfg,
-                "rollout_mode",
-                default="batched_feature_cache",
-            )
-        )
-
     @classmethod
     def from_pretrained(
         cls,
@@ -319,84 +308,14 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             )
 
         if mode == "train":
-            if self.rollout_mode != "batched_feature_cache":
-                raise NotImplementedError(
-                    "UniNaVid train rollout metadata is supported only for "
-                    "rollout_mode='batched_feature_cache'."
-                )
-            return self._predict_train_batch_cached(
+            return self._predict_train_batch(
                 env_obs,
                 kwargs,
             )
 
-        if self.rollout_mode == "sequential_cache":
-            return self._predict_batch_sequential(env_obs, **kwargs)
-        if self.rollout_mode == "batched_feature_cache":
-            return self._predict_batch_cached(env_obs, **kwargs)
+        return self._predict_eval_batch(env_obs, **kwargs)
 
-    def _predict_batch_sequential(self, env_obs, **generation_kwargs):
-        batch_size = len(env_obs["task_descriptions"])
-        action_chunks = []
-
-        missing_run_type = object()
-        original_run_type = getattr(self.model.config, "run_type", missing_run_type)
-        self.model.config.run_type = "eval"
-        try:
-            for slot_id in range(batch_size):
-                episode_id = episode_id_from_obs(env_obs, slot_id)
-                cache = get_slot_cache(
-                    self._nav_caches,
-                    slot_id=slot_id,
-                    episode_id=episode_id,
-                )
-                self._load_model_cache(cache)
-
-                instruction = env_obs["task_descriptions"][slot_id]
-                navigation_prompt = build_navigation_prompt(instruction)
-                input_ids = self._build_navigation_input_ids(navigation_prompt)
-                rgb_frames = select_slot_rgb_frames(env_obs, slot_id)
-                self.model.get_model().new_frames = len(rgb_frames)
-                images = self._preprocess_navigation_images(rgb_frames)
-                self.model.update_prompt(
-                    [
-                        [
-                            navigation_prompt.replace(
-                                DEFAULT_IMAGE_TOKEN,
-                                "",
-                            ).replace("\n", "")
-                        ]
-                    ]
-                )
-
-                output_ids = self.model.generate(
-                    input_ids,
-                    images=images,
-                    use_cache=True,
-                    **generation_kwargs,
-                )
-                input_token_len = input_ids.shape[1]
-                output_text = self.tokenizer.batch_decode(
-                    output_ids[:, input_token_len:],
-                    skip_special_tokens=True,
-                )[0].strip()
-                parsed_actions = parse_uninavid_actions(
-                    output_text,
-                    self.num_action_chunks,
-                )
-                action_chunks.append(parsed_actions)
-                self._save_model_cache(cache)
-        finally:
-            self._clear_model_cache()
-            if original_run_type is missing_run_type:
-                if hasattr(self.model.config, "run_type"):
-                    delattr(self.model.config, "run_type")
-            else:
-                self.model.config.run_type = original_run_type
-
-        actions = torch.stack(action_chunks, dim=0)
-        return actions, empty_rollout_metadata()
-
-    def _predict_batch_cached(self, env_obs, **generation_kwargs):
+    def _predict_eval_batch(self, env_obs, **generation_kwargs):
         output_texts, _, _, _, _ = self._generate_batch_outputs(
             env_obs,
             generation_kwargs,
@@ -412,7 +331,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         actions = torch.stack(action_chunks, dim=0)
         return actions, empty_rollout_metadata()
 
-    def _predict_train_batch_cached(
+    def _predict_train_batch(
         self,
         env_obs: dict[str, Any],
         generation_kwargs: dict[str, Any],
@@ -964,30 +883,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         )
         prompt_len = prompt_inputs_embeds.shape[1]
         return outputs.logits[:, prompt_len - 1 : -1, :]
-
-    def _load_model_cache(self, cache: UniNaVidNavCache) -> None:
-        backbone = self.model.get_model()
-        backbone.feat_cache = cache.feat_cache
-        backbone.long_feat_cache = cache.long_feat_cache
-        backbone.weight = cache.weight
-        backbone.new_frames = cache.new_frames
-
-    def _save_model_cache(self, cache: UniNaVidNavCache) -> None:
-        backbone = self.model.get_model()
-        cache.feat_cache = getattr(backbone, "feat_cache", None)
-        cache.long_feat_cache = getattr(backbone, "long_feat_cache", None)
-        cache.weight = int(getattr(backbone, "weight", 1))
-        cache.new_frames = int(getattr(backbone, "new_frames", 0))
-
-    def _clear_model_cache(self) -> None:
-        backbone = self.model.get_model()
-        if hasattr(backbone, "initialize_online_inference_nav_feat_cache"):
-            backbone.initialize_online_inference_nav_feat_cache()
-        else:
-            backbone.feat_cache = None
-            backbone.long_feat_cache = None
-            backbone.weight = 1
-            backbone.new_frames = 0
 
     def _move_images(self, images, *, device: torch.device):
         if images is None:
