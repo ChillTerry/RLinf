@@ -180,6 +180,14 @@ class HabitatEnv(gym.Env):
         self._init_env()
 
         self.metrics_cfg = cfg.metrics_cfg
+        self.debug_legacy_metrics_base_dir = getattr(
+            self.metrics_cfg, "legacy_metrics_base_dir", None
+        )
+        self.debug_legacy_metrics_enabled = bool(self.debug_legacy_metrics_base_dir)
+        self.debug_legacy_initial_distance_to_goal = np.zeros(
+            self.num_envs, dtype=np.float32
+        )
+        self.debug_legacy_dones_once = np.zeros(self.num_envs, dtype=bool)
         self.video_cfg = cfg.video_cfg
         self.current_raw_obs = None
 
@@ -300,6 +308,7 @@ class HabitatEnv(gym.Env):
         infos = list_of_dict_to_dict_of_list(info_lists)
         infos = self._record_metrics(infos, terminations, first_done_mask)
         step_reward = self._calc_step_reward(infos["episode"], first_done_reward_mask)
+        self._debug_write_legacy_first_done_metrics(infos, terminations, truncations)
 
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs, info_lists)
@@ -328,6 +337,9 @@ class HabitatEnv(gym.Env):
 
         raw_obs = self.env.reset(env_idx)
         self._elapsed_steps[env_idx] = 0
+        if self.debug_legacy_metrics_enabled:
+            self.debug_legacy_initial_distance_to_goal[env_idx] = 0.0
+            self.debug_legacy_dones_once[env_idx] = False
         self.first_done_cached_mask[env_idx] = False
         self.initial_distance_to_goal[env_idx] = np.nan
         current_metrics = self.env.get_current_metrics(env_idx)
@@ -620,6 +632,75 @@ class HabitatEnv(gym.Env):
                 continue
             with open(metrics_file, "w") as f:
                 json.dump(metrics_dict, f, indent=2, ensure_ascii=False)
+
+    def _debug_write_legacy_first_done_metrics(self, infos, terminations, truncations):
+        if not self.debug_legacy_metrics_enabled:
+            return
+
+        episode_info = {}
+        dist_threshold = self.env_config.task.measurements.success.success_distance
+        terminations = np.array(terminations, dtype=bool, copy=True)
+        truncations = np.array(truncations, dtype=bool, copy=True)
+
+        episode_info["distance_to_goal"] = np.asarray(
+            infos["distance_to_goal"], dtype=np.float32
+        ).copy()
+
+        is_first_step = self._elapsed_steps == 1
+        if is_first_step.any():
+            self.debug_legacy_initial_distance_to_goal[is_first_step] = episode_info[
+                "distance_to_goal"
+            ][is_first_step].copy()
+
+        episode_info["success"] = (
+            terminations & (episode_info["distance_to_goal"] < dist_threshold)
+        ).astype(np.float32)
+
+        episode_info["trajectory_Length"] = np.asarray(
+            infos["trajectory_Length"], dtype=np.float32
+        ).copy()
+
+        episode_info["spl"] = episode_info["success"] * (
+            self.debug_legacy_initial_distance_to_goal
+            / np.maximum(
+                episode_info["trajectory_Length"],
+                self.debug_legacy_initial_distance_to_goal,
+            )
+        )
+
+        episode_info["oracle_success"] = np.asarray(
+            infos["oracle_success"], dtype=np.float32
+        ).copy()
+        episode_info["oracle_navigation_error"] = np.asarray(
+            infos["oracle_navigation_error"], dtype=np.float32
+        ).copy()
+
+        if "ndtw" in infos:
+            episode_info["ndtw"] = np.asarray(infos["ndtw"], dtype=np.float32).copy()
+
+        metric_save_masks = (terminations | truncations) & (
+            ~self.debug_legacy_dones_once
+        )
+        if not metric_save_masks.any():
+            return
+
+        self.debug_legacy_dones_once[metric_save_masks] = True
+        episode_ids = self.env.get_current_episode_metadata()["episode_id"]
+        os.makedirs(self.debug_legacy_metrics_base_dir, exist_ok=True)
+        for i, should_save in enumerate(metric_save_masks):
+            if not should_save:
+                continue
+            episode_id = episode_ids[i]
+            metrics_dict = {key: float(value[i]) for key, value in episode_info.items()}
+            metrics_dict["elapsed_steps"] = int(self._elapsed_steps[i])
+            metrics_file = os.path.join(
+                self.debug_legacy_metrics_base_dir,
+                f"episode_{episode_id}.json",
+            )
+            if os.path.exists(metrics_file):
+                continue
+            with open(metrics_file, "w", encoding="utf-8") as file_obj:
+                json.dump(metrics_dict, file_obj, indent=2, ensure_ascii=False)
 
     def _init_env(self):
         env_fns = self._get_env_fns()

@@ -121,7 +121,78 @@ Conclusion: blocked by current metrics recorder expectations under the exact leg
 
 ## Hypothesis 2a: first-done metrics recorder
 
-Status: not run
+Status: blocked
+
+Implementation:
+
+- Added an opt-in legacy first-done debug recorder in `HabitatEnv`.
+- The recorder is disabled by default and only runs when
+  `env.eval.metrics_cfg.legacy_metrics_base_dir` is provided.
+
+Command:
+
+```bash
+export EMBODIED_PATH="$(cd examples/embodiment && pwd)"
+export REPO_PATH="$(pwd)"
+export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
+export MUJOCO_GL="osmesa"
+export PYOPENGL_PLATFORM="osmesa"
+export PYTHONPATH="${REPO_PATH}:${PYTHONPATH}"
+export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
+export PYTHONPATH="${REPO_PATH}:${ROBOTWIN_PATH}:${PYTHONPATH}"
+export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
+export PYTHONPATH="${DREAMZERO_PATH}:${PYTHONPATH}"
+export HYDRA_FULL_ERROR=1
+LOG_DIR="logs/$(date +'%Y%m%d-%H:%M:%S')-habitat_r2r_eval_cma_dual_recorder"
+mkdir -p "${LOG_DIR}"
+python "${SRC_FILE}" \
+  --config-path "${EMBODIED_PATH}/config/" \
+  --config-name habitat_r2r_eval_cma \
+  runner.logger.log_path="${LOG_DIR}" \
+  +env.eval.metrics_cfg.legacy_metrics_base_dir="${LOG_DIR}/metrics/eval_legacy_recorder" \
+  2>&1 | tee "${LOG_DIR}/eval_embodiment.log"
+```
+
+Result:
+
+- `LOG_DIR`: `logs/20260519-04:58:49-habitat_r2r_eval_cma_dual_recorder`
+- Exit status: `0` from the shell pipeline, but the eval process reported worker failure and exited main execution early.
+- Current recorder episode JSON files: `0`
+- Legacy debug recorder episode JSON files: `0`
+- Failure point: `EnvWorker.init_worker`, before any episode rollout or metric JSON output.
+- Error summary:
+
+```text
+ValueError: record count must be divisible by total_num_processes * num_group
+Exiting main process due to a failure upon worker execution.
+```
+
+Same-run comparison:
+
+Not run because neither `metrics/eval` nor `metrics/eval_legacy_recorder`
+contained episode JSON files.
+
+| Metric | current recorder | legacy debug recorder | Difference |
+| --- | ---: | ---: | ---: |
+| success | blocked | blocked | blocked |
+| spl | blocked | blocked | blocked |
+| oracle_success | blocked | blocked | blocked |
+
+Legacy debug recorder vs legacy branch:
+
+Not run because the legacy debug recorder did not produce episode JSON files.
+
+| Metric | legacy debug recorder | legacy branch | Difference |
+| --- | ---: | ---: | ---: |
+| success | blocked | 0.277412 | blocked |
+| spl | blocked | 0.261990 | blocked |
+| oracle_success | blocked | 0.333882 | blocked |
+
+Conclusion:
+
+Blocked. Cause 2a is not confirmed, partially confirmed, or rejected because
+the corrected dual-recorder eval failed during Habitat global-plan episode
+assignment before any metrics were recorded.
 
 ## Hypothesis 2b: full legacy Habitat step semantics
 
@@ -129,4 +200,9 @@ Status: not run
 
 ## Conclusion
 
-Status: blocked on Hypothesis 1 because the corrected eval reaches Habitat execution but fails before metric JSON output with missing `ndtw` in `infos`.
+Status: blocked on Hypothesis 1 and Hypothesis 2a.
+
+- Hypothesis 1: blocked because the corrected eval reaches Habitat execution
+  but fails before metric JSON output with missing `ndtw` in `infos`.
+- Hypothesis 2a: blocked because the dual-recorder eval fails during Habitat
+  global-plan episode assignment before any metric JSON output.
