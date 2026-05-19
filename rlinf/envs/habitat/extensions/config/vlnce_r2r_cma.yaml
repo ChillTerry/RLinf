@@ -1,0 +1,76 @@
+# @package _global_
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/task: vln_r2r
+  - /habitat/simulator/agents@habitat.simulator.agents.main_agent: agent_base
+  - /habitat/dataset/vln: mp3d_r2r
+  - /habitat/task/lab_sensors:
+    - gps_sensor
+    - compass_sensor
+  - /habitat/task/measurements:
+    - top_down_map
+    - ndtw
+  - _self_
+
+habitat:
+  seed: 1234
+  environment:
+    max_episode_steps: 512
+    iterator_options:
+      max_scene_repeat_steps: -1
+      shuffle: True
+  simulator:
+    agents:
+      main_agent:
+        sim_sensors:
+          rgb_sensor:
+            type: HabitatSimRGBSensor
+            width: 224
+            height: 224
+            hfov: 90
+          depth_sensor:
+            type: HabitatSimDepthSensor
+            width: 256
+            height: 256
+            hfov: 90
+            min_depth: 0.0
+            max_depth: 10.0
+            normalize_depth: True
+    forward_step_size: 0.25
+    turn_angle: 15
+    habitat_sim_v0:
+      gpu_device_id: 0
+  task:
+    actions:
+      no_op:
+        type: "NoOpAction"
+    measurements:
+      top_down_map:
+        type: TopDownMap
+      distance_to_goal:
+        type: DistanceToGoal
+        distance_to: POINT
+      success:
+        type: Success
+        success_distance: 3.0
+      spl:
+        type: SPL
+      trajectory_Length:
+        type: TrajectoryLength
+      oracle_success:
+        type: OracleSuccess
+      oracle_navigation_error:
+        type: OracleNavigationError
+      ndtw:
+        type: NDTW
+        SPLIT: ${habitat.dataset.split}
+        GT_PATH: "VLN-CE/datasets/r2r/{split}/{split}_gt.json.gz"
+        SUCCESS_DISTANCE: 3.0
+        FDTW: False
+
+  dataset:
+    type: R2RVLN-v1
+    split: None
+    scenes_dir: "/path/to/scene_dir"
+    data_path: "/path/to/data_path"

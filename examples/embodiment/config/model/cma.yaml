@@ -1,0 +1,64 @@
+model_type: "cma"
+precision: "fp32"
+load_to_device: true
+
+model_path: null
+
+action_dim: 1
+num_action_classes: 4
+num_action_chunks: 1
+image_size: [256, 256, 3]
+
+add_value_head: false
+add_q_head: false
+q_head_type: "default"
+num_q_heads: 2
+
+independent_std: true
+action_scale: null
+final_tanh: false
+std_range: null
+logstd_range: null
+
+instruction_encoder_config:
+  sensor_uuid: "instruction"
+  vocab_size: 2504
+  use_pretrained_embeddings: false
+  embedding_file: null
+  fine_tune_embeddings: true
+  embedding_size: 50
+  hidden_size: 128
+  rnn_type: "LSTM"
+  final_state_only: false
+  bidirectional: true
+
+depth_encoder_config:
+  cnn_type: "VlnResnetDepthEncoder"
+  output_size: 128
+  backbone: "resnet50"
+  ddppo_checkpoint: null
+  trainable: true
+  depth_width: 256
+  depth_height: 256
+  min_depth: 0.0
+  max_depth: 10.0
+
+rgb_encoder_config:
+  cnn_type: "TorchVisionResNet50"
+  output_size: 256
+  trainable: true
+
+state_encoder_config:
+  hidden_size: 512
+  rnn_type: "GRU"
+
+hidden_size: 512
+normalize_rgb: false
+ablate_instruction: false
+ablate_depth: false
+ablate_rgb: false
+
+use_progress_monitor: false
+progress_monitor_alpha: 1.0
+
+is_lora: false

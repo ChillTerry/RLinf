@@ -116,6 +116,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_cma(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.cma import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_uninavid(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.uninavid import get_model
 
@@ -202,6 +207,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.VALUE_MODEL.value,
         _build_value_model,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.CMA_POLICY.value,
+        _build_cma,
         category="embodied",
         force=True,
     )
