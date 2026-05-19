@@ -92,15 +92,13 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             SupportedModel.UNINAVID,
         ]:
             with self.amp_context:
-                losses = self.model(forward_type=ForwardType.SFT, data=batch)
-            if isinstance(losses, dict):
-                if losses.get("dynamics_loss", None) is not None:
-                    self._dreamzero_loss = {
-                        "dynamics_loss": losses["dynamics_loss"],
-                        "action_loss": losses["action_loss"],
-                    }
-                return losses["loss"]
-            return losses
+                losses_dict = self.model(forward_type=ForwardType.SFT, data=batch)
+            if losses_dict.get("dynamics_loss", None) is not None:
+                self._dreamzero_loss = {
+                    "dynamics_loss": losses_dict["dynamics_loss"],
+                    "action_loss": losses_dict["action_loss"],
+                }
+            return losses_dict["loss"]
         observation, actions = batch
 
         register_pytree_dataclasses(observation)

@@ -124,7 +124,7 @@ def test_uninavid_masked_logprob_gather_skips_negative_infinity_pad_logits():
     assert logits.grad[0, 1].eq(0).all()
 
 
-def test_uninavid_generate_batched_navigation_outputs_can_return_scores(monkeypatch):
+def test_uninavid_generate_batch_outputs_can_return_scores(monkeypatch):
     score_step_1 = torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float32)
     score_step_2 = torch.tensor([[3.0, 4.0, 5.0]], dtype=torch.float32)
     model = _GenerateModel(
@@ -187,7 +187,7 @@ def test_uninavid_generate_batched_navigation_outputs_can_return_scores(monkeypa
     }
 
     output_texts, inputs_embeds, attention_mask, response_ids, generated_scores = (
-        policy._generate_batched_navigation_outputs(
+        policy._generate_batch_outputs(
             env_obs,
             generation_kwargs={"max_new_tokens": 2},
             return_scores=True,
@@ -217,7 +217,7 @@ def test_uninavid_pads_response_ids_masks_and_generation_logprobs_together():
     prev_logprobs = torch.tensor([[[-0.1], [-0.2]]], dtype=torch.float32)
 
     padded_ids, padded_mask, padded_logprobs = (
-        policy._pad_response_forward_inputs_with_logprobs(
+        policy._pad_response_inputs_with_logprobs(
             response_ids=response_ids,
             response_mask=response_mask,
             prev_logprobs=prev_logprobs,
@@ -262,10 +262,10 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
     def fail_recompute(**kwargs):
         raise AssertionError("post-generation logprob recomputation should not run")
 
-    monkeypatch.setattr(policy, "_generate_batched_navigation_outputs", fake_generate_outputs)
-    monkeypatch.setattr(policy, "_compute_response_logprobs_from_embeds", fail_recompute)
+    monkeypatch.setattr(policy, "_generate_batch_outputs", fake_generate_outputs)
+    monkeypatch.setattr(policy, "_compute_logits_from_embeds", fail_recompute)
 
-    actions, metadata = policy._predict_action_batch_with_batched_feature_cache_train(
+    actions, metadata = policy._predict_train_batch_cached(
         env_obs={},
         generation_kwargs={"max_new_tokens": 4},
     )
