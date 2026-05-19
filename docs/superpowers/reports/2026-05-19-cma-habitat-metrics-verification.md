@@ -121,7 +121,7 @@ Conclusion: blocked by current metrics recorder expectations under the exact leg
 
 ## Hypothesis 2a: first-done metrics recorder
 
-Status: blocked
+Status: rejected as the primary cause
 
 Implementation:
 
@@ -129,7 +129,7 @@ Implementation:
 - The recorder is disabled by default and only runs when
   `env.eval.metrics_cfg.legacy_metrics_base_dir` is provided.
 
-Command:
+Initial dual-recorder command:
 
 ```bash
 export EMBODIED_PATH="$(cd examples/embodiment && pwd)"
@@ -153,7 +153,7 @@ python "${SRC_FILE}" \
   2>&1 | tee "${LOG_DIR}/eval_embodiment.log"
 ```
 
-Result:
+Initial result:
 
 - `LOG_DIR`: `logs/20260519-04:58:49-habitat_r2r_eval_cma_dual_recorder`
 - Exit status: `0` from the shell pipeline, but the eval process reported worker failure and exited main execution early.
@@ -167,32 +167,96 @@ ValueError: record count must be divisible by total_num_processes * num_group
 Exiting main process due to a failure upon worker execution.
 ```
 
+Root cause of initial blocked run:
+
+- The command did not override `env.eval.data_path` and `env.eval.ndtw_gt_path`.
+- Hydra therefore used the default `tiny_val_unseen.json.gz` from `examples/embodiment/config/habitat_r2r_eval_cma.yaml`.
+- The tiny dataset episode count does not satisfy the current allocator constraint `total_num_processes * num_group`.
+- This failure happened before rollout and was not caused by the opt-in recorder.
+
+Corrected full-val command:
+
+```bash
+export EMBODIED_PATH="$(cd examples/embodiment && pwd)"
+export REPO_PATH="$(pwd)"
+export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
+export MUJOCO_GL="osmesa"
+export PYOPENGL_PLATFORM="osmesa"
+export PYTHONPATH="${REPO_PATH}:${PYTHONPATH}"
+export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
+export PYTHONPATH="${REPO_PATH}:${ROBOTWIN_PATH}:${PYTHONPATH}"
+export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
+export PYTHONPATH="${DREAMZERO_PATH}:${PYTHONPATH}"
+export HYDRA_FULL_ERROR=1
+LOG_DIR="logs/$(date +'%Y%m%d-%H:%M:%S')-habitat_r2r_eval_cma_dual_recorder"
+mkdir -p "${LOG_DIR}"
+python "${SRC_FILE}" \
+  --config-path "${EMBODIED_PATH}/config/" \
+  --config-name habitat_r2r_eval_cma \
+  runner.logger.log_path="${LOG_DIR}" \
+  env.eval.data_path=VLN-CE/datasets/r2r/val_unseen/val_unseen.json.gz \
+  env.eval.ndtw_gt_path=VLN-CE/datasets/r2r/val_unseen/val_unseen_gt.json.gz \
+  +env.eval.metrics_cfg.legacy_metrics_base_dir="${LOG_DIR}/metrics/eval_legacy_recorder" \
+  2>&1 | tee "${LOG_DIR}/eval_embodiment.log"
+```
+
+Corrected full-val result:
+
+- `LOG_DIR`: `logs/20260519-05:03:51-habitat_r2r_eval_cma_dual_recorder`
+- Current recorder episode JSON files: `1824`
+- Legacy debug recorder episode JSON files: `1824`
+
 Same-run comparison:
 
-Not run because neither `metrics/eval` nor `metrics/eval_legacy_recorder`
-contained episode JSON files.
+```bash
+python .vscode/compare_habitat_metrics.py \
+  logs/20260519-05:03:51-habitat_r2r_eval_cma_dual_recorder/metrics/eval \
+  logs/20260519-05:03:51-habitat_r2r_eval_cma_dual_recorder/metrics/eval_legacy_recorder
+```
 
 | Metric | current recorder | legacy debug recorder | Difference |
 | --- | ---: | ---: | ---: |
-| success | blocked | blocked | blocked |
-| spl | blocked | blocked | blocked |
-| oracle_success | blocked | blocked | blocked |
+| success | 0.256579 | 0.256579 | 0.000000 |
+| spl | 0.242229 | 0.242062 | 0.000167 |
+| oracle_success | 0.302083 | 0.302083 | 0.000000 |
+
+Additional same-run facts:
+
+- `common_count`: `1824`
+- `success.changed`: `0`
+- `oracle_success.changed`: `0`
+- `spl.changed`: `10`
 
 Legacy debug recorder vs legacy branch:
 
-Not run because the legacy debug recorder did not produce episode JSON files.
+```bash
+python .vscode/compare_habitat_metrics.py \
+  logs/20260519-05:03:51-habitat_r2r_eval_cma_dual_recorder/metrics/eval_legacy_recorder \
+  logs/20260519-01:32:39/metrics/eval
+```
 
 | Metric | legacy debug recorder | legacy branch | Difference |
 | --- | ---: | ---: | ---: |
-| success | blocked | 0.277412 | blocked |
-| spl | blocked | 0.261990 | blocked |
-| oracle_success | blocked | 0.333882 | blocked |
+| success | 0.256579 | 0.277412 | -0.020833 |
+| spl | 0.242062 | 0.261990 | -0.019928 |
+| oracle_success | 0.302083 | 0.333882 | -0.031798 |
+
+Additional legacy-branch comparison facts:
+
+- `common_count`: `1824`
+- `success.changed`: `494`
+- `spl.changed`: `626`
+- `oracle_success.changed`: `488`
 
 Conclusion:
 
-Blocked. Cause 2a is not confirmed, partially confirmed, or rejected because
-the corrected dual-recorder eval failed during Habitat global-plan episode
-assignment before any metrics were recorded.
+Rejected as the primary explanation for the metrics gap. On the same corrected
+full-val trajectory, the current recorder and legacy first-done debug recorder
+produce identical `success` and `oracle_success`, and only a very small `spl`
+mean difference (`0.000167`). The legacy debug recorder still remains below the
+legacy branch by `success=-0.020833`, `spl=-0.019928`, and
+`oracle_success=-0.031798`, so the first-done recorder alone does not explain
+the observed gap.
 
 ## Hypothesis 2b: full legacy Habitat step semantics
 
@@ -200,9 +264,10 @@ Status: not run
 
 ## Conclusion
 
-Status: blocked on Hypothesis 1 and Hypothesis 2a.
+Status: blocked on Hypothesis 1; Hypothesis 2a rejected as the primary cause.
 
 - Hypothesis 1: blocked because the corrected eval reaches Habitat execution
   but fails before metric JSON output with missing `ndtw` in `infos`.
-- Hypothesis 2a: blocked because the dual-recorder eval fails during Habitat
-  global-plan episode assignment before any metric JSON output.
+- Hypothesis 2a: rejected as the primary cause because the same-run current and
+  legacy first-done recorders match on `success` and `oracle_success`, and the
+  remaining `spl` delta is far smaller than the baseline gap.
