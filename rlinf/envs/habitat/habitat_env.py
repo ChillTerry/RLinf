@@ -180,6 +180,18 @@ class HabitatEnv(gym.Env):
         self._init_env()
 
         self.metrics_cfg = cfg.metrics_cfg
+        requested_legacy_cma_step_semantics = bool(
+            getattr(self.cfg, "use_legacy_cma_step_semantics", False)
+        )
+        model_type = getattr(self.cfg, "model_type", None)
+        if requested_legacy_cma_step_semantics and model_type != "cma":
+            raise ValueError(
+                "use_legacy_cma_step_semantics is CMA-specific and requires "
+                "cfg.model_type == 'cma'."
+            )
+        self.use_legacy_cma_step_semantics = (
+            requested_legacy_cma_step_semantics and model_type == "cma"
+        )
         self.debug_legacy_metrics_base_dir = getattr(
             self.metrics_cfg, "legacy_metrics_base_dir", None
         )
@@ -215,6 +227,9 @@ class HabitatEnv(gym.Env):
         self._is_start = value
 
     def chunk_step(self, chunk_actions):
+        if self.use_legacy_cma_step_semantics:
+            return self._legacy_cma_chunk_step(chunk_actions)
+
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_actions = np.vectorize(lambda x: self.action_map[x])(chunk_actions)
         chunk_size = chunk_actions.shape[1]
@@ -260,6 +275,72 @@ class HabitatEnv(gym.Env):
 
         # [num_envs, chunk_steps]
         chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        if self.auto_reset or self.ignore_terminations:
+            chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+            chunk_terminations[:, -1] = raw_chunk_terminations.any(dim=1)
+
+            chunk_truncations = torch.zeros_like(raw_chunk_truncations)
+            chunk_truncations[:, -1] = raw_chunk_truncations.any(dim=1)
+        else:
+            chunk_terminations = raw_chunk_terminations.clone()
+            chunk_truncations = raw_chunk_truncations.clone()
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
+    def _legacy_cma_chunk_step(self, chunk_actions):
+        chunk_actions = np.vectorize(lambda x: self.action_map[x])(chunk_actions)
+        if chunk_actions.ndim == 3 and chunk_actions.shape[-1] == 1:
+            chunk_actions = np.squeeze(chunk_actions, axis=-1)
+        if chunk_actions.ndim != 2:
+            raise ValueError(
+                "Legacy CMA chunk_step expects chunk_actions with shape "
+                "[num_envs, chunk_step] or [num_envs, chunk_step, 1]."
+            )
+        chunk_size = chunk_actions.shape[1]
+        obs_list = []
+        infos_list = []
+
+        for env_idx, chunk_action in enumerate(chunk_actions):
+            stop_idx = np.where(chunk_action == "stop")[0]
+            if len(stop_idx) > 0:
+                stop_idx = stop_idx[0] + 1
+                truncated_chunk = chunk_action[:stop_idx].copy()
+                chunk_actions[env_idx] = np.concatenate(
+                    [truncated_chunk, ["no_op"] * (chunk_size - len(truncated_chunk))]
+                )
+
+        for env_idx, elapsed_step in enumerate(self.elapsed_steps):
+            if elapsed_step + chunk_size >= self.max_episode_steps:
+                reserved_idx = self.max_episode_steps - elapsed_step
+                truncated_chunk = chunk_actions[env_idx][:reserved_idx].copy()
+                truncated_chunk[reserved_idx - 1] = "stop"
+                chunk_actions[env_idx] = np.concatenate(
+                    [truncated_chunk, ["no_op"] * (chunk_size - len(truncated_chunk))]
+                )
+
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+        for i in range(chunk_size):
+            extracted_obs, step_reward, terminations, truncations, infos = self.step(
+                chunk_actions[:, i],
+                auto_reset=True,
+            )
+            obs_list.append(extracted_obs)
+            infos_list.append(infos)
+            chunk_rewards.append(step_reward)
+            raw_chunk_terminations.append(terminations)
+            raw_chunk_truncations.append(truncations)
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
         if self.auto_reset or self.ignore_terminations:
             chunk_terminations = torch.zeros_like(raw_chunk_terminations)
             chunk_terminations[:, -1] = raw_chunk_terminations.any(dim=1)

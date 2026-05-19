@@ -260,14 +260,127 @@ the observed gap.
 
 ## Hypothesis 2b: full legacy Habitat step semantics
 
-Status: not run
+Status: suggestive, not controlled
+
+Implementation:
+
+- Added an explicit opt-in `env.eval.use_legacy_cma_step_semantics` flag in
+  `HabitatEnv`.
+- Default `chunk_step` behavior remains unchanged when the flag is absent or
+  false.
+
+Syntax check:
+
+```bash
+python -m py_compile rlinf/envs/habitat/habitat_env.py
+```
+
+Syntax check result: pass.
+
+Command:
+
+```bash
+export EMBODIED_PATH="$(cd examples/embodiment && pwd)"
+export REPO_PATH="$(pwd)"
+export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
+export MUJOCO_GL="osmesa"
+export PYOPENGL_PLATFORM="osmesa"
+export PYTHONPATH="${REPO_PATH}:${PYTHONPATH}"
+export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
+export PYTHONPATH="${REPO_PATH}:${ROBOTWIN_PATH}:${PYTHONPATH}"
+export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
+export PYTHONPATH="${DREAMZERO_PATH}:${PYTHONPATH}"
+export HYDRA_FULL_ERROR=1
+LOG_DIR="logs/$(date +'%Y%m%d-%H:%M:%S')-habitat_r2r_eval_cma_legacy_step"
+mkdir -p "${LOG_DIR}"
+python "${SRC_FILE}" \
+  --config-path "${EMBODIED_PATH}/config/" \
+  --config-name habitat_r2r_eval_cma \
+  runner.logger.log_path="${LOG_DIR}" \
+  env.eval.data_path=VLN-CE/datasets/r2r/val_unseen/val_unseen.json.gz \
+  env.eval.ndtw_gt_path=VLN-CE/datasets/r2r/val_unseen/val_unseen_gt.json.gz \
+  +env.eval.use_legacy_cma_step_semantics=True \
+  2>&1 | tee "${LOG_DIR}/eval_embodiment.log"
+```
+
+Result:
+
+- `LOG_DIR`: `logs/20260519-05:31:36-habitat_r2r_eval_cma_legacy_step`
+- Eval process exit status: `0`
+- Episode JSON files: `1824`
+- GPU placement: rollout/env workers were placed on GPU ranks `4`, `5`, `6`,
+  and `7`.
+
+Legacy-step run vs legacy branch:
+
+```bash
+python .vscode/compare_habitat_metrics.py \
+  logs/20260519-05:31:36-habitat_r2r_eval_cma_legacy_step/metrics/eval \
+  logs/20260519-01:32:39/metrics/eval
+```
+
+| Metric | legacy-step cma2 run | legacy branch | Difference |
+| --- | ---: | ---: | ---: |
+| success | 0.259320 | 0.277412 | -0.018092 |
+| spl | 0.242417 | 0.261990 | -0.019573 |
+| oracle_success | 0.303180 | 0.333882 | -0.030702 |
+
+Additional legacy-branch comparison facts:
+
+- `common_count`: `1824`
+- `success.changed`: `479`
+- `spl.changed`: `623`
+- `oracle_success.changed`: `496`
+- `success_flips.left_success_right_fail`: `223`
+- `success_flips.left_fail_right_success`: `256`
+
+Legacy-step run vs cma2 baseline:
+
+```bash
+python .vscode/compare_habitat_metrics.py \
+  logs/20260519-05:31:36-habitat_r2r_eval_cma_legacy_step/metrics/eval \
+  logs/20260519-03:43:47-habitat_r2r_eval_cma/metrics/eval
+```
+
+| Metric | legacy-step cma2 run | cma2 baseline | Difference |
+| --- | ---: | ---: | ---: |
+| success | 0.259320 | 0.248904 | 0.010417 |
+| spl | 0.242417 | 0.232475 | 0.009942 |
+| oracle_success | 0.303180 | 0.299890 | 0.003289 |
+
+Additional cma2-baseline comparison facts:
+
+- `common_count`: `1824`
+- `success.changed`: `383`
+- `spl.changed`: `538`
+- `oracle_success.changed`: `376`
+- `success_flips.left_success_right_fail`: `201`
+- `success_flips.left_fail_right_success`: `182`
+
+Conclusion:
+
+Suggestive, but not an isolated causal estimate. The legacy-step run is closer
+to the legacy branch than the original cma2 baseline on `success` and `spl`,
+with the original baseline gaps changing from `success=-0.028509` to
+`success=-0.018092` and from `spl=-0.029515` to `spl=-0.019573`. However, these
+comparisons are across independent runs. A corrected default CMA run in
+Hypothesis 2a produced `success=0.256579`, while the original cma2 baseline was
+`success=0.248904`, so run-to-run variation is large enough that this result
+cannot be treated as a controlled same-run estimate of the legacy step effect.
+The legacy-step run also remains materially below the legacy branch, especially
+for `oracle_success=-0.030702`.
 
 ## Conclusion
 
-Status: blocked on Hypothesis 1; Hypothesis 2a rejected as the primary cause.
+Status: unresolved with suggestive evidence.
 
 - Hypothesis 1: blocked because the corrected eval reaches Habitat execution
   but fails before metric JSON output with missing `ndtw` in `infos`.
 - Hypothesis 2a: rejected as the primary cause because the same-run current and
   legacy first-done recorders match on `success` and `oracle_success`, and the
   remaining `spl` delta is far smaller than the baseline gap.
+- Hypothesis 2b: suggestive but not controlled. The legacy-step run is closer
+  to the legacy branch than the original cma2 baseline on `success` and `spl`,
+  but no paired default rerun was performed, and observed default CMA run
+  variation prevents attributing the difference causally to step semantics
+  alone.
