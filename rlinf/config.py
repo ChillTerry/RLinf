@@ -797,6 +797,22 @@ def validate_embodied_cfg(cfg):
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
 
+    with open_dict(cfg):
+        cfg.runner.save_best_only = cfg.runner.get("save_best_only", False)
+        cfg.runner.best_metric = cfg.runner.get("best_metric", "success")
+        cfg.runner.best_metric_criteria = cfg.runner.get("best_metric_criteria", "max")
+
+    if cfg.runner.save_best_only:
+        assert cfg.runner.val_check_interval > 0, (
+            "runner.save_best_only requires runner.val_check_interval > 0."
+        )
+        assert cfg.runner.best_metric, (
+            "runner.save_best_only requires runner.best_metric."
+        )
+        assert cfg.runner.best_metric_criteria in ["max", "min"], (
+            "runner.best_metric_criteria must be one of ['max', 'min']."
+        )
+
     # NOTE: Currently we only support actor_critic as PPO algorithm loss, and only support value_head as critic model.
     # This will be updated in the future to support more algorithms and critic models.
     # Check that actor_critic loss requires value_head

@@ -100,6 +100,12 @@ class EmbodiedRunner:
         self.enable_per_worker_metric_log = bool(
             self.cfg.runner.get("per_worker_log", False)
         )
+        self.save_best_only = bool(self.cfg.runner.get("save_best_only", False))
+        self.best_metric = self.cfg.runner.get("best_metric", "success")
+        self.best_metric_criteria = self.cfg.runner.get("best_metric_criteria", "max")
+        self.best_metric_value = (
+            float("-inf") if self.best_metric_criteria == "max" else float("inf")
+        )
 
         # Async logging setup
         self.stop_logging = False
@@ -337,10 +343,11 @@ class EmbodiedRunner:
                     with self.timer("eval"):
                         self.update_rollout_weights()
                         eval_metrics = self.evaluate()
+                        self._save_best_checkpoint(eval_metrics)
                         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                         self.metric_logger.log(data=eval_metrics, step=_step)
 
-                if save_model:
+                if save_model and not self.save_best_only:
                     self._save_checkpoint()
 
             time_metrics = self.timer.consume_durations()
@@ -464,13 +471,64 @@ class EmbodiedRunner:
         self.log_queue.join()  # Wait for all queued logs to be processed
         self.log_thread.join(timeout=1.0)
 
-    def _save_checkpoint(self):
-        self.logger.info(f"Saving checkpoint at step {self.global_step}.")
-        base_output_dir = os.path.join(
+    def _save_best_checkpoint(self, eval_metrics: dict) -> bool:
+        if not getattr(self, "save_best_only", False):
+            return False
+
+        best_metric = getattr(self, "best_metric", "success")
+        best_metric_criteria = getattr(self, "best_metric_criteria", "max")
+        if best_metric not in eval_metrics:
+            raise KeyError(
+                f"runner.save_best_only requires eval metric `{best_metric}`, "
+                f"but eval metrics are {sorted(eval_metrics.keys())}."
+            )
+
+        metric_value = float(eval_metrics[best_metric])
+        best_metric_value = getattr(
+            self,
+            "best_metric_value",
+            float("-inf") if best_metric_criteria == "max" else float("inf"),
+        )
+        if best_metric_criteria == "max":
+            improved = metric_value > best_metric_value
+        elif best_metric_criteria == "min":
+            improved = metric_value < best_metric_value
+        else:
+            raise ValueError(
+                f"runner.best_metric_criteria must be 'max' or 'min', got {best_metric_criteria!r}."
+            )
+
+        if not improved:
+            return False
+
+        self.best_metric_value = metric_value
+        self._save_checkpoint(is_best=True)
+        return True
+
+    def _save_checkpoint(self, is_best: bool = False):
+        if getattr(self, "save_best_only", False) and not is_best:
+            return
+
+        if is_best:
+            self.logger.info(
+                f"Saving best checkpoint at step {self.global_step} "
+                f"with {getattr(self, 'best_metric', 'metric')}="
+                f"{getattr(self, 'best_metric_value', None)}."
+            )
+        else:
+            self.logger.info(f"Saving checkpoint at step {self.global_step}.")
+
+        checkpoint_root = os.path.join(
             self.cfg.runner.logger.log_path,
             self.cfg.runner.logger.experiment_name,
-            f"checkpoints/global_step_{self.global_step}",
         )
+        if is_best:
+            base_output_dir = os.path.join(checkpoint_root, "checkpoints/best_model")
+        else:
+            base_output_dir = os.path.join(
+                checkpoint_root,
+                f"checkpoints/global_step_{self.global_step}",
+            )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
