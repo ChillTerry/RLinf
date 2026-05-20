@@ -2,7 +2,7 @@ model_type: "cma"
 precision: "fp32"
 load_to_device: true
 
-model_path: null
+model_path: ""
 
 action_dim: 1
 num_action_classes: 4

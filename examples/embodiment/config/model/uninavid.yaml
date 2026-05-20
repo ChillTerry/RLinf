@@ -1,6 +1,6 @@
 model_type: "uninavid"
-model_path: "VLN-CE/models/uninavid_weights/uninavid-7b-full-224-video-fps-1-grid-2"
-vision_tower: "VLN-CE/models/uninavid_weights/eva_vit_g.pth"
+model_path: ""
+vision_tower: ""
 image_processor: "rlinf/models/embodiment/uninavid/processor/clip-patch14-224"
 version: "imgsp_v1"
 conv_mode: "vicuna_v1"
