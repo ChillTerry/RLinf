@@ -520,18 +520,21 @@ class EnvWorker(Worker):
         )
 
         current_dones = chunk_dones[:, -1]  # [num_envs] bool
-        prev = self.eval_prev_done[stage_id].to(current_dones.device)
-        newly_done = current_dones & ~prev
-        self.eval_prev_done[stage_id] = prev | current_dones
+        if self.cfg.env.eval.env_type == "habitat":
+            done_mask = current_dones
+        else:
+            prev = self.eval_prev_done[stage_id].to(current_dones.device)
+            done_mask = current_dones & ~prev
+            self.eval_prev_done[stage_id] = prev | current_dones
 
-        if newly_done.any():
+        if done_mask.any():
             if "final_info" in infos:
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][newly_done].cpu()
+                    env_info[key] = final_info["episode"][key][done_mask].cpu()
             elif "episode" in infos:
                 for key in infos["episode"]:
-                    env_info[key] = infos["episode"][key][newly_done].cpu()
+                    env_info[key] = infos["episode"][key][done_mask].cpu()
 
         env_output = EnvOutput(
             obs=extracted_obs,
