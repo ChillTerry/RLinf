@@ -45,40 +45,7 @@ from torch import Tensor
 from rlinf.envs.habitat.extensions import maps
 
 
-def observations_to_image(
-    observation: dict[str, Any],
-    info: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Generate image of single frame from observation and info
-    returned from a single environment step().
-
-    Args:
-        observation: observation returned from an environment step().
-        info: info returned from an environment step().
-
-    Returns:
-        generated image of a single frame.
-    """
-    egocentric_view = {}
-    observation_size = -1
-    if "rgb" in observation:
-        observation_size = observation["rgb"].shape[0]
-        rgb = observation["rgb"][:, :, :3]
-        egocentric_view["rgb"] = rgb
-
-    # draw depth map if observation has depth info. resize to rgb size.
-    if "depth" in observation:
-        if observation_size == -1:
-            observation_size = observation["depth"].shape[0]
-        depth_map = (observation["depth"].squeeze() * 255).astype(np.uint8)
-        depth_map = np.stack([depth_map for _ in range(3)], axis=2)
-        egocentric_view["depth"] = depth_map
-
-    assert len(egocentric_view) > 0, "Expected at least one visual sensor enabled."
-
-    if info is None:
-        return egocentric_view
-
+def render_topdown_map(info: dict[str, Any] | None = None) -> ndarray:
     map_k = None
     if "top_down_map_vlnce" in info:
         map_k = "top_down_map_vlnce"
@@ -105,9 +72,7 @@ def observations_to_image(
         if td_map.shape[0] > td_map.shape[1]:
             td_map = np.rot90(td_map, 1)
 
-        egocentric_view["top_down_map"] = td_map
-
-    return egocentric_view
+    return td_map
 
 
 def pano_observations_to_image(

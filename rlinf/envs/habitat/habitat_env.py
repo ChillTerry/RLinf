@@ -24,16 +24,16 @@ import gym
 import habitat
 import numpy as np
 import torch
+from habitat.config.default_structured_configs import MeasurementConfig
 from habitat.core.embodied_task import SimulatorTaskAction
 from habitat.core.registry import registry
-from habitat.config.default_structured_configs import MeasurementConfig
 from habitat_baselines.config.default import get_config
 from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
 
 from rlinf.envs.habitat.extensions import measures
 from rlinf.envs.habitat.extensions.allocator import vram_balance_episode_sequences
-from rlinf.envs.habitat.extensions.utils import observations_to_image
+from rlinf.envs.habitat.extensions.utils import render_topdown_map
 from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
@@ -404,36 +404,38 @@ class HabitatEnv(gym.Env):
         should_render_video = info_lists is not None and self.cfg.video_cfg.save_video
 
         for i in range(len(obs_list)):
+            image = {}
             obs = obs_list[i]
             info = info_lists[i] if info_lists is not None else None
+
+            image["rgb"] = obs["rgb"]
+            if "depth" in obs:
+                image["depth"] = obs["depth"]
             if should_render_video:
-                images = observations_to_image(obs, info)
-                if "top_down_map" in images:
-                    image_size = (images["rgb"].shape[1], images["rgb"].shape[0])
-                    images["top_down_map"] = cv2.resize(
-                        images["top_down_map"],
-                        dsize=image_size,
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-                    images["concat"] = np.concatenate(
-                        (images["rgb"], images["top_down_map"]), axis=1
-                    )
-                else:
-                    images["concat"] = images["rgb"]
-            else:
-                images = observations_to_image(obs)
+                image["topdown_map"] = render_topdown_map(info)
+                image_size = (image["rgb"].shape[1], image["rgb"].shape[0])
+                image["top_down_map"] = cv2.resize(
+                    image["top_down_map"],
+                    dsize=image_size,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                image["main_images"] = np.concatenate(
+                    (image["rgb"], image["topdown_map"]), axis=1
+                )
+
             inst = str(obs["instruction"].get("text", ""))
             # token is used for CMA algorithm, please refer to
             # https://github.com/jacobkrantz/VLN-CE for more details.
             token = obs["instruction"].get("tokens", [])
-            image_list.append(images)
+
+            image_list.append(image)
             task_descs.append(inst)
             token_list.append(token)
         image_tensor = to_tensor(list_of_dict_to_dict_of_list(image_list))
 
         obs = {}
         if should_render_video:
-            obs["main_images"] = image_tensor["concat"].clone()  # [N_ENV, H, W, C]
+            obs["main_images"] = image_tensor["main_images"].clone()  # [N_ENV, H, W, C]
         obs["wrist_images"] = image_tensor[
             "rgb"
         ].clone()  # Temporarily use wrist_images to store rgb images
@@ -478,16 +480,18 @@ class HabitatEnv(gym.Env):
                 device=final_obs["rgb_frame_history"].device
             )
             history = final_obs["rgb_frame_history"]
-            history[done_mask] = reset_frames[done_mask].unsqueeze(1).expand(
-                -1,
-                history.shape[1],
-                *history.shape[2:],
+            history[done_mask] = (
+                reset_frames[done_mask]
+                .unsqueeze(1)
+                .expand(
+                    -1,
+                    history.shape[1],
+                    *history.shape[2:],
+                )
             )
             final_obs["rgb_frame_history_lengths"][done_mask] = 1
         reset_obs["rgb_frame_history"] = final_obs["rgb_frame_history"]
-        reset_obs["rgb_frame_history_lengths"] = final_obs[
-            "rgb_frame_history_lengths"
-        ]
+        reset_obs["rgb_frame_history_lengths"] = final_obs["rgb_frame_history_lengths"]
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
@@ -574,7 +578,9 @@ class HabitatEnv(gym.Env):
 
         latest_episode = to_tensor(episode_info)
         if self.episode_info is None:
-            self.episode_info = {k: torch.zeros_like(v) for k, v in latest_episode.items()}
+            self.episode_info = {
+                k: torch.zeros_like(v) for k, v in latest_episode.items()
+            }
 
         update_mask = torch.as_tensor(~self.first_done_cached_mask, dtype=torch.bool)
         for k, v in latest_episode.items():
