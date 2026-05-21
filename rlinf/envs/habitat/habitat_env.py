@@ -393,6 +393,8 @@ class HabitatEnv(gym.Env):
             depth = obs["depth"]
             depth = np.clip(depth, min_depth, max_depth)
             depth = (depth - min_depth) / (max_depth - min_depth)
+            if depth.ndim == 2:
+                depth = depth[..., None]
             obs["depth"] = depth
             raw_obs[env_idx] = obs
 
