@@ -411,7 +411,7 @@ class HabitatEnv(gym.Env):
             info = info_lists[i] if info_lists is not None else None
 
             image["rgb"] = obs["rgb"][:, :, :3]
-            if "depth" in obs:
+            if self.cfg.model_type == "cma":
                 image["depth"] = obs["depth"]
             if should_render_video:
                 image["topdown_map"] = render_topdown_map(info)
