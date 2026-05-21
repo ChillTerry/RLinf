@@ -408,14 +408,14 @@ class HabitatEnv(gym.Env):
             obs = obs_list[i]
             info = info_lists[i] if info_lists is not None else None
 
-            image["rgb"] = obs["rgb"]
+            image["rgb"] = obs["rgb"][:, :, :3]
             if "depth" in obs:
                 image["depth"] = obs["depth"]
             if should_render_video:
                 image["topdown_map"] = render_topdown_map(info)
                 image_size = (image["rgb"].shape[1], image["rgb"].shape[0])
-                image["top_down_map"] = cv2.resize(
-                    image["top_down_map"],
+                image["topdown_map"] = cv2.resize(
+                    image["topdown_map"],
                     dsize=image_size,
                     interpolation=cv2.INTER_LINEAR,
                 )
