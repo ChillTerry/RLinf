@@ -48,7 +48,7 @@ algorithm:
   update_epoch: 1
   rollout_epoch: 1
   eval_rollout_epoch: 1
-  group_size: 8
+  group_size: 4
 
   reward_type: chunk_level
   logprob_type: token_level
@@ -68,8 +68,8 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
 
-  success_reward_coef: 10.0
-  ndtw_reward_coef: 5.0
+  success_reward_coef: 15.0
+  ndtw_reward_coef: 0.0
   filter_rewards: True
   rewards_lower_bound: 1.0
   rewards_upper_bound: 12.0
@@ -77,7 +77,7 @@ algorithm:
   sampling_params:
     do_sample: True
     temperature_train: 1.0
-    temperature_eval: 0.2
+    temperature_eval: 0.0
     top_k: 50
     top_p: 1.0
     repetition_penalty: 1.0
@@ -93,7 +93,7 @@ env:
   scenes_dir: "VLN-CE/scene_dataset"
 
   train:
-    total_num_envs: 128
+    total_num_envs: 32
     max_episode_steps: 128
     max_steps_per_rollout_epoch: 128
     group_size: ${algorithm.group_size}
@@ -114,8 +114,8 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
-    total_num_envs: 56
-    max_episode_steps: 100
+    total_num_envs: 112
+    max_episode_steps: 200
     max_steps_per_rollout_epoch: 3200
     group_size: 1
     auto_reset: True
@@ -130,7 +130,7 @@ env:
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
     metrics_cfg:
-      save_metrics: False
+      save_metrics: True
       metrics_base_dir: ${runner.logger.log_path}/metrics/eval
     video_cfg:
       save_video: False
@@ -152,8 +152,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 64
-  global_batch_size: 1024
+  micro_batch_size: 8
+  global_batch_size: 32
   seed: 42
   enable_offload: True
 
