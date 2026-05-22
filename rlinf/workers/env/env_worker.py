@@ -31,6 +31,7 @@ from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.utils.action_chunks import get_effective_num_action_chunks
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
@@ -103,11 +104,11 @@ class EnvWorker(Worker):
         if not self.only_eval:
             self.n_train_chunk_steps = (
                 self.cfg.env.train.max_steps_per_rollout_epoch
-                // self.cfg.actor.model.num_action_chunks
+                // get_effective_num_action_chunks(self.cfg.actor.model, "train")
             )
         self.n_eval_chunk_steps = (
             self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
+            // get_effective_num_action_chunks(self.cfg.actor.model, "eval")
         )
         self.actor_split_num = self.get_actor_split_num()
 
@@ -494,7 +495,10 @@ class EnvWorker(Worker):
             raw_chunk_actions=raw_actions,
             env_type=self.cfg.env.eval.env_type,
             model_type=self.cfg.actor.model.model_type,
-            num_action_chunks=self.cfg.actor.model.num_action_chunks,
+            num_action_chunks=get_effective_num_action_chunks(
+                self.cfg.actor.model,
+                "eval",
+            ),
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
             wm_env_type=self.cfg.env.eval.get("wm_env_type", None),

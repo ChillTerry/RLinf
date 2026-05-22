@@ -29,6 +29,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
+from rlinf.utils.action_chunks import get_effective_num_action_chunks
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
 
@@ -75,11 +76,11 @@ class MultiStepRolloutWorker(Worker):
 
         self.n_train_chunk_steps = (
             cfg.env.train.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+            // get_effective_num_action_chunks(cfg.actor.model, "train")
         )
         self.n_eval_chunk_steps = (
             cfg.env.eval.max_steps_per_rollout_epoch
-            // cfg.actor.model.num_action_chunks
+            // get_effective_num_action_chunks(cfg.actor.model, "eval")
         )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
@@ -264,6 +265,11 @@ class MultiStepRolloutWorker(Worker):
                 "eval" if self.cfg.algorithm.loss_type == "embodied_dagger" else mode
             )
             kwargs = {**kwargs, "mode": rollout_mode}
+            if mode == "eval":
+                kwargs["num_action_chunks"] = get_effective_num_action_chunks(
+                    self.cfg.actor.model,
+                    "eval",
+                )
         elif model_type in [
             SupportedModel.OPENPI,
             SupportedModel.MLP_POLICY,

@@ -88,11 +88,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
     def _no_split_names(self) -> list[str]:
         return list(self._UNINAVID_FSDP_WRAP_NAMES)
 
-    @property
-    def num_action_chunks(self) -> int:
-        cfg = getattr(self, "cfg", None)
-        return int(self._cfg_get(cfg, "num_action_chunks", default=4))
-
     @classmethod
     def from_pretrained(
         cls,
@@ -307,15 +302,50 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 "UniNaVid does not provide critic values for GRPO training."
             )
 
+        num_action_chunks = self._get_num_action_chunks(
+            mode=mode,
+            override=kwargs.pop("num_action_chunks", None),
+        )
         if mode == "train":
             return self._predict_train_batch(
                 env_obs,
                 kwargs,
+                num_action_chunks=num_action_chunks,
             )
 
-        return self._predict_eval_batch(env_obs, **kwargs)
+        return self._predict_eval_batch(
+            env_obs,
+            kwargs,
+            num_action_chunks=num_action_chunks,
+        )
 
-    def _predict_eval_batch(self, env_obs, **generation_kwargs):
+    def _get_num_action_chunks(self, mode: str, override: int | None = None) -> int:
+        if override is not None:
+            return int(override)
+        cfg = getattr(self, "cfg", None)
+        if mode == "eval":
+            eval_num_action_chunks = self._cfg_get(
+                cfg,
+                "eval_num_action_chunks",
+                default=None,
+            )
+            if eval_num_action_chunks is not None:
+                return int(eval_num_action_chunks)
+
+        num_action_chunks = self._cfg_get(
+            cfg,
+            "num_action_chunks",
+            default=4,
+        )
+        return int(num_action_chunks)
+
+    def _predict_eval_batch(
+        self,
+        env_obs: dict[str, Any],
+        generation_kwargs: dict[str, Any],
+        *,
+        num_action_chunks: int,
+    ):
         output_texts, _, _, _, _ = self._generate_batch_outputs(
             env_obs,
             generation_kwargs,
@@ -325,7 +355,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             normalized_output_text = output_text.strip()
             parsed_actions = parse_uninavid_actions(
                 normalized_output_text,
-                self.num_action_chunks,
+                num_action_chunks,
             )
             action_chunks.append(parsed_actions)
         actions = torch.stack(action_chunks, dim=0)
@@ -335,6 +365,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         self,
         env_obs: dict[str, Any],
         generation_kwargs: dict[str, Any],
+        *,
+        num_action_chunks: int,
     ):
         (
             output_texts,
@@ -351,7 +383,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         for output_text in output_texts:
             parsed_actions = parse_uninavid_actions(
                 output_text.strip(),
-                self.num_action_chunks,
+                num_action_chunks,
             )
             action_chunks.append(parsed_actions)
         actions = torch.stack(action_chunks, dim=0)
@@ -473,9 +505,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             )
             if return_scores:
                 generated_scores = torch.stack(tuple(outputs.scores), dim=1).float()
-                response_ids = outputs.sequences[
-                    :, 1 : 1 + generated_scores.shape[1]
-                ]
+                response_ids = outputs.sequences[:, 1 : 1 + generated_scores.shape[1]]
             else:
                 generated_scores = None
                 output_ids = (
@@ -543,30 +573,54 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         device = self._get_device()
         token_prompt = token_prompt.to(device=device)
 
-        video_start = self.tokenizer(
-            VIDEO_START_SPECIAL_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        image_separator = self.tokenizer(
-            IAMGE_SEPARATOR,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        video_end = self.tokenizer(
-            VIDEO_END_SPECIAL_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        image_start = self.tokenizer(
-            IMAGE_START_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        image_end = self.tokenizer(
-            IMAGE_END_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
-        navigation = self.tokenizer(
-            NAVIGATION_SPECIAL_TOKEN,
-            return_tensors="pt",
-        ).input_ids[0][1:].to(device)
+        video_start = (
+            self.tokenizer(
+                VIDEO_START_SPECIAL_TOKEN,
+                return_tensors="pt",
+            )
+            .input_ids[0][1:]
+            .to(device)
+        )
+        image_separator = (
+            self.tokenizer(
+                IAMGE_SEPARATOR,
+                return_tensors="pt",
+            )
+            .input_ids[0][1:]
+            .to(device)
+        )
+        video_end = (
+            self.tokenizer(
+                VIDEO_END_SPECIAL_TOKEN,
+                return_tensors="pt",
+            )
+            .input_ids[0][1:]
+            .to(device)
+        )
+        image_start = (
+            self.tokenizer(
+                IMAGE_START_TOKEN,
+                return_tensors="pt",
+            )
+            .input_ids[0][1:]
+            .to(device)
+        )
+        image_end = (
+            self.tokenizer(
+                IMAGE_END_TOKEN,
+                return_tensors="pt",
+            )
+            .input_ids[0][1:]
+            .to(device)
+        )
+        navigation = (
+            self.tokenizer(
+                NAVIGATION_SPECIAL_TOKEN,
+                return_tensors="pt",
+            )
+            .input_ids[0][1:]
+            .to(device)
+        )
 
         pieces: list[torch.Tensor] = []
         while True:
@@ -859,7 +913,9 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             return self.model.get_model().embed_tokens(response_ids)
         if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
             return self.model.model.embed_tokens(response_ids)
-        raise AttributeError("UniNaVid language model does not expose token embeddings.")
+        raise AttributeError(
+            "UniNaVid language model does not expose token embeddings."
+        )
 
     def _compute_logits_from_embeds(
         self,
