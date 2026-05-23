@@ -1620,32 +1620,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
                             )
                         )
+                        ref_drift_inputs = None
                         if self._should_log_uninavid_reference_drift():
                             if self.ref_policy_state_dict is None:
                                 raise KeyError(
                                     "UniNaVid reference drift diagnostics require initial reference weights."
                                 )
-                            with torch.no_grad():
-                                with cpu_weight_swap(
-                                    self.model,
-                                    self.ref_policy_state_dict,
-                                    self.offload_model_buffer,
-                                ):
-                                    ref_output_dict = self.model(
-                                        forward_inputs=forward_inputs,
-                                        compute_logprobs=True,
-                                        compute_entropy=False,
-                                        compute_values=False,
-                                        use_cache=False,
-                                    )
-                            ref_drift_metrics = (
-                                compute_uninavid_reference_drift_diagnostics(
-                                    logprobs=prepared_loss_inputs["logprobs"],
-                                    ref_logprobs=ref_output_dict["logprobs"].float(),
-                                    loss_mask=prepared_loss_inputs["loss_mask"],
-                                )
-                            )
-                            metrics_data.update(ref_drift_metrics)
+                            ref_drift_inputs = {
+                                "forward_inputs": forward_inputs,
+                                "logprobs": prepared_loss_inputs["logprobs"].detach(),
+                                "loss_mask": prepared_loss_inputs[
+                                    "loss_mask"
+                                ].detach(),
+                            }
                         uninavid_actor_diagnostic_stats.append(diagnostic_stats)
                         if log_ratio_abs_values.numel() > 0:
                             uninavid_log_ratio_abs_values.append(
@@ -1702,6 +1689,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     loss /= self.gradient_accumulation
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
+
+                    if (
+                        model_type == SupportedModel.UNINAVID
+                        and ref_drift_inputs is not None
+                    ):
+                        with torch.no_grad():
+                            with cpu_weight_swap(
+                                self.model,
+                                self.ref_policy_state_dict,
+                                self.offload_model_buffer,
+                            ):
+                                ref_output_dict = self.model(
+                                    forward_inputs=ref_drift_inputs["forward_inputs"],
+                                    compute_logprobs=True,
+                                    compute_entropy=False,
+                                    compute_values=False,
+                                    use_cache=False,
+                                )
+                        ref_drift_metrics = compute_uninavid_reference_drift_diagnostics(
+                            logprobs=ref_drift_inputs["logprobs"],
+                            ref_logprobs=ref_output_dict["logprobs"].float(),
+                            loss_mask=ref_drift_inputs["loss_mask"],
+                        )
+                        metrics_data.update(ref_drift_metrics)
 
                     metrics_data["actor/total_loss"] = loss.detach().item()
                     append_to_dict(metrics, metrics_data)
