@@ -798,16 +798,18 @@ def validate_embodied_cfg(cfg):
     )
 
     with open_dict(cfg):
-        cfg.runner.save_best_only = cfg.runner.get("save_best_only", False)
+        cfg.runner.save_best_ckpt = cfg.runner.get("save_best_ckpt", False)
         cfg.runner.best_metric = cfg.runner.get("best_metric", "success")
-        cfg.runner.best_metric_criteria = cfg.runner.get("best_metric_criteria", "max")
+        cfg.runner.best_metric_criteria = cfg.runner.get(
+            "best_metric_criteria", cfg.runner.get("best_metric_mode", "max")
+        )
 
-    if cfg.runner.save_best_only:
+    if cfg.runner.save_best_ckpt:
         assert cfg.runner.val_check_interval > 0, (
-            "runner.save_best_only requires runner.val_check_interval > 0."
+            "runner.save_best_ckpt requires runner.val_check_interval > 0."
         )
         assert cfg.runner.best_metric, (
-            "runner.save_best_only requires runner.best_metric."
+            "runner.save_best_ckpt requires runner.best_metric."
         )
         assert cfg.runner.best_metric_criteria in ["max", "min"], (
             "runner.best_metric_criteria must be one of ['max', 'min']."

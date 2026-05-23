@@ -100,9 +100,11 @@ class EmbodiedRunner:
         self.enable_per_worker_metric_log = bool(
             self.cfg.runner.get("per_worker_log", False)
         )
-        self.save_best_only = bool(self.cfg.runner.get("save_best_only", False))
+        self.save_best_ckpt = bool(self.cfg.runner.get("save_best_ckpt", False))
         self.best_metric = self.cfg.runner.get("best_metric", "success")
-        self.best_metric_criteria = self.cfg.runner.get("best_metric_criteria", "max")
+        self.best_metric_criteria = self.cfg.runner.get(
+            "best_metric_criteria", self.cfg.runner.get("best_metric_mode", "max")
+        )
         self.best_metric_value = (
             float("-inf") if self.best_metric_criteria == "max" else float("inf")
         )
@@ -343,11 +345,12 @@ class EmbodiedRunner:
                     with self.timer("eval"):
                         self.update_rollout_weights()
                         eval_metrics = self.evaluate()
-                        self._save_best_checkpoint(eval_metrics)
+                        if self.save_best_ckpt:
+                            self._save_best_checkpoint(eval_metrics)
                         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                         self.metric_logger.log(data=eval_metrics, step=_step)
 
-                if save_model and not self.save_best_only:
+                if save_model:
                     self._save_checkpoint()
 
             time_metrics = self.timer.consume_durations()
@@ -472,14 +475,11 @@ class EmbodiedRunner:
         self.log_thread.join(timeout=1.0)
 
     def _save_best_checkpoint(self, eval_metrics: dict) -> bool:
-        if not getattr(self, "save_best_only", False):
-            return False
-
         best_metric = getattr(self, "best_metric", "success")
         best_metric_criteria = getattr(self, "best_metric_criteria", "max")
         if best_metric not in eval_metrics:
             raise KeyError(
-                f"runner.save_best_only requires eval metric `{best_metric}`, "
+                f"runner.save_best_ckpt requires eval metric `{best_metric}`, "
                 f"but eval metrics are {sorted(eval_metrics.keys())}."
             )
 
@@ -506,9 +506,6 @@ class EmbodiedRunner:
         return True
 
     def _save_checkpoint(self, is_best: bool = False):
-        if getattr(self, "save_best_only", False) and not is_best:
-            return
-
         if is_best:
             self.logger.info(
                 f"Saving best checkpoint at step {self.global_step} "

@@ -34,7 +34,7 @@ runner:
   only_eval: True
   val_check_interval: -1
   save_interval: -1
-  save_best_only: False
+  save_best_ckpt: False
   best_metric: success
   best_metric_mode: max
 
