@@ -101,6 +101,22 @@ def parse_uninavid_actions(
     )
 
 
+def count_parsed_action_chars(output_text: str, num_action_chunks: int) -> int:
+    action_chars = 0
+    parsed_actions = 0
+    for match in _ACTION_PATTERN.finditer(output_text):
+        action = match.group(1).lower()
+        action_chars += sum(ch.isalpha() for ch in action)
+        parsed_actions += 1
+        if action == "stop" or parsed_actions == num_action_chunks:
+            break
+    return action_chars
+
+
+def count_response_alpha_chars(output_text: str) -> int:
+    return sum(ch.isalpha() for ch in output_text)
+
+
 def tensor_to_rgb_numpy(frame: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(frame, torch.Tensor):
         frame = frame.detach().cpu().numpy()

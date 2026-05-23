@@ -34,6 +34,7 @@ from rlinf.algorithms.utils import (
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
+from rlinf.envs import SupportedEnvType
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
     FSDPModelManager,
 )
@@ -994,6 +995,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
+        self._uninavid_habitat_grpo_keep_group_mask = None
+        self._uninavid_habitat_grpo_keep_group_ratio = None
         self.version = 0
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
@@ -1001,6 +1004,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # create weight syncer
         weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer")
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
+
+    def _should_compute_uninavid_habitat_grpo_diagnostics(self) -> bool:
+        return (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.UNINAVID
+            and SupportedEnvType(self.cfg.env.train.env_type)
+            == SupportedEnvType.HABITAT
+            and self.cfg.algorithm.adv_type == "grpo"
+            and self.cfg.algorithm.get("filter_rewards", False)
+        )
 
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
@@ -1146,6 +1158,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         rollout_epoch = self.cfg.algorithm.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
+        self._uninavid_habitat_grpo_keep_group_mask = None
+        self._uninavid_habitat_grpo_keep_group_ratio = None
 
         if (
             not self.cfg.env.train.auto_reset
@@ -1195,6 +1209,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             ) & (
                 mean_reward_in_group <= self.cfg.algorithm.rewards_upper_bound
             )  # [n_prompts]
+            keep_group_mask = reward_filter_mask
+            if self._should_compute_uninavid_habitat_grpo_diagnostics():
+                from rlinf.models.embodiment.uninavid.grpo_diagnostics import (
+                    all_reduce_keep_group_ratio,
+                )
+
+                self._uninavid_habitat_grpo_keep_group_mask = keep_group_mask
+                self._uninavid_habitat_grpo_keep_group_ratio = (
+                    all_reduce_keep_group_ratio(keep_group_mask)
+                )
 
             # extend mask dimension
             reward_filter_mask = reward_filter_mask.repeat_interleave(
@@ -1241,6 +1265,62 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        if self._should_compute_uninavid_habitat_grpo_diagnostics():
+            from rlinf.models.embodiment.uninavid.grpo_diagnostics import (
+                all_reduce_action_ratios,
+                all_reduce_grpo_diagnostic_stats,
+                compute_grpo_diagnostic_stats,
+                finalize_grpo_diagnostic_stats,
+                reduce_success_to_trajectory_success,
+            )
+
+            if self._uninavid_habitat_grpo_keep_group_mask is None:
+                raise KeyError(
+                    "Habitat UniNaVid GRPO diagnostics require reward filtering."
+                )
+            env_info = self.rollout_batch.get("env_info", {})
+            if "success" not in env_info:
+                raise KeyError(
+                    "Habitat UniNaVid GRPO diagnostics require env_info['success']."
+                )
+            grpo_diagnostic_stats = compute_grpo_diagnostic_stats(
+                rewards=self.rollout_batch["rewards"],
+                dones=self.rollout_batch["dones"],
+                trajectory_success=reduce_success_to_trajectory_success(
+                    env_info["success"],
+                    batch_size=self.rollout_batch["rewards"].shape[1],
+                ),
+                keep_group_mask=self._uninavid_habitat_grpo_keep_group_mask,
+                group_size=self.cfg.algorithm.group_size,
+                reward_type=self.cfg.algorithm.reward_type,
+                loss_mask=self.rollout_batch.get("loss_mask", None),
+                loss_mask_sum=self.rollout_batch.get("loss_mask_sum", None),
+            )
+            grpo_diagnostic_stats = all_reduce_grpo_diagnostic_stats(
+                grpo_diagnostic_stats
+            )
+            rollout_metrics.update(
+                finalize_grpo_diagnostic_stats(grpo_diagnostic_stats)
+            )
+            rollout_metrics["reward_filter/keep_group_ratio"] = (
+                self._uninavid_habitat_grpo_keep_group_ratio
+            )
+            actions = self.rollout_batch.get("actions", None)
+            if actions is not None:
+                group_size = self.cfg.algorithm.group_size
+                keep_group_mask = self._uninavid_habitat_grpo_keep_group_mask.to(
+                    device=actions.device, dtype=torch.bool
+                )
+                grouped_actions = actions.reshape(
+                    actions.shape[0],
+                    keep_group_mask.numel(),
+                    group_size,
+                    *actions.shape[2:],
+                )
+                rollout_metrics.update(
+                    all_reduce_action_ratios(grouped_actions[:, keep_group_mask])
+                )
+            self.rollout_batch.pop("env_info", None)
         return rollout_metrics
 
     def _build_sft_data_loader(self):
@@ -1374,6 +1454,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
+        uninavid_actor_diagnostic_stats = []
+        uninavid_log_ratio_abs_values = []
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
@@ -1451,6 +1533,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         from rlinf.algorithms.registry import get_policy_loss
                         from rlinf.algorithms.utils import postprocess_loss_metric
                         from rlinf.models.embodiment.uninavid.rl_loss import (
+                            compute_uninavid_actor_diagnostic_stats,
                             prepare_uninavid_token_level_loss_inputs,
                         )
 
@@ -1484,6 +1567,28 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             **prepared_loss_inputs,
                         )
                         metrics_data = postprocess_loss_metric(metrics_data)
+                        diagnostic_stats, log_ratio_abs_values = (
+                            compute_uninavid_actor_diagnostic_stats(
+                                logprobs=prepared_loss_inputs["logprobs"],
+                                old_logprobs=prepared_loss_inputs["old_logprobs"],
+                                advantages=prepared_loss_inputs["advantages"],
+                                loss_mask=prepared_loss_inputs["loss_mask"],
+                                response_mask=batch["forward_inputs"]["response_mask"],
+                                parsed_action_char_count=batch["forward_inputs"][
+                                    "parsed_action_char_count"
+                                ],
+                                response_alpha_char_count=batch["forward_inputs"][
+                                    "response_alpha_char_count"
+                                ],
+                                clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
+                                clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
+                            )
+                        )
+                        uninavid_actor_diagnostic_stats.append(diagnostic_stats)
+                        if log_ratio_abs_values.numel() > 0:
+                            uninavid_log_ratio_abs_values.append(
+                                log_ratio_abs_values.detach().cpu()
+                            )
                         loss_mask = prepared_loss_inputs["loss_mask"]
                     else:
                         kwargs = {
@@ -1502,9 +1607,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
                             "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
                             "value_clip": self.cfg.algorithm.get("value_clip", None),
-                            "huber_delta": self.cfg.algorithm.get(
-                                "huber_delta", None
-                            ),
+                            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
                             "loss_mask": loss_mask,
                             "loss_mask_sum": loss_mask_sum,
                             "max_episode_steps": self.cfg.env.train.max_episode_steps,
@@ -1516,10 +1619,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
                     )
-                    if (
-                        self.cfg.algorithm.entropy_bonus > 0
-                        and not critic_warmup
-                    ):
+                    if self.cfg.algorithm.entropy_bonus > 0 and not critic_warmup:
                         if model_type == SupportedModel.UNINAVID:
                             entropy = prepared_loss_inputs["entropy"]
                         else:
@@ -1562,6 +1662,34 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+        if uninavid_actor_diagnostic_stats:
+            from rlinf.models.embodiment.uninavid.rl_loss import (
+                all_reduce_uninavid_actor_diagnostic_stats,
+                finalize_uninavid_actor_diagnostics,
+                gather_uninavid_log_ratio_abs_values,
+                merge_uninavid_actor_diagnostic_stats,
+            )
+
+            diagnostic_stats = merge_uninavid_actor_diagnostic_stats(
+                uninavid_actor_diagnostic_stats
+            )
+            diagnostic_stats = all_reduce_uninavid_actor_diagnostic_stats(
+                diagnostic_stats
+            )
+            log_ratio_abs_values = (
+                torch.cat(uninavid_log_ratio_abs_values, dim=0)
+                if uninavid_log_ratio_abs_values
+                else torch.empty(0, dtype=torch.float32)
+            )
+            log_ratio_abs_values = gather_uninavid_log_ratio_abs_values(
+                log_ratio_abs_values
+            )
+            mean_metric_dict.update(
+                finalize_uninavid_actor_diagnostics(
+                    diagnostic_stats,
+                    log_ratio_abs_values,
+                )
+            )
 
         return mean_metric_dict
 

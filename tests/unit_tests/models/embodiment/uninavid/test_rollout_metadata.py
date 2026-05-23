@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from types import SimpleNamespace
 
 import pytest
@@ -153,7 +167,9 @@ def test_uninavid_generate_batch_outputs_can_return_scores(monkeypatch):
     monkeypatch.setattr(
         policy,
         "_update_slot_feature_cache",
-        lambda cache, visual_features, new_frames: torch.ones((1, 2), dtype=torch.float32),
+        lambda cache, visual_features, new_frames: torch.ones(
+            (1, 2), dtype=torch.float32
+        ),
     )
     monkeypatch.setattr(
         "rlinf.models.embodiment.uninavid.uninavid_action_model.build_navigation_visual_tokens",
@@ -276,6 +292,9 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
         "prompt_attention_mask",
         "response_ids",
         "response_mask",
+        "action",
+        "parsed_action_char_count",
+        "response_alpha_char_count",
     }
     assert metadata["forward_inputs"]["prompt_inputs_embeds"].shape == (1, 3, 2)
     assert metadata["forward_inputs"]["prompt_attention_mask"].shape == (1, 3)
@@ -283,6 +302,9 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
     assert metadata["forward_inputs"]["response_mask"].tolist() == [
         [True, True, False, False]
     ]
+    assert metadata["forward_inputs"]["action"].tolist() == [[0, 4, 4, 4]]
+    assert metadata["forward_inputs"]["parsed_action_char_count"].tolist() == [4]
+    assert metadata["forward_inputs"]["response_alpha_char_count"].tolist() == [4]
 
     expected = torch.log_softmax(generated_scores, dim=-1).gather(
         -1,
@@ -293,3 +315,45 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
         dim=1,
     )
     torch.testing.assert_close(metadata["prev_logprobs"], expected)
+
+
+def test_uninavid_train_metadata_records_response_text_diagnostic_counts(
+    monkeypatch,
+):
+    class DiagnosticTokenizer(_Tokenizer):
+        def batch_decode(self, response_ids, skip_special_tokens=True):
+            return ["forward left ignored", "123 !!!"]
+
+    policy = UniNaVidForActionPrediction(
+        tokenizer=DiagnosticTokenizer(),
+        model=_GenerateModel(outputs=None),
+        image_processor=None,
+    )
+    prompt_inputs_embeds = torch.ones((2, 3, 2), dtype=torch.float32)
+    prompt_attention_mask = torch.ones((2, 3), dtype=torch.long)
+    response_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    generated_scores = torch.zeros((2, 2, 5), dtype=torch.float32)
+
+    def fake_generate_outputs(env_obs, generation_kwargs, *, return_scores=False):
+        assert return_scores is True
+        return (
+            ["forward left ignored", "123 !!!"],
+            prompt_inputs_embeds,
+            prompt_attention_mask,
+            response_ids,
+            generated_scores,
+        )
+
+    monkeypatch.setattr(policy, "_generate_batch_outputs", fake_generate_outputs)
+
+    _actions, metadata = policy._predict_train_batch(
+        env_obs={},
+        generation_kwargs={"max_new_tokens": 2},
+        num_action_chunks=1,
+    )
+
+    forward_inputs = metadata["forward_inputs"]
+    assert forward_inputs["parsed_action_char_count"].dtype == torch.long
+    assert forward_inputs["response_alpha_char_count"].dtype == torch.long
+    assert forward_inputs["parsed_action_char_count"].tolist() == [7, 0]
+    assert forward_inputs["response_alpha_char_count"].tolist() == [18, 0]

@@ -389,6 +389,8 @@ class Trajectory:
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
+    # Optional generic transport; producers are opt-in and consumers may pop after use.
+    env_info: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def _generate_field_mask(
@@ -536,6 +538,8 @@ class EmbodiedRolloutResult:
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
+    # Defaults empty; UniNaVid/Habitat/GRPO EnvWorker is the current gated producer.
+    env_info: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
     def append_step_result(self, result: ChunkStepResult):
         if result.actions is not None:
@@ -627,6 +631,10 @@ class EmbodiedRolloutResult:
         self.curr_obs.append(curr_obs)
         self.next_obs.append(next_obs)
 
+    def append_env_info(self, env_info: dict[str, Any]):
+        # Generic optional transport; actor diagnostics consume and remove it.
+        self.env_info.append(env_info)
+
     def to_trajectory(self) -> Trajectory:
         # return [trajectory_length, B, ...]
         trajectory = Trajectory(
@@ -675,6 +683,10 @@ class EmbodiedRolloutResult:
             trajectory.next_obs = stack_list_of_dict_tensor(self.next_obs)
             for key in trajectory.next_obs.keys():
                 trajectory.next_obs[key] = trajectory.next_obs[key].cpu().contiguous()
+        if len(self.env_info) > 0:
+            trajectory.env_info = stack_list_of_dict_tensor(self.env_info)
+            for key in trajectory.env_info.keys():
+                trajectory.env_info[key] = trajectory.env_info[key].cpu().contiguous()
 
         trajectory.model_weights_id = get_model_weights_id(
             trajectory.versions
@@ -702,6 +714,12 @@ class EmbodiedRolloutResult:
             )
             for i in range(split_size):
                 splited_trajectories[i].next_obs = splited_obs[i]
+        if len(all_trajectory.env_info) > 0:
+            splited_env_info = split_dict_to_chunk(
+                all_trajectory.env_info, split_size, dim=1
+            )
+            for i in range(split_size):
+                splited_trajectories[i].env_info = splited_env_info[i]
 
         if (
             all_trajectory.forward_inputs is not None
@@ -770,6 +788,18 @@ def convert_trajectories_to_batch(
             ]
             if tensors:
                 batch["next_obs"][key] = torch.cat(tensors, dim=1)
+
+    if any(traj.env_info for traj in trajectories):
+        all_keys: set[str] = set()
+        for traj in trajectories:
+            all_keys.update(traj.env_info.keys())
+        batch["env_info"] = {}
+        for key in all_keys:
+            tensors = [
+                traj.env_info[key] for traj in trajectories if key in traj.env_info
+            ]
+            if tensors:
+                batch["env_info"][key] = torch.cat(tensors, dim=1)
 
     if trajectories[0].forward_inputs:
         all_keys: set[str] = set()

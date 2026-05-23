@@ -37,6 +37,8 @@ from rlinf.models.embodiment.uninavid.model.uninavid_arch import (
 from rlinf.models.embodiment.uninavid.nav_rollout import (
     UniNaVidNavCache,
     build_navigation_prompt,
+    count_parsed_action_chars,
+    count_response_alpha_chars,
     empty_rollout_metadata,
     episode_id_from_obs,
     get_slot_cache,
@@ -87,6 +89,10 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
     @property
     def _no_split_names(self) -> list[str]:
         return list(self._UNINAVID_FSDP_WRAP_NAMES)
+
+    @property
+    def num_action_chunks(self) -> int:
+        return self._get_num_action_chunks(mode="train")
 
     @classmethod
     def from_pretrained(
@@ -380,12 +386,18 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             return_scores=True,
         )
         action_chunks = []
+        parsed_action_char_counts = []
+        response_alpha_char_counts = []
         for output_text in output_texts:
             parsed_actions = parse_uninavid_actions(
                 output_text.strip(),
                 num_action_chunks,
             )
             action_chunks.append(parsed_actions)
+            parsed_action_char_counts.append(
+                count_parsed_action_chars(output_text, num_action_chunks)
+            )
+            response_alpha_char_counts.append(count_response_alpha_chars(output_text))
         actions = torch.stack(action_chunks, dim=0)
         max_new_tokens = generation_kwargs.get("max_new_tokens")
         if max_new_tokens is None:
@@ -435,9 +447,31 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 "prompt_attention_mask": prompt_attention_mask.detach(),
                 "response_ids": response_ids.detach(),
                 "response_mask": response_mask.detach(),
+                "action": actions.reshape(actions.shape[0], -1).detach(),
+                "parsed_action_char_count": torch.tensor(
+                    parsed_action_char_counts,
+                    dtype=torch.long,
+                    device=response_ids.device,
+                ),
+                "response_alpha_char_count": torch.tensor(
+                    response_alpha_char_counts,
+                    dtype=torch.long,
+                    device=response_ids.device,
+                ),
             },
         }
         return actions, metadata
+
+    def _predict_train_batch_cached(
+        self,
+        env_obs: dict[str, Any],
+        generation_kwargs: dict[str, Any],
+    ):
+        return self._predict_train_batch(
+            env_obs,
+            generation_kwargs,
+            num_action_chunks=self._get_num_action_chunks(mode="train"),
+        )
 
     def _generate_batch_outputs(
         self,

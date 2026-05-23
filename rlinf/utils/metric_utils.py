@@ -53,9 +53,15 @@ def count_trajectories(metrics_dict):
     if not metrics_dict:
         return 0
 
-    # Use the first metric tensor to get the trajectory count
-    # All metrics should have the same first dimension (number of trajectories)
-    first_key = next(iter(metrics_dict.keys()))
+    countable_keys = [
+        key for key in metrics_dict.keys() if not key.startswith("action/")
+    ]
+    if not countable_keys:
+        return 0
+
+    # Use the first non-diagnostic metric tensor to get the trajectory count.
+    # Action distribution diagnostics are per-step ratios, not trajectory records.
+    first_key = countable_keys[0]
     first_tensor = metrics_dict[first_key]
 
     if isinstance(first_tensor, torch.Tensor):

@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
@@ -27,7 +28,7 @@ from rlinf.data.embodied_io_struct import (
     RolloutResult,
     Trajectory,
 )
-from rlinf.envs import get_env_cls
+from rlinf.envs import SupportedEnvType, get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
@@ -546,6 +547,41 @@ class EnvWorker(Worker):
         )
         return env_output, env_info
 
+    def _compute_eval_action_metrics(
+        self, raw_chunk_actions
+    ) -> dict[str, torch.Tensor]:
+        if (
+            SupportedModel(self.cfg.actor.model.model_type) != SupportedModel.UNINAVID
+            or SupportedEnvType(self.cfg.env.eval.env_type) != SupportedEnvType.HABITAT
+        ):
+            return {}
+
+        from rlinf.models.embodiment.uninavid.nav_rollout import (
+            NO_OP_ACTION_ID,
+            STOP_ACTION_ID,
+        )
+
+        actions = torch.as_tensor(raw_chunk_actions)
+        if actions.numel() == 0:
+            empty = torch.empty(0, dtype=torch.float32)
+            return {
+                "action/stop_ratio": empty,
+                "action/no_op_ratio": empty.clone(),
+            }
+        actions = actions.reshape(-1)
+        return {
+            "action/stop_ratio": (actions == STOP_ACTION_ID)
+            .float()
+            .mean()
+            .reshape(1)
+            .cpu(),
+            "action/no_op_ratio": (actions == NO_OP_ACTION_ID)
+            .float()
+            .mean()
+            .reshape(1)
+            .cpu(),
+        }
+
     def _build_chunk_final_obs(self, obs_list, infos_list):
         """Build per-env terminal observations for a whole chunk.
 
@@ -963,6 +999,41 @@ class EnvWorker(Worker):
             else:
                 env_metrics[key].append(value)
 
+    def _should_send_uninavid_habitat_grpo_env_info(self) -> bool:
+        return (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.UNINAVID
+            and SupportedEnvType(self.cfg.env.train.env_type)
+            == SupportedEnvType.HABITAT
+            and self.cfg.algorithm.adv_type == "grpo"
+            and self.cfg.algorithm.get("filter_rewards", False)
+        )
+
+    def _append_uninavid_habitat_grpo_env_info(
+        self,
+        rollout_result: EmbodiedRolloutResult,
+        env_info: dict[str, Any],
+        dones: torch.Tensor,
+    ) -> None:
+        if not self._should_send_uninavid_habitat_grpo_env_info():
+            return
+
+        if self.cfg.env.train.get("auto_reset", False):
+            done_mask = dones[:, -1].to(torch.bool)
+            success = torch.zeros(dones.shape[0], dtype=torch.float32)
+            if done_mask.any():
+                if "success" not in env_info:
+                    raise KeyError(
+                        "Habitat UniNaVid GRPO diagnostics require env_info['success']."
+                    )
+                success[done_mask.cpu()] = env_info["success"].to(torch.float32)
+        else:
+            if "success" not in env_info:
+                raise KeyError(
+                    "Habitat UniNaVid GRPO diagnostics require env_info['success']."
+                )
+            success = env_info["success"].to(torch.float32)
+        rollout_result.append_env_info({"success": success})
+
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
         self.last_intervened_info_list = [
@@ -1082,6 +1153,9 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
+                    self._append_uninavid_habitat_grpo_env_info(
+                        self.rollout_results[stage_id], env_info, env_output.dones
+                    )
                     self.record_env_metrics(env_metrics, env_info, epoch)
 
             for stage_id in range(self.stage_num):
@@ -1192,6 +1266,9 @@ class EnvWorker(Worker):
                     )
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
+                    )
+                    env_info.update(
+                        self._compute_eval_action_metrics(raw_chunk_actions)
                     )
 
                     for key, value in env_info.items():
