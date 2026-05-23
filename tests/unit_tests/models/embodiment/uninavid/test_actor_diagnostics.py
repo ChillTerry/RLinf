@@ -15,14 +15,17 @@
 import math
 
 import torch
+from omegaconf import OmegaConf
 
 from rlinf.models.embodiment.uninavid.rl_loss import (
     compute_uninavid_actor_diagnostic_stats,
     compute_uninavid_actor_diagnostics,
+    compute_uninavid_reference_drift_diagnostics,
     finalize_uninavid_actor_diagnostics,
     gather_uninavid_log_ratio_abs_values,
     merge_uninavid_actor_diagnostic_stats,
 )
+from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 def test_actor_diagnostics_use_only_masked_token_positions():
@@ -163,3 +166,82 @@ def test_gather_log_ratio_abs_values_without_dist_returns_flat_values(monkeypatc
     values = gather_uninavid_log_ratio_abs_values(torch.tensor([[0.1], [0.2]]))
 
     torch.testing.assert_close(values, torch.tensor([0.1, 0.2]))
+
+
+def test_reference_drift_diagnostics_use_only_masked_token_positions():
+    metrics = compute_uninavid_reference_drift_diagnostics(
+        logprobs=torch.tensor([[[0.2], [0.0], [-0.3]]], dtype=torch.float32),
+        ref_logprobs=torch.tensor([[[0.0], [0.4], [-0.1]]], dtype=torch.float32),
+        loss_mask=torch.tensor([[[True], [False], [True]]]),
+    )
+
+    valid_log_ratio = torch.tensor([0.2, -0.2], dtype=torch.float32)
+    valid_ratio = valid_log_ratio.exp()
+
+    assert math.isclose(
+        metrics["actor/ref_log_ratio_abs_mean"],
+        valid_log_ratio.abs().mean().item(),
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        metrics["actor/ref_log_ratio_p95_abs"],
+        torch.quantile(valid_log_ratio.abs(), 0.95).item(),
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        metrics["actor/ref_approx_kl_k2"],
+        (0.5 * (valid_log_ratio**2).mean()).item(),
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        metrics["actor/ref_ratio_abs"],
+        (valid_ratio - 1.0).abs().mean().item(),
+        rel_tol=1e-6,
+    )
+    assert metrics["actor/ref_valid_token_count"] == 2.0
+
+
+def test_reference_drift_logprobs_are_requested_only_for_uninavid_habitat():
+    cfg = OmegaConf.create(
+        {
+            "actor": {"model": {"model_type": "uninavid"}},
+            "env": {"train": {"env_type": "habitat"}},
+            "algorithm": {
+                "kl_beta": 0.0,
+                "reinpp_kl_beta": 0.0,
+                "log_reference_drift": True,
+            },
+        }
+    )
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.cfg = cfg
+    actor.kl_beta = 0.0
+    actor.reinpp_kl_beta = 0.0
+
+    assert actor._should_log_uninavid_reference_drift()
+    assert actor._should_compute_ref_logprobs()
+
+    actor.cfg.env.train.env_type = "libero"
+
+    assert not actor._should_log_uninavid_reference_drift()
+    assert not actor._should_compute_ref_logprobs()
+
+
+def test_reference_drift_logprobs_are_not_requested_without_env_config():
+    cfg = OmegaConf.create(
+        {
+            "actor": {"model": {"model_type": "uninavid"}},
+            "algorithm": {
+                "kl_beta": 0.0,
+                "reinpp_kl_beta": 0.0,
+                "log_reference_drift": True,
+            },
+        }
+    )
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.cfg = cfg
+    actor.kl_beta = 0.0
+    actor.reinpp_kl_beta = 0.0
+
+    assert not actor._should_log_uninavid_reference_drift()
+    assert not actor._should_compute_ref_logprobs()

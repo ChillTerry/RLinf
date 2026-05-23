@@ -280,3 +280,45 @@ def finalize_uninavid_actor_diagnostics(
 def compute_uninavid_actor_diagnostics(**kwargs) -> dict[str, float]:
     stats, log_ratio_abs_values = compute_uninavid_actor_diagnostic_stats(**kwargs)
     return finalize_uninavid_actor_diagnostics(stats, log_ratio_abs_values)
+
+
+def compute_uninavid_reference_drift_diagnostics(
+    *,
+    logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> dict[str, float]:
+    if ref_logprobs.shape != logprobs.shape:
+        raise ValueError("UniNaVid ref_logprobs must match logprobs shape.")
+    if loss_mask.shape != logprobs.shape:
+        raise ValueError("UniNaVid reference drift loss_mask must match logprobs.")
+
+    with torch.no_grad():
+        loss_mask = loss_mask.to(torch.bool)
+        valid_token_count = loss_mask.sum()
+        if valid_token_count.item() == 0:
+            return {
+                "actor/ref_log_ratio_abs_mean": 0.0,
+                "actor/ref_log_ratio_p95_abs": 0.0,
+                "actor/ref_approx_kl_k2": 0.0,
+                "actor/ref_ratio_abs": 0.0,
+                "actor/ref_valid_token_count": 0.0,
+            }
+
+        log_ratio = logprobs.float() - ref_logprobs.float()
+        valid_log_ratio = log_ratio[loss_mask]
+        valid_log_ratio_abs = valid_log_ratio.abs()
+        valid_ratio = valid_log_ratio.exp()
+
+        return {
+            "actor/ref_log_ratio_abs_mean": valid_log_ratio_abs.mean().item(),
+            "actor/ref_log_ratio_p95_abs": torch.quantile(
+                valid_log_ratio_abs.float(),
+                0.95,
+            ).item(),
+            "actor/ref_approx_kl_k2": (
+                0.5 * (valid_log_ratio.float() ** 2).mean()
+            ).item(),
+            "actor/ref_ratio_abs": (valid_ratio - 1.0).abs().mean().item(),
+            "actor/ref_valid_token_count": float(valid_token_count.item()),
+        }

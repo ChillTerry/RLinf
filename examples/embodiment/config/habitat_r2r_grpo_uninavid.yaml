@@ -73,6 +73,7 @@ algorithm:
   filter_rewards: True
   rewards_lower_bound: 1.0
   rewards_upper_bound: 12.0
+  log_reference_drift: True
 
   sampling_params:
     do_sample: True

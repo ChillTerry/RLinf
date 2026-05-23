@@ -210,9 +210,7 @@ class FSDPActor(FSDPModelManager, Worker):
         doing a handshake with inference workers.
         """
         self.setup_model_and_optimizer()
-        if (
-            self.kl_beta > 0 or self.reinpp_kl_beta > 0
-        ) and self.combine_reference_model:
+        if self._should_compute_ref_logprobs() and self.combine_reference_model:
             self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
             self.offload_model_buffer = {}
 
@@ -220,6 +218,23 @@ class FSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
+
+    def _should_log_uninavid_reference_drift(self) -> bool:
+        env_type = OmegaConf.select(self.cfg, "env.train.env_type")
+        return (
+            self.cfg.algorithm.get("log_reference_drift", False)
+            and SupportedModel(self.cfg.actor.model.model_type)
+            == SupportedModel.UNINAVID
+            and env_type is not None
+            and SupportedEnvType(env_type) == SupportedEnvType.HABITAT
+        )
+
+    def _should_compute_ref_logprobs(self) -> bool:
+        return (
+            self.kl_beta > 0
+            or self.reinpp_kl_beta > 0
+            or self._should_log_uninavid_reference_drift()
+        )
 
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """Setup destination ranks for token and weight communication."""
@@ -1014,6 +1029,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             and self.cfg.algorithm.get("filter_rewards", False)
         )
 
+    def _should_log_uninavid_reference_drift(self) -> bool:
+        env_type = OmegaConf.select(self.cfg, "env.train.env_type")
+        return (
+            self.cfg.algorithm.get("log_reference_drift", False)
+            and SupportedModel(self.cfg.actor.model.model_type)
+            == SupportedModel.UNINAVID
+            and env_type is not None
+            and SupportedEnvType(env_type) == SupportedEnvType.HABITAT
+        )
+
+    def _should_compute_ref_logprobs(self) -> bool:
+        return self._should_log_uninavid_reference_drift()
+
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
         Setup destination ranks for weight communication.
@@ -1038,6 +1066,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if needed, offload model parameters and optimizer states to CPU.
         """
         self.setup_model_and_optimizer()
+
+        if self._should_log_uninavid_reference_drift():
+            self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+            self.offload_model_buffer = {}
+        else:
+            self.ref_policy_state_dict = None
+            self.offload_model_buffer = {}
 
         if self.enable_offload:
             self.offload_param_and_grad()
@@ -1534,6 +1569,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         from rlinf.algorithms.utils import postprocess_loss_metric
                         from rlinf.models.embodiment.uninavid.rl_loss import (
                             compute_uninavid_actor_diagnostic_stats,
+                            compute_uninavid_reference_drift_diagnostics,
                             prepare_uninavid_token_level_loss_inputs,
                         )
 
@@ -1584,6 +1620,32 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
                             )
                         )
+                        if self._should_log_uninavid_reference_drift():
+                            if self.ref_policy_state_dict is None:
+                                raise KeyError(
+                                    "UniNaVid reference drift diagnostics require initial reference weights."
+                                )
+                            with torch.no_grad():
+                                with cpu_weight_swap(
+                                    self.model,
+                                    self.ref_policy_state_dict,
+                                    self.offload_model_buffer,
+                                ):
+                                    ref_output_dict = self.model(
+                                        forward_inputs=forward_inputs,
+                                        compute_logprobs=True,
+                                        compute_entropy=False,
+                                        compute_values=False,
+                                        use_cache=False,
+                                    )
+                            ref_drift_metrics = (
+                                compute_uninavid_reference_drift_diagnostics(
+                                    logprobs=prepared_loss_inputs["logprobs"],
+                                    ref_logprobs=ref_output_dict["logprobs"].float(),
+                                    loss_mask=prepared_loss_inputs["loss_mask"],
+                                )
+                            )
+                            metrics_data.update(ref_drift_metrics)
                         uninavid_actor_diagnostic_stats.append(diagnostic_stats)
                         if log_ratio_abs_values.numel() > 0:
                             uninavid_log_ratio_abs_values.append(
