@@ -58,6 +58,7 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+        self.eval_episode_action_metrics: dict[int, dict[str, torch.Tensor]] = {}
         self.rollout_epoch = self.cfg.algorithm.get("rollout_epoch", 1)
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
@@ -488,7 +489,7 @@ class EnvWorker(Worker):
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
-    ) -> tuple[EnvOutput, dict[str, Any]]:
+    ) -> tuple[EnvOutput, dict[str, Any], torch.Tensor]:
         """
         This function is used to evaluate the environment.
         """
@@ -545,7 +546,7 @@ class EnvWorker(Worker):
             obs=extracted_obs,
             final_obs=final_obs,
         )
-        return env_output, env_info
+        return env_output, env_info, done_mask.detach().cpu()
 
     def _compute_eval_action_metrics(
         self, raw_chunk_actions
@@ -581,6 +582,113 @@ class EnvWorker(Worker):
             .reshape(1)
             .cpu(),
         }
+
+    def _should_compute_eval_action_metrics(self) -> bool:
+        return (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.UNINAVID
+            and SupportedEnvType(self.cfg.env.eval.env_type) == SupportedEnvType.HABITAT
+        )
+
+    def _reset_eval_episode_action_metrics(self, stage_id: int) -> None:
+        if not hasattr(self, "eval_episode_action_metrics"):
+            self.eval_episode_action_metrics = {}
+        max_episode_steps = int(self.cfg.env.eval.max_episode_steps)
+        num_envs = int(self.eval_num_envs_per_stage)
+        self.eval_episode_action_metrics[stage_id] = {
+            "first_stop_step": torch.full(
+                (num_envs,),
+                float(max_episode_steps + 1),
+                dtype=torch.float32,
+            ),
+            "valid_move_count": torch.zeros(num_envs, dtype=torch.float32),
+            "action_count": torch.zeros(num_envs, dtype=torch.float32),
+        }
+
+    def _update_eval_episode_action_metrics(
+        self,
+        raw_chunk_actions,
+        stage_id: int,
+    ) -> None:
+        if not self._should_compute_eval_action_metrics():
+            return
+
+        from rlinf.models.embodiment.uninavid.nav_rollout import (
+            FORWARD_ACTION_ID,
+            LEFT_ACTION_ID,
+            RIGHT_ACTION_ID,
+            STOP_ACTION_ID,
+        )
+
+        if (
+            not hasattr(self, "eval_episode_action_metrics")
+            or stage_id not in self.eval_episode_action_metrics
+        ):
+            self._reset_eval_episode_action_metrics(stage_id)
+
+        actions = torch.as_tensor(raw_chunk_actions).detach().cpu()
+        if actions.numel() == 0:
+            return
+        actions = actions.reshape(actions.shape[0], -1)
+        state = self.eval_episode_action_metrics[stage_id]
+        max_episode_steps = int(self.cfg.env.eval.max_episode_steps)
+        unset_stop_value = float(max_episode_steps + 1)
+        valid_move_actions = torch.tensor(
+            [FORWARD_ACTION_ID, LEFT_ACTION_ID, RIGHT_ACTION_ID],
+            dtype=actions.dtype,
+        )
+
+        for env_idx in range(actions.shape[0]):
+            for action in actions[env_idx]:
+                if state["first_stop_step"][env_idx] != unset_stop_value:
+                    break
+                if state["action_count"][env_idx] >= max_episode_steps:
+                    break
+                state["action_count"][env_idx] += 1.0
+                if (action == valid_move_actions).any():
+                    state["valid_move_count"][env_idx] += 1.0
+                if (
+                    int(action.item()) == STOP_ACTION_ID
+                    and state["first_stop_step"][env_idx] == unset_stop_value
+                ):
+                    state["first_stop_step"][env_idx] = state["action_count"][env_idx]
+
+    def _collect_eval_episode_action_metrics(
+        self,
+        stage_id: int,
+        done_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if not self._should_compute_eval_action_metrics():
+            return {}
+
+        if (
+            not hasattr(self, "eval_episode_action_metrics")
+            or stage_id not in self.eval_episode_action_metrics
+        ):
+            self._reset_eval_episode_action_metrics(stage_id)
+
+        done_mask = torch.as_tensor(done_mask, dtype=torch.bool).detach().cpu()
+        state = self.eval_episode_action_metrics[stage_id]
+        if done_mask.numel() == 0 or not done_mask.any():
+            empty = torch.empty(0, dtype=torch.float32)
+            return {
+                "action/first_stop_step": empty,
+                "action/valid_move_ratio": empty.clone(),
+            }
+
+        action_count = state["action_count"][done_mask].clamp_min(1.0)
+        metrics = {
+            "action/first_stop_step": state["first_stop_step"][done_mask].clone(),
+            "action/valid_move_ratio": (
+                state["valid_move_count"][done_mask] / action_count
+            ).clone(),
+        }
+
+        max_episode_steps = int(self.cfg.env.eval.max_episode_steps)
+        state["first_stop_step"][done_mask] = float(max_episode_steps + 1)
+        state["valid_move_count"][done_mask] = 0.0
+        state["action_count"][done_mask] = 0.0
+
+        return metrics
 
     def _build_chunk_final_obs(self, obs_list, infos_list):
         """Build per-env terminal observations for a whole chunk.
@@ -1240,6 +1348,8 @@ class EnvWorker(Worker):
                     self.eval_prev_done[stage_id] = torch.zeros(
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
+                    if self._should_compute_eval_action_metrics():
+                        self._reset_eval_episode_action_metrics(stage_id)
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
                     env_output = EnvOutput(
                         obs=extracted_obs,
@@ -1264,11 +1374,20 @@ class EnvWorker(Worker):
                     raw_chunk_actions = self.recv_chunk_actions(
                         input_channel, mode="eval"
                     )
-                    env_output, env_info = self.env_evaluate_step(
+                    self._update_eval_episode_action_metrics(
+                        raw_chunk_actions, stage_id
+                    )
+                    env_output, env_info, done_mask = self.env_evaluate_step(
                         raw_chunk_actions, stage_id
                     )
                     env_info.update(
                         self._compute_eval_action_metrics(raw_chunk_actions)
+                    )
+                    env_info.update(
+                        self._collect_eval_episode_action_metrics(
+                            stage_id,
+                            done_mask,
+                        )
                     )
 
                     for key, value in env_info.items():

@@ -32,7 +32,10 @@ from rlinf.models.embodiment.uninavid.grpo_diagnostics import (
     reduce_success_to_trajectory_success,
 )
 from rlinf.models.embodiment.uninavid.nav_rollout import (
+    FORWARD_ACTION_ID,
+    LEFT_ACTION_ID,
     NO_OP_ACTION_ID,
+    RIGHT_ACTION_ID,
     STOP_ACTION_ID,
 )
 from rlinf.utils.metric_utils import compute_evaluate_metrics, count_trajectories
@@ -623,6 +626,108 @@ def test_eval_action_metrics_empty_input_returns_empty_metric_tensors():
 
     assert metrics["action/stop_ratio"].numel() == 0
     assert metrics["action/no_op_ratio"].numel() == 0
+
+
+def test_eval_episode_action_metrics_track_first_stop_and_valid_moves():
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {"model": {"model_type": "uninavid"}},
+            "env": {"eval": {"env_type": "habitat", "max_episode_steps": 5}},
+        }
+    )
+    worker.eval_num_envs_per_stage = 3
+
+    worker._reset_eval_episode_action_metrics(stage_id=0)
+    worker._update_eval_episode_action_metrics(
+        torch.tensor(
+            [
+                [[FORWARD_ACTION_ID], [LEFT_ACTION_ID]],
+                [[FORWARD_ACTION_ID], [STOP_ACTION_ID]],
+                [[NO_OP_ACTION_ID], [RIGHT_ACTION_ID]],
+            ],
+            dtype=torch.long,
+        ),
+        stage_id=0,
+    )
+    worker._update_eval_episode_action_metrics(
+        torch.tensor(
+            [
+                [[RIGHT_ACTION_ID], [STOP_ACTION_ID]],
+                [[FORWARD_ACTION_ID], [LEFT_ACTION_ID]],
+                [[FORWARD_ACTION_ID], [LEFT_ACTION_ID]],
+            ],
+            dtype=torch.long,
+        ),
+        stage_id=0,
+    )
+
+    metrics = worker._collect_eval_episode_action_metrics(
+        stage_id=0,
+        done_mask=torch.tensor([True, True, False]),
+    )
+
+    torch.testing.assert_close(
+        metrics["action/first_stop_step"],
+        torch.tensor([4.0, 2.0]),
+    )
+    torch.testing.assert_close(
+        metrics["action/valid_move_ratio"],
+        torch.tensor([0.75, 0.5]),
+    )
+
+
+def test_eval_episode_action_metrics_use_timeout_sentinel_and_reset_done_envs():
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {"model": {"model_type": "uninavid"}},
+            "env": {"eval": {"env_type": "habitat", "max_episode_steps": 3}},
+        }
+    )
+    worker.eval_num_envs_per_stage = 1
+
+    worker._reset_eval_episode_action_metrics(stage_id=0)
+    worker._update_eval_episode_action_metrics(
+        torch.tensor([[[FORWARD_ACTION_ID], [NO_OP_ACTION_ID]]], dtype=torch.long),
+        stage_id=0,
+    )
+    worker._update_eval_episode_action_metrics(
+        torch.tensor([[[LEFT_ACTION_ID], [RIGHT_ACTION_ID]]], dtype=torch.long),
+        stage_id=0,
+    )
+
+    metrics = worker._collect_eval_episode_action_metrics(
+        stage_id=0,
+        done_mask=torch.tensor([True]),
+    )
+
+    torch.testing.assert_close(
+        metrics["action/first_stop_step"],
+        torch.tensor([4.0]),
+    )
+    torch.testing.assert_close(
+        metrics["action/valid_move_ratio"],
+        torch.tensor([2.0 / 3.0]),
+    )
+
+    worker._update_eval_episode_action_metrics(
+        torch.tensor([[[STOP_ACTION_ID], [NO_OP_ACTION_ID]]], dtype=torch.long),
+        stage_id=0,
+    )
+    metrics = worker._collect_eval_episode_action_metrics(
+        stage_id=0,
+        done_mask=torch.tensor([True]),
+    )
+
+    torch.testing.assert_close(
+        metrics["action/first_stop_step"],
+        torch.tensor([1.0]),
+    )
+    torch.testing.assert_close(
+        metrics["action/valid_move_ratio"],
+        torch.tensor([0.0]),
+    )
 
 
 def test_eval_action_metrics_do_not_drive_trajectory_count():

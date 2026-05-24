@@ -186,6 +186,16 @@ class EmbodiedRunner:
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
         return eval_metrics
 
+    def _evaluate_at_start(self):
+        if not self.cfg.runner.get("eval_at_start", False):
+            return
+
+        with self.timer("eval"):
+            self.update_rollout_weights()
+            eval_metrics = self.evaluate()
+            eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+            self.metric_logger.log(data=eval_metrics, step=0)
+
     def _log_ranked_metrics(
         self,
         metrics_list: list[dict] | None,
@@ -279,6 +289,8 @@ class EmbodiedRunner:
     def run(self):
         start_step = self.global_step
         start_time = time.time()
+        if start_step == 0:
+            self._evaluate_at_start()
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)
@@ -348,7 +360,10 @@ class EmbodiedRunner:
                         if self.save_best_ckpt:
                             self._save_best_checkpoint(eval_metrics)
                         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                        self.metric_logger.log(data=eval_metrics, step=_step)
+                        self.metric_logger.log(
+                            data=eval_metrics,
+                            step=self.global_step,
+                        )
 
                 if save_model:
                     self._save_checkpoint()

@@ -22,8 +22,16 @@ from rlinf.runners.embodied_runner import EmbodiedRunner
 
 
 class _ImmediateHandle:
+    def __init__(self, result=None):
+        self.result = result
+
     def wait(self):
-        return None
+        return self.result
+
+    def consume_durations(self, return_per_rank=False):
+        if return_per_rank:
+            return {}, []
+        return {}
 
 
 def _make_runner(tmp_path: Path) -> EmbodiedRunner:
@@ -139,3 +147,129 @@ def test_save_best_ckpt_requires_validation_interval():
         assert "save_best_ckpt requires runner.val_check_interval > 0" in str(exc)
     else:
         raise AssertionError("validate_embodied_cfg should reject disabled eval")
+
+
+def test_eval_at_start_logs_eval_metrics_at_step_zero(tmp_path):
+    cfg = OmegaConf.create(
+        {
+            "runner": {
+                "weight_sync_interval": 1,
+                "overlap_env_bootstrap": False,
+                "eval_at_start": True,
+                "save_best_ckpt": False,
+                "best_metric": "success",
+                "best_metric_criteria": "max",
+                "max_epochs": 1,
+                "max_steps": 0,
+                "logger": {
+                    "log_path": str(tmp_path),
+                    "experiment_name": "initial_eval",
+                },
+            }
+        }
+    )
+
+    runner = object.__new__(EmbodiedRunner)
+    runner.cfg = cfg
+    runner.global_step = 0
+    runner.max_steps = 0
+    runner.weight_sync_interval = 1
+    runner.save_best_ckpt = False
+    runner.best_metric = "success"
+    runner.best_metric_criteria = "max"
+    runner.best_metric_value = float("-inf")
+    runner.enable_per_worker_metric_log = False
+    runner.metric_logger = MagicMock()
+    runner.timer = MagicMock()
+    runner.timer.return_value.__enter__.return_value = None
+    runner.timer.return_value.__exit__.return_value = None
+    runner.update_rollout_weights = MagicMock()
+    runner.evaluate = MagicMock(return_value={"success": 0.5})
+    runner.print_metrics_table_async = MagicMock()
+    runner.stop_logging = False
+    runner.log_queue = MagicMock()
+    runner.log_thread = MagicMock()
+
+    runner.run()
+
+    runner.update_rollout_weights.assert_called_once()
+    runner.evaluate.assert_called_once()
+    runner.metric_logger.log.assert_any_call(
+        data={"eval/success": 0.5},
+        step=0,
+    )
+    runner.metric_logger.finish.assert_called_once()
+
+
+def test_eval_at_start_logs_post_update_eval_at_global_step(tmp_path):
+    cfg = OmegaConf.create(
+        {
+            "runner": {
+                "weight_sync_interval": 1,
+                "overlap_env_bootstrap": False,
+                "eval_at_start": True,
+                "save_best_ckpt": False,
+                "best_metric": "success",
+                "best_metric_criteria": "max",
+                "val_check_interval": 1,
+                "save_interval": -1,
+                "max_epochs": 1,
+                "max_steps": 1,
+                "logger": {
+                    "log_path": str(tmp_path),
+                    "experiment_name": "initial_eval",
+                },
+            }
+        }
+    )
+
+    runner = object.__new__(EmbodiedRunner)
+    runner.cfg = cfg
+    runner.global_step = 0
+    runner.max_steps = 1
+    runner.weight_sync_interval = 1
+    runner.overlap_env_bootstrap = False
+    runner.reward = None
+    runner.reward_channel = None
+    runner.env_channel = MagicMock()
+    runner.rollout_channel = MagicMock()
+    runner.actor_channel = MagicMock()
+    runner.save_best_ckpt = False
+    runner.best_metric = "success"
+    runner.best_metric_criteria = "max"
+    runner.best_metric_value = float("-inf")
+    runner.enable_per_worker_metric_log = False
+    runner.metric_logger = MagicMock()
+    runner.timer = MagicMock()
+    runner.timer.return_value.__enter__.return_value = None
+    runner.timer.return_value.__exit__.return_value = None
+    runner.timer.consume_durations.return_value = {}
+    runner.update_rollout_weights = MagicMock()
+    runner.evaluate = MagicMock(
+        side_effect=[
+            {"success": 0.5},
+            {"success": 0.6},
+        ]
+    )
+    runner.print_metrics_table_async = MagicMock()
+    runner.stop_logging = False
+    runner.log_queue = MagicMock()
+    runner.log_thread = MagicMock()
+
+    runner.actor = MagicMock()
+    runner.actor.recv_rollout_trajectories.return_value = _ImmediateHandle()
+    runner.actor.compute_advantages_and_returns.return_value = _ImmediateHandle([])
+    runner.actor.run_training.return_value = _ImmediateHandle([])
+    runner.rollout = MagicMock()
+    runner.rollout.generate.return_value = _ImmediateHandle()
+    runner.env = MagicMock()
+    runner.env.interact.return_value = _ImmediateHandle([])
+
+    runner.run()
+
+    eval_log_steps = [
+        call.kwargs["step"]
+        for call in runner.metric_logger.log.call_args_list
+        if call.kwargs.get("data", {}).get("eval/success") is not None
+    ]
+    assert eval_log_steps == [0, 1]
