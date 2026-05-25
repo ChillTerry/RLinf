@@ -24,8 +24,22 @@ from rlinf.models.embodiment.uninavid.rl_loss import (
     finalize_uninavid_actor_diagnostics,
     gather_uninavid_log_ratio_abs_values,
     merge_uninavid_actor_diagnostic_stats,
+    prepare_uninavid_token_level_loss_inputs,
 )
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+
+def test_prepare_loss_inputs_restricts_mask_to_action_tokens():
+    prepared = prepare_uninavid_token_level_loss_inputs(
+        logprobs=torch.zeros((1, 4, 1), dtype=torch.float32),
+        old_logprobs=torch.zeros((1, 4, 1), dtype=torch.float32),
+        advantages=torch.ones((1, 1, 1), dtype=torch.float32),
+        response_mask=torch.tensor([[True, True, True, False]]),
+        action_token_mask=torch.tensor([[True, False, True, True]]),
+        sample_loss_mask=torch.tensor([[[True], [True], [False], [True]]]),
+    )
+
+    assert prepared["loss_mask"].tolist() == [[[True], [False], [False], [False]]]
 
 
 def test_actor_diagnostics_use_only_masked_token_positions():

@@ -292,6 +292,7 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
         "prompt_attention_mask",
         "response_ids",
         "response_mask",
+        "action_token_mask",
         "action",
         "parsed_action_char_count",
         "response_alpha_char_count",
@@ -301,6 +302,9 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
     assert metadata["forward_inputs"]["response_ids"].tolist() == [[1, 2, 0, 0]]
     assert metadata["forward_inputs"]["response_mask"].tolist() == [
         [True, True, False, False]
+    ]
+    assert metadata["forward_inputs"]["action_token_mask"].tolist() == [
+        [False, False, False, False]
     ]
     assert metadata["forward_inputs"]["action"].tolist() == [[0, 4, 4, 4]]
     assert metadata["forward_inputs"]["parsed_action_char_count"].tolist() == [4]

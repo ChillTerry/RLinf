@@ -36,6 +36,7 @@ from rlinf.models.embodiment.uninavid.model.uninavid_arch import (
 )
 from rlinf.models.embodiment.uninavid.nav_rollout import (
     UniNaVidNavCache,
+    build_action_token_mask,
     build_navigation_prompt,
     count_parsed_action_chars,
     count_response_alpha_chars,
@@ -386,19 +387,32 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             return_scores=True,
         )
         action_chunks = []
+        action_token_masks = []
         parsed_action_char_counts = []
         response_alpha_char_counts = []
-        for output_text in output_texts:
+        for output_text, response_id in zip(output_texts, response_ids):
             parsed_actions = parse_uninavid_actions(
                 output_text.strip(),
                 num_action_chunks,
             )
             action_chunks.append(parsed_actions)
+            action_token_masks.append(
+                torch.tensor(
+                    build_action_token_mask(
+                        output_text,
+                        response_id,
+                        num_action_chunks,
+                    ),
+                    dtype=torch.bool,
+                    device=response_ids.device,
+                )
+            )
             parsed_action_char_counts.append(
                 count_parsed_action_chars(output_text, num_action_chunks)
             )
             response_alpha_char_counts.append(count_response_alpha_chars(output_text))
         actions = torch.stack(action_chunks, dim=0)
+        action_token_mask = torch.stack(action_token_masks, dim=0)
         max_new_tokens = generation_kwargs.get("max_new_tokens")
         if max_new_tokens is None:
             response_len = int(response_ids.shape[1])
@@ -439,6 +453,25 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 target_len=response_len,
             )
         )
+        if action_token_mask.shape[1] < response_len:
+            action_token_mask = torch.cat(
+                [
+                    action_token_mask,
+                    torch.zeros(
+                        (
+                            action_token_mask.shape[0],
+                            response_len - action_token_mask.shape[1],
+                        ),
+                        dtype=torch.bool,
+                        device=action_token_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
+        if action_token_mask.shape[1] != response_len:
+            raise ValueError(
+                "UniNaVid action token mask length must match response length."
+            )
         metadata = {
             "prev_logprobs": prev_logprobs.detach(),
             "prev_values": None,
@@ -447,6 +480,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 "prompt_attention_mask": prompt_attention_mask.detach(),
                 "response_ids": response_ids.detach(),
                 "response_mask": response_mask.detach(),
+                "action_token_mask": action_token_mask.detach(),
                 "action": actions.reshape(actions.shape[0], -1).detach(),
                 "parsed_action_char_count": torch.tensor(
                     parsed_action_char_counts,

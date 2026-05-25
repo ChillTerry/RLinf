@@ -45,6 +45,12 @@ HABITAT_NAV_ACTION_TO_ID = {
 }
 
 _ACTION_PATTERN = re.compile(r"\b(stop|forward|left|right)\b", re.IGNORECASE)
+ACTION_TOKEN_IDS = {
+    "forward": (6375, 11333),
+    "left": (2175, 1563),
+    "right": (1492, 1266),
+    "stop": (5040, 9847),
+}
 
 
 @dataclass
@@ -101,15 +107,45 @@ def parse_uninavid_actions(
     )
 
 
-def count_parsed_action_chars(output_text: str, num_action_chunks: int) -> int:
-    action_chars = 0
-    parsed_actions = 0
+def parse_uninavid_action_names(output_text: str, num_action_chunks: int) -> list[str]:
+    action_names = []
     for match in _ACTION_PATTERN.finditer(output_text):
         action = match.group(1).lower()
-        action_chars += sum(ch.isalpha() for ch in action)
-        parsed_actions += 1
-        if action == "stop" or parsed_actions == num_action_chunks:
+        action_names.append(action)
+        if action == "stop" or len(action_names) == num_action_chunks:
             break
+    return action_names
+
+
+def build_action_token_mask(
+    output_text: str,
+    response_ids: list[int] | torch.Tensor,
+    num_action_chunks: int,
+) -> list[bool]:
+    action_names = parse_uninavid_action_names(output_text, num_action_chunks)
+    mask = [False] * len(response_ids)
+    search_start = 0
+    response_id_list = (
+        response_ids.detach().cpu().tolist()
+        if isinstance(response_ids, torch.Tensor)
+        else list(response_ids)
+    )
+
+    for action in action_names:
+        token_ids = ACTION_TOKEN_IDS[action]
+        for index in range(search_start, len(response_id_list)):
+            if response_id_list[index] in token_ids:
+                mask[index] = True
+                search_start = index + 1
+                break
+
+    return mask
+
+
+def count_parsed_action_chars(output_text: str, num_action_chunks: int) -> int:
+    action_chars = 0
+    for action in parse_uninavid_action_names(output_text, num_action_chunks):
+        action_chars += sum(ch.isalpha() for ch in action)
     return action_chars
 
 

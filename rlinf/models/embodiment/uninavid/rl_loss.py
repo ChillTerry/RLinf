@@ -27,6 +27,7 @@ def prepare_uninavid_token_level_loss_inputs(
     old_logprobs: torch.Tensor,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
+    action_token_mask: Optional[torch.Tensor] = None,
     sample_loss_mask: Optional[torch.Tensor] = None,
     entropy: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
@@ -42,6 +43,12 @@ def prepare_uninavid_token_level_loss_inputs(
     logprobs = logprobs.float()
     old_logprobs = old_logprobs.float()
     mask = response_mask.to(torch.bool).unsqueeze(-1)
+    if action_token_mask is not None:
+        if action_token_mask.shape != response_mask.shape:
+            raise ValueError(
+                "UniNaVid action_token_mask must have shape [batch, response_len]."
+            )
+        mask = mask & action_token_mask.to(torch.bool).unsqueeze(-1)
 
     if sample_loss_mask is not None:
         sample_loss_mask = sample_loss_mask.to(torch.bool)

@@ -1578,6 +1578,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             old_logprobs=prev_logprobs,
                             advantages=advantages,
                             response_mask=batch["forward_inputs"]["response_mask"],
+                            action_token_mask=batch["forward_inputs"][
+                                "action_token_mask"
+                            ],
                             sample_loss_mask=loss_mask,
                             entropy=output_dict.get("entropy"),
                         )
