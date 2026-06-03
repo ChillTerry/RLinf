@@ -84,7 +84,7 @@ def test_subgoal_success_bonus_is_normalized_by_subgoal_count():
     assert tracker.active_subgoal_index.tolist() == [1]
     assert tracker.completed_subgoal_count.tolist() == [1]
     assert math.isclose(tracker.initial_distance_to_active_subgoal[0], 2.0, rel_tol=1e-6)
-    assert reward[0] > 2.0
+    assert math.isclose(reward[0], 2.8666666667, rel_tol=1e-6)
 
 
 def test_switch_without_precision_bonus_permanently_loses_that_bonus():
@@ -101,7 +101,7 @@ def test_switch_without_precision_bonus_permanently_loses_that_bonus():
     assert tracker.active_subgoal_index.tolist() == [1]
     assert tracker.completed_subgoal_count.tolist() == [1]
     assert tracker.cumulative_subgoal_success[0] == 0.0
-    assert reward[0] > 0.0
+    assert math.isclose(reward[0], 0.75, rel_tol=1e-6)
 
     _, second_components = tracker.compute_step(
         distances_to_subgoals=[[0.2, 0.4, 3.0]],
@@ -131,7 +131,7 @@ def test_stall_penalty_starts_after_patience_threshold():
     assert first_components["r_penalty"][0] == 0.0
     assert second_components["r_penalty"][0] == -1.5
     assert first_reward[0] == 0.0
-    assert second_reward[0] < 0.0
+    assert math.isclose(second_reward[0], -1.5, rel_tol=1e-6)
 
 
 def test_premature_stop_is_penalized_before_all_subgoals_finish():
@@ -145,7 +145,7 @@ def test_premature_stop_is_penalized_before_all_subgoals_finish():
     )
 
     assert components["r_stop"][0] == -4.0
-    assert reward[0] < 0.0
+    assert math.isclose(reward[0], -3.8333333333, rel_tol=1e-6)
     assert tracker.active_subgoal_index.tolist() == [0]
 
 
