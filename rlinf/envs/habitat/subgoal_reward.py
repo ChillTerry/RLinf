@@ -105,9 +105,7 @@ class SubgoalRewardTracker:
             normalized_progress = float(
                 np.clip(progress_delta / denominator, -1.0, 1.0)
             )
-            progress_reward = float(self.config.progress_reward_coef) * max(
-                normalized_progress, 0.0
-            )
+            progress_reward = float(self.config.progress_reward_coef) * normalized_progress
 
             if normalized_progress <= 0.0:
                 self.non_positive_progress_steps[env_idx] += 1

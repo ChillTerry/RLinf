@@ -69,6 +69,22 @@ def test_progress_is_clipped_to_unit_scale():
     assert components["normalized_progress"][0] == 1.0
 
 
+def test_negative_progress_produces_negative_progress_reward():
+    tracker = _tracker(progress_reward_coef=1.0, stall_patience=3)
+    tracker.reset([0], [[4.0]])
+
+    reward, components = tracker.compute_step(
+        distances_to_subgoals=[[5.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert math.isclose(components["normalized_progress"][0], -0.25, rel_tol=1e-6)
+    assert math.isclose(components["r_progress"][0], -0.25, rel_tol=1e-6)
+    assert components["r_penalty"][0] == 0.0
+    assert math.isclose(reward[0], -0.25, rel_tol=1e-6)
+
+
 def test_subgoal_success_bonus_is_normalized_by_subgoal_count():
     tracker = _tracker(subgoal_success_reward_coef=6.0)
     tracker.reset([0], [[3.0, 4.0, 5.0]])
@@ -131,7 +147,7 @@ def test_stall_penalty_starts_after_patience_threshold():
     assert first_components["r_penalty"][0] == 0.0
     assert second_components["r_penalty"][0] == -1.5
     assert first_reward[0] == 0.0
-    assert math.isclose(second_reward[0], -1.5, rel_tol=1e-6)
+    assert math.isclose(second_reward[0], -1.625, rel_tol=1e-6)
 
 
 def test_premature_stop_is_penalized_before_all_subgoals_finish():
