@@ -122,6 +122,10 @@ def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
     assert raw_cfg["env"]["eval"]["stall_patience"] == "${algorithm.stall_patience}"
     assert raw_cfg["env"]["eval"]["stall_penalty_coeff"] == "${algorithm.stall_penalty_coeff}"
     assert (
+        raw_cfg["env"]["eval"]["data_path"]
+        == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz"
+    )
+    assert (
         raw_cfg["env"]["eval"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
     )
