@@ -20,6 +20,10 @@ import torch
 
 import rlinf.envs.habitat.habitat_env as habitat_env_module
 from rlinf.envs.habitat.habitat_env import HabitatEnv
+from rlinf.envs.habitat.subgoal_reward import (
+    SubgoalRewardConfig,
+    SubgoalRewardTracker,
+)
 
 
 def test_uninavid_habitat_extension_config_composes_with_local_schema():
@@ -69,8 +73,8 @@ def test_habitat_grpo_uninavid_uses_weighted_reward_config():
     raw_cfg = OmegaConf.to_container(cfg, resolve=False)
 
     assert "reward_coef" not in raw_cfg["algorithm"]
-    assert raw_cfg["algorithm"]["success_reward_coef"] == 10.0
-    assert raw_cfg["algorithm"]["ndtw_reward_coef"] == 5.0
+    assert raw_cfg["algorithm"]["success_reward_coef"] == 15.0
+    assert raw_cfg["algorithm"]["ndtw_reward_coef"] == 0.0
     assert "reward_mode" not in raw_cfg["env"]["train"]
     assert raw_cfg["env"]["train"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_cfg["env"]["train"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
@@ -168,6 +172,7 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
 def _make_reward_test_env(num_envs):
     env = object.__new__(HabitatEnv)
     env.num_envs = num_envs
+    env.reward_mode = "weighted_success_ndtw"
     env.cfg = SimpleNamespace(success_reward_coef=10.0, ndtw_reward_coef=5.0)
     env.env_config = SimpleNamespace(
         task=SimpleNamespace(
@@ -488,6 +493,7 @@ def test_habitat_record_metrics_includes_ndtw_and_seeds_initial_distance_to_goal
     env.initial_distance_to_goal = np.array([np.nan, 5.0], dtype=np.float32)
     env.first_done_cached_mask = np.array([False, False])
     env.episode_info = None
+    env.metrics_cfg = SimpleNamespace(save_metrics=False)
 
     infos = {
         "distance_to_goal": [3.5, 3.0],
@@ -507,3 +513,102 @@ def test_habitat_record_metrics_includes_ndtw_and_seeds_initial_distance_to_goal
     assert recorded_infos["episode"]["success"].tolist() == [0.0, 1.0]
     assert recorded_infos["episode"]["spl"].tolist() == [0.0, 1.0]
     assert recorded_infos["episode"]["ndtw"].tolist() == [0.25, 0.75]
+
+
+def test_habitat_subgoal_reward_reset_initializes_tracker():
+    env = object.__new__(HabitatEnv)
+    env.num_envs = 2
+    env.cfg = SimpleNamespace(
+        reward_mode="subgoal_progress",
+        progress_reward_coef=1.0,
+        subgoal_success_reward_coef=6.0,
+        subgoal_switch_distance=1.0,
+        subgoal_success_distance=0.5,
+        stop_success_reward_coef=10.0,
+        final_success_distance=3.0,
+        premature_stop_coeff=4.0,
+        stall_patience=3,
+        stall_penalty_coeff=1.0,
+    )
+    env.reward_mode = "subgoal_progress"
+    env.subgoal_reward = SubgoalRewardTracker(
+        num_envs=2,
+        config=SubgoalRewardConfig(
+            progress_reward_coef=1.0,
+            subgoal_success_reward_coef=6.0,
+            subgoal_switch_distance=1.0,
+            subgoal_success_distance=0.5,
+            stop_success_reward_coef=10.0,
+            final_success_distance=3.0,
+            premature_stop_coeff=4.0,
+            stall_patience=3,
+            stall_penalty_coeff=1.0,
+        ),
+    )
+    env.env = SimpleNamespace(
+        get_current_episode_goal_distances=lambda id=None: {
+            "distances_to_goals": [[4.0, 8.0], [3.0]]
+        }
+    )
+
+    env._reset_subgoal_reward_state(np.array([0, 1]))
+
+    assert env.subgoal_reward.num_subgoals.tolist() == [2, 1]
+    assert env.subgoal_reward.previous_distance_to_active_subgoal.tolist() == [4.0, 3.0]
+
+
+def test_habitat_subgoal_reward_dispatch_uses_dense_reward_and_attaches_metrics():
+    env = object.__new__(HabitatEnv)
+    env.num_envs = 1
+    env.reward_mode = "subgoal_progress"
+    env.episode_info = {}
+    env.subgoal_reward = SubgoalRewardTracker(
+        num_envs=1,
+        config=SubgoalRewardConfig(
+            progress_reward_coef=1.0,
+            subgoal_success_reward_coef=6.0,
+            subgoal_switch_distance=1.0,
+            subgoal_success_distance=0.5,
+            stop_success_reward_coef=10.0,
+            final_success_distance=3.0,
+            premature_stop_coeff=4.0,
+            stall_patience=3,
+            stall_penalty_coeff=1.0,
+        ),
+    )
+    env.subgoal_reward.reset([0], [[4.0, 8.0]])
+    env.env = SimpleNamespace(
+        get_current_episode_goal_distances=lambda id=None: {
+            "distances_to_goals": [[3.0, 7.0]]
+        }
+    )
+    infos = {"episode": {}}
+
+    reward = env._calc_step_reward(
+        episode={},
+        first_done_reward_mask=np.array([False]),
+        is_stop=np.array([False]),
+        valid_reward_mask=np.array([True]),
+        infos=infos,
+    )
+
+    assert reward.tolist() == [0.25]
+    assert infos["episode"]["r_progress"].tolist() == [0.25]
+    assert infos["episode"]["active_subgoal_index"].tolist() == [0.0]
+
+
+def test_habitat_weighted_reward_dispatch_remains_default():
+    env = _make_reward_test_env(num_envs=1)
+    env.reward_mode = "weighted_success_ndtw"
+    episode = {
+        "success": torch.tensor([1.0]),
+        "distance_to_goal": torch.tensor([1.5]),
+        "ndtw": torch.tensor([0.2]),
+    }
+
+    reward = env._calc_step_reward(
+        episode,
+        first_done_reward_mask=np.array([True]),
+    )
+
+    assert reward.tolist() == [6.0]

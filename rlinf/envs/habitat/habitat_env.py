@@ -34,6 +34,10 @@ from hydra.core.global_hydra import GlobalHydra
 from rlinf.envs.habitat.extensions import measures
 from rlinf.envs.habitat.extensions.allocator import vram_balance_episode_sequences
 from rlinf.envs.habitat.extensions.utils import render_topdown_map
+from rlinf.envs.habitat.subgoal_reward import (
+    SubgoalRewardConfig,
+    SubgoalRewardTracker,
+)
 from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
@@ -185,6 +189,25 @@ class HabitatEnv(gym.Env):
 
         self.env_config = self.env.get_env_attr("config")[0]
         self.initial_distance_to_goal = np.full(self.num_envs, np.nan, dtype=np.float32)
+        self.reward_mode = getattr(self.cfg, "reward_mode", "weighted_success_ndtw")
+        self.subgoal_reward = None
+        if self.reward_mode == "subgoal_progress":
+            self.subgoal_reward = SubgoalRewardTracker(
+                num_envs=self.num_envs,
+                config=SubgoalRewardConfig(
+                    progress_reward_coef=float(self.cfg.progress_reward_coef),
+                    subgoal_success_reward_coef=float(
+                        self.cfg.subgoal_success_reward_coef
+                    ),
+                    subgoal_switch_distance=float(self.cfg.subgoal_switch_distance),
+                    subgoal_success_distance=float(self.cfg.subgoal_success_distance),
+                    stop_success_reward_coef=float(self.cfg.stop_success_reward_coef),
+                    final_success_distance=float(self.cfg.final_success_distance),
+                    premature_stop_coeff=float(self.cfg.premature_stop_coeff),
+                    stall_patience=int(self.cfg.stall_patience),
+                    stall_penalty_coeff=float(self.cfg.stall_penalty_coeff),
+                ),
+            )
 
         self.action_map = {
             0: "stop",
@@ -296,10 +319,17 @@ class HabitatEnv(gym.Env):
         done_mask = terminations | truncations
         first_done_mask = done_mask & (~self.first_done_cached_mask)
         first_done_reward_mask = first_done_mask & terminations & (~truncations)
+        valid_reward_mask = ~self.first_done_cached_mask
 
         infos = list_of_dict_to_dict_of_list(info_lists)
         infos = self._record_metrics(infos, terminations, first_done_mask)
-        step_reward = self._calc_step_reward(infos["episode"], first_done_reward_mask)
+        step_reward = self._calc_step_reward(
+            infos["episode"],
+            first_done_reward_mask,
+            is_stop=is_stop,
+            valid_reward_mask=valid_reward_mask,
+            infos=infos,
+        )
 
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs, info_lists)
@@ -335,6 +365,7 @@ class HabitatEnv(gym.Env):
         if distance_to_goal is not None:
             distance_to_goal = np.asarray(distance_to_goal, dtype=np.float32)
             self.initial_distance_to_goal[env_idx] = distance_to_goal
+        self._reset_subgoal_reward_state(env_idx)
         if self.episode_info is not None:
             device = next(iter(self.episode_info.values())).device
             mask = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
@@ -355,6 +386,15 @@ class HabitatEnv(gym.Env):
 
     def update_reset_state_ids(self):
         pass
+
+    def _reset_subgoal_reward_state(self, env_idx):
+        if getattr(self, "subgoal_reward", None) is None:
+            return
+        metadata = self.env.get_current_episode_goal_distances(id=env_idx)
+        self.subgoal_reward.reset(
+            env_idx,
+            metadata["distances_to_goals"],
+        )
 
     def _format_habitat_actions(self, actions):
         formatted_actions = []
@@ -508,7 +548,26 @@ class HabitatEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return obs, infos
 
-    def _calc_step_reward(self, episode, first_done_reward_mask):
+    def _calc_step_reward(
+        self,
+        episode,
+        first_done_reward_mask,
+        is_stop=None,
+        valid_reward_mask=None,
+        infos=None,
+    ):
+        if self.reward_mode == "subgoal_progress":
+            return self._calc_subgoal_progress_reward(
+                is_stop=is_stop,
+                valid_reward_mask=valid_reward_mask,
+                infos=infos,
+            )
+        return self._calc_weighted_success_ndtw_reward(
+            episode,
+            first_done_reward_mask,
+        )
+
+    def _calc_weighted_success_ndtw_reward(self, episode, first_done_reward_mask):
         device = episode["success"].device
         reward = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         first_done_reward_mask = torch.as_tensor(
@@ -536,6 +595,34 @@ class HabitatEnv(gym.Env):
             success_reward[first_done_reward_mask] + ndtw_reward[first_done_reward_mask]
         )
         return reward
+
+    def _calc_subgoal_progress_reward(self, is_stop, valid_reward_mask, infos):
+        if self.subgoal_reward is None:
+            raise RuntimeError("subgoal_progress reward mode requires subgoal_reward.")
+        if is_stop is None:
+            raise RuntimeError("subgoal_progress reward mode requires is_stop.")
+        if valid_reward_mask is None:
+            raise RuntimeError("subgoal_progress reward mode requires valid_reward_mask.")
+
+        metadata = self.env.get_current_episode_goal_distances()
+        reward, components = self.subgoal_reward.compute_step(
+            distances_to_subgoals=metadata["distances_to_goals"],
+            is_stop=is_stop,
+            valid_mask=valid_reward_mask,
+        )
+        if infos is not None:
+            self._attach_subgoal_reward_metrics(infos, components)
+        return to_tensor(reward)
+
+    def _attach_subgoal_reward_metrics(self, infos, components):
+        episode = infos.setdefault("episode", {})
+        for key, value in components.items():
+            tensor_value = to_tensor(value)
+            episode[key] = tensor_value
+            if self.episode_info is not None:
+                if key not in self.episode_info:
+                    self.episode_info[key] = torch.zeros_like(tensor_value)
+                self.episode_info[key][:] = tensor_value
 
     def _record_metrics(self, infos, terminations, first_done_mask):
         episode_info = {}
