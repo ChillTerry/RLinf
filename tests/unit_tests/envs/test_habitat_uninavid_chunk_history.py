@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+import json
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -595,6 +596,117 @@ def test_habitat_subgoal_reward_dispatch_uses_dense_reward_and_attaches_metrics(
     assert reward.tolist() == [0.25]
     assert infos["episode"]["r_progress"].tolist() == [0.25]
     assert infos["episode"]["active_subgoal_index"].tolist() == [0.0]
+
+
+def test_habitat_subgoal_reward_metrics_preserve_cached_first_done_values():
+    env = object.__new__(HabitatEnv)
+    env.num_envs = 1
+    env.episode_info = {
+        "success": torch.tensor([1.0]),
+    }
+    infos = {"episode": {k: v.clone() for k, v in env.episode_info.items()}}
+
+    env._attach_subgoal_reward_metrics(
+        infos,
+        {
+            "r_progress": np.array([0.25], dtype=np.float32),
+            "active_subgoal_index": np.array([0.0], dtype=np.float32),
+        },
+        valid_reward_mask=np.array([True]),
+    )
+    env._attach_subgoal_reward_metrics(
+        infos,
+        {
+            "r_progress": np.array([0.0], dtype=np.float32),
+            "active_subgoal_index": np.array([1.0], dtype=np.float32),
+        },
+        valid_reward_mask=np.array([False]),
+    )
+
+    assert env.episode_info["r_progress"].tolist() == [0.25]
+    assert infos["episode"]["r_progress"].tolist() == [0.25]
+    assert env.episode_info["active_subgoal_index"].tolist() == [0.0]
+
+
+def test_habitat_step_writes_subgoal_reward_metrics_after_current_step(tmp_path):
+    env = object.__new__(HabitatEnv)
+    env.num_envs = 1
+    env.reward_mode = "subgoal_progress"
+    env.cfg = SimpleNamespace(
+        model_type="uninavid",
+        video_cfg=SimpleNamespace(save_video=False),
+    )
+    env.metrics_cfg = SimpleNamespace(
+        save_metrics=True,
+        metrics_base_dir=str(tmp_path),
+    )
+    env.env_config = SimpleNamespace(
+        task=SimpleNamespace(
+            measurements=SimpleNamespace(success=SimpleNamespace(success_distance=3.0))
+        ),
+        simulator=SimpleNamespace(
+            agents=SimpleNamespace(
+                main_agent=SimpleNamespace(
+                    sim_sensors=SimpleNamespace(
+                        depth_sensor=SimpleNamespace(normalize_depth=False)
+                    )
+                )
+            )
+        ),
+    )
+    env._elapsed_steps = np.zeros(1, dtype=np.int32)
+    env.max_episode_steps = 10
+    env.ignore_terminations = False
+    env.auto_reset = False
+    env.first_done_cached_mask = np.zeros(1, dtype=bool)
+    env.initial_distance_to_goal = np.array([4.0], dtype=np.float32)
+    env.episode_info = None
+    env.current_raw_obs = None
+    env.subgoal_reward = SubgoalRewardTracker(
+        num_envs=1,
+        config=SubgoalRewardConfig(
+            progress_reward_coef=1.0,
+            subgoal_success_reward_coef=6.0,
+            subgoal_switch_distance=1.0,
+            subgoal_success_distance=0.5,
+            stop_success_reward_coef=10.0,
+            final_success_distance=3.0,
+            premature_stop_coeff=4.0,
+            stall_patience=3,
+            stall_penalty_coeff=1.0,
+        ),
+    )
+    env.subgoal_reward.reset([0], [[4.0]])
+    env._normalize_depth = lambda actions, raw_obs: None
+    env._wrap_obs = lambda raw_obs, info_lists=None: {}
+    env.env = SimpleNamespace(
+        step=lambda actions: (
+            [{}],
+            np.array([0.0], dtype=np.float32),
+            np.array([False]),
+            [
+                {
+                    "distance_to_goal": 3.0,
+                    "ndtw": 0.5,
+                    "trajectory_Length": 1.0,
+                    "oracle_success": 0.0,
+                    "oracle_navigation_error": 3.0,
+                }
+            ],
+        ),
+        get_current_episode_goal_distances=lambda id=None: {
+            "distances_to_goals": [[3.0]]
+        },
+        get_current_episode_metadata=lambda: {"episode_id": ["episode-1"]},
+    )
+
+    env.step(np.array(["stop"], dtype="U12"), auto_reset=False)
+
+    metrics_file = tmp_path / "episode_episode-1.json"
+    metrics = json.loads(metrics_file.read_text())
+    assert metrics["r_progress"] == 0.25
+    assert metrics["active_subgoal_index"] == 0.0
+    assert "normalized_progress" in metrics
 
 
 def test_habitat_weighted_reward_dispatch_remains_default():

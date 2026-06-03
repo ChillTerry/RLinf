@@ -330,6 +330,9 @@ class HabitatEnv(gym.Env):
             valid_reward_mask=valid_reward_mask,
             infos=infos,
         )
+        if self.metrics_cfg.save_metrics:
+            self._write_first_done_metrics(self.episode_info, first_done_mask)
+        self.first_done_cached_mask[first_done_mask] = True
 
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs, info_lists)
@@ -611,18 +614,26 @@ class HabitatEnv(gym.Env):
             valid_mask=valid_reward_mask,
         )
         if infos is not None:
-            self._attach_subgoal_reward_metrics(infos, components)
+            self._attach_subgoal_reward_metrics(infos, components, valid_reward_mask)
         return to_tensor(reward)
 
-    def _attach_subgoal_reward_metrics(self, infos, components):
-        episode = infos.setdefault("episode", {})
+    def _attach_subgoal_reward_metrics(self, infos, components, valid_reward_mask):
+        valid_reward_mask = np.asarray(valid_reward_mask, dtype=bool)
+        if self.episode_info is None:
+            self.episode_info = {}
         for key, value in components.items():
             tensor_value = to_tensor(value)
-            episode[key] = tensor_value
-            if self.episode_info is not None:
-                if key not in self.episode_info:
-                    self.episode_info[key] = torch.zeros_like(tensor_value)
-                self.episode_info[key][:] = tensor_value
+            if key not in self.episode_info:
+                self.episode_info[key] = torch.zeros_like(tensor_value)
+            mask = torch.as_tensor(
+                valid_reward_mask,
+                dtype=torch.bool,
+                device=self.episode_info[key].device,
+            )
+            self.episode_info[key][mask] = tensor_value.to(
+                device=self.episode_info[key].device
+            )[mask]
+        infos["episode"] = {k: v.clone() for k, v in self.episode_info.items()}
 
     def _record_metrics(self, infos, terminations, first_done_mask):
         episode_info = {}
@@ -675,10 +686,6 @@ class HabitatEnv(gym.Env):
         for k, v in latest_episode.items():
             mask = update_mask.to(device=v.device)
             self.episode_info[k][mask] = v[mask]
-
-        if self.metrics_cfg.save_metrics:
-            self._write_first_done_metrics(self.episode_info, first_done_mask)
-        self.first_done_cached_mask[first_done_mask] = True
 
         infos["episode"] = {k: v.clone() for k, v in self.episode_info.items()}
 
