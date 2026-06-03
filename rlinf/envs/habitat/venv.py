@@ -60,6 +60,26 @@ class HabitatRLEnv(RLEnv):
     def get_current_metrics(self):
         return self.habitat_env.get_metrics()
 
+    def get_current_episode_goal_distances(self):
+        episode = self.habitat_env.current_episode
+        sim = self.habitat_env.sim
+        agent_position = sim.get_agent_state().position
+        agent_position_list = np.asarray(agent_position, dtype=np.float32).tolist()
+        goals = [
+            np.asarray(goal.position, dtype=np.float32).tolist()
+            for goal in episode.goals
+        ]
+        distances_to_goals = [
+            float(sim.geodesic_distance(agent_position, goal_position))
+            for goal_position in goals
+        ]
+        return {
+            "episode_id": getattr(episode, "episode_id", None),
+            "agent_position": agent_position_list,
+            "goals": goals,
+            "distances_to_goals": distances_to_goals,
+        }
+
     def get_reward_range(self):
         return (-np.inf, np.inf)
 
@@ -183,6 +203,11 @@ def _worker(
                     p.send(env.get_current_metrics())
                 else:
                     p.send({})
+            elif cmd == "get_current_episode_goal_distances":
+                if hasattr(env, "get_current_episode_goal_distances"):
+                    p.send(env.get_current_episode_goal_distances())
+                else:
+                    p.send({})
             elif cmd == "reconfigure":
                 env.close()
                 config = data.pop("config")
@@ -274,3 +299,22 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
                 metrics[key].append(value)
 
         return metrics
+
+    def get_current_episode_goal_distances(self, id=None):
+        self._assert_is_not_closed()
+        id = self._wrap_id(id)
+        if self.is_async:
+            self._assert_id(id)
+
+        goal_metadata: dict[str, list[Any]] = {}
+        for i in id:
+            self.workers[i].parent_remote.send(
+                ["get_current_episode_goal_distances", None]
+            )
+            worker_metadata = self.workers[i].parent_remote.recv()
+            for key, value in worker_metadata.items():
+                if key not in goal_metadata:
+                    goal_metadata[key] = []
+                goal_metadata[key].append(value)
+
+        return goal_metadata
