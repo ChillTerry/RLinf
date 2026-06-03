@@ -128,6 +128,7 @@ class SubgoalRewardTracker:
                 ) / float(self.num_subgoals[env_idx])
                 self.subgoal_success_given[env_idx][active_idx] = True
 
+            stop_reward = self._stop_reward(env_idx, final_distance, is_stop[env_idx])
             should_switch = active_distance <= float(self.config.subgoal_switch_distance)
             if should_switch:
                 self.completed_subgoal_count[env_idx] += 1
@@ -146,7 +147,6 @@ class SubgoalRewardTracker:
             else:
                 self.previous_distance_to_active_subgoal[env_idx] = active_distance
 
-            stop_reward = self._stop_reward(env_idx, final_distance, is_stop[env_idx])
             reward[env_idx] = (
                 progress_reward + subgoal_success + penalty + stop_reward
             )

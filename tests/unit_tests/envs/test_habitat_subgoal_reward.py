@@ -186,6 +186,26 @@ def test_final_stop_success_is_scaled_by_final_distance_after_all_subgoals_finis
     assert second_reward[0] == 7.5
 
 
+def test_stop_on_same_step_as_final_subgoal_switch_is_still_premature():
+    tracker = _tracker(
+        premature_stop_coeff=4.0,
+        stop_success_reward_coef=10.0,
+        final_success_distance=3.0,
+    )
+    tracker.reset([0], [[2.0]])
+
+    reward, components = tracker.compute_step(
+        distances_to_subgoals=[[0.4]],
+        is_stop=np.array([True]),
+        valid_mask=np.array([True]),
+    )
+
+    assert tracker.all_subgoals_finished.tolist() == [True]
+    assert components["r_subgoal_success"][0] == 6.0
+    assert components["r_stop"][0] == -4.0
+    assert math.isclose(reward[0], 2.8, rel_tol=1e-6)
+
+
 def test_invalid_mask_keeps_reward_and_state_unchanged():
     tracker = _tracker()
     tracker.reset([0], [[4.0, 5.0]])
