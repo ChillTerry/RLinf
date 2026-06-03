@@ -69,11 +69,19 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
 
-  success_reward_coef: 15.0
-  ndtw_reward_coef: 0.0
-  filter_rewards: True
-  rewards_lower_bound: 1.0
-  rewards_upper_bound: 12.0
+  reward_mode: subgoal_progress
+  progress_reward_coef: 1.0
+  subgoal_success_reward_coef: 6.0
+  subgoal_switch_distance: 1.0
+  subgoal_success_distance: 0.5
+  stop_success_reward_coef: 10.0
+  final_success_distance: 3.0
+  premature_stop_coeff: 4.0
+  stall_patience: 3
+  stall_penalty_coeff: 1.0
+  filter_rewards: False
+  rewards_lower_bound: -1000000000.0
+  rewards_upper_bound: 1000000000.0
   log_reference_drift: False
 
   sampling_params:
@@ -100,11 +108,19 @@ env:
     max_steps_per_rollout_epoch: 128
     group_size: ${algorithm.group_size}
     model_type: ${actor.model.model_type}
-    success_reward_coef: ${algorithm.success_reward_coef}
-    ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
+    reward_mode: ${algorithm.reward_mode}
+    progress_reward_coef: ${algorithm.progress_reward_coef}
+    subgoal_success_reward_coef: ${algorithm.subgoal_success_reward_coef}
+    subgoal_switch_distance: ${algorithm.subgoal_switch_distance}
+    subgoal_success_distance: ${algorithm.subgoal_success_distance}
+    stop_success_reward_coef: ${algorithm.stop_success_reward_coef}
+    final_success_distance: ${algorithm.final_success_distance}
+    premature_stop_coeff: ${algorithm.premature_stop_coeff}
+    stall_patience: ${algorithm.stall_patience}
+    stall_penalty_coeff: ${algorithm.stall_penalty_coeff}
     split: train
     scenes_dir: ${env.scenes_dir}
-    data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}.json.gz
+    data_path: ${env.data_path_dir}/${env.train.split}/r2r_train_with_subgoals.json
     ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
@@ -123,8 +139,16 @@ env:
     auto_reset: True
     ignore_terminations: True
     model_type: ${actor.model.model_type}
-    success_reward_coef: ${algorithm.success_reward_coef}
-    ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
+    reward_mode: ${algorithm.reward_mode}
+    progress_reward_coef: ${algorithm.progress_reward_coef}
+    subgoal_success_reward_coef: ${algorithm.subgoal_success_reward_coef}
+    subgoal_switch_distance: ${algorithm.subgoal_switch_distance}
+    subgoal_success_distance: ${algorithm.subgoal_success_distance}
+    stop_success_reward_coef: ${algorithm.stop_success_reward_coef}
+    final_success_distance: ${algorithm.final_success_distance}
+    premature_stop_coeff: ${algorithm.premature_stop_coeff}
+    stall_patience: ${algorithm.stall_patience}
+    stall_penalty_coeff: ${algorithm.stall_penalty_coeff}
     split: val_unseen
     scenes_dir: ${env.scenes_dir}
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz

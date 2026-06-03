@@ -69,23 +69,58 @@ def test_habitat_r2r_env_default_uses_weighted_reward_config():
     assert cfg.ndtw_gt_path is None
 
 
-def test_habitat_grpo_uninavid_uses_weighted_reward_config():
+def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
     cfg = OmegaConf.load("examples/embodiment/config/habitat_r2r_grpo_uninavid.yaml")
     raw_cfg = OmegaConf.to_container(cfg, resolve=False)
 
     assert "reward_coef" not in raw_cfg["algorithm"]
-    assert raw_cfg["algorithm"]["success_reward_coef"] == 15.0
-    assert raw_cfg["algorithm"]["ndtw_reward_coef"] == 0.0
-    assert "reward_mode" not in raw_cfg["env"]["train"]
-    assert raw_cfg["env"]["train"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
-    assert raw_cfg["env"]["train"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
+    assert "success_reward_coef" not in raw_cfg["algorithm"]
+    assert "ndtw_reward_coef" not in raw_cfg["algorithm"]
+    assert raw_cfg["algorithm"]["reward_mode"] == "subgoal_progress"
+    assert raw_cfg["algorithm"]["progress_reward_coef"] == 1.0
+    assert raw_cfg["algorithm"]["subgoal_success_reward_coef"] == 6.0
+    assert raw_cfg["algorithm"]["subgoal_switch_distance"] == 1.0
+    assert raw_cfg["algorithm"]["subgoal_success_distance"] == 0.5
+    assert raw_cfg["algorithm"]["stop_success_reward_coef"] == 10.0
+    assert raw_cfg["algorithm"]["final_success_distance"] == 3.0
+    assert raw_cfg["algorithm"]["premature_stop_coeff"] == 4.0
+    assert raw_cfg["algorithm"]["stall_patience"] == 3
+    assert raw_cfg["algorithm"]["stall_penalty_coeff"] == 1.0
+    assert raw_cfg["algorithm"]["filter_rewards"] is False
+    assert raw_cfg["algorithm"]["rewards_lower_bound"] == -1000000000.0
+    assert raw_cfg["algorithm"]["rewards_upper_bound"] == 1000000000.0
+    assert "success_reward_coef" not in raw_cfg["env"]["train"]
+    assert "ndtw_reward_coef" not in raw_cfg["env"]["train"]
+    assert raw_cfg["env"]["train"]["reward_mode"] == "${algorithm.reward_mode}"
+    assert raw_cfg["env"]["train"]["progress_reward_coef"] == "${algorithm.progress_reward_coef}"
+    assert raw_cfg["env"]["train"]["subgoal_success_reward_coef"] == "${algorithm.subgoal_success_reward_coef}"
+    assert raw_cfg["env"]["train"]["subgoal_switch_distance"] == "${algorithm.subgoal_switch_distance}"
+    assert raw_cfg["env"]["train"]["subgoal_success_distance"] == "${algorithm.subgoal_success_distance}"
+    assert raw_cfg["env"]["train"]["stop_success_reward_coef"] == "${algorithm.stop_success_reward_coef}"
+    assert raw_cfg["env"]["train"]["final_success_distance"] == "${algorithm.final_success_distance}"
+    assert raw_cfg["env"]["train"]["premature_stop_coeff"] == "${algorithm.premature_stop_coeff}"
+    assert raw_cfg["env"]["train"]["stall_patience"] == "${algorithm.stall_patience}"
+    assert raw_cfg["env"]["train"]["stall_penalty_coeff"] == "${algorithm.stall_penalty_coeff}"
+    assert (
+        raw_cfg["env"]["train"]["data_path"]
+        == "${env.data_path_dir}/${env.train.split}/r2r_train_with_subgoals.json"
+    )
     assert (
         raw_cfg["env"]["train"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
     )
-    assert "reward_mode" not in raw_cfg["env"]["eval"]
-    assert raw_cfg["env"]["eval"]["success_reward_coef"] == "${algorithm.success_reward_coef}"
-    assert raw_cfg["env"]["eval"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
+    assert "success_reward_coef" not in raw_cfg["env"]["eval"]
+    assert "ndtw_reward_coef" not in raw_cfg["env"]["eval"]
+    assert raw_cfg["env"]["eval"]["reward_mode"] == "${algorithm.reward_mode}"
+    assert raw_cfg["env"]["eval"]["progress_reward_coef"] == "${algorithm.progress_reward_coef}"
+    assert raw_cfg["env"]["eval"]["subgoal_success_reward_coef"] == "${algorithm.subgoal_success_reward_coef}"
+    assert raw_cfg["env"]["eval"]["subgoal_switch_distance"] == "${algorithm.subgoal_switch_distance}"
+    assert raw_cfg["env"]["eval"]["subgoal_success_distance"] == "${algorithm.subgoal_success_distance}"
+    assert raw_cfg["env"]["eval"]["stop_success_reward_coef"] == "${algorithm.stop_success_reward_coef}"
+    assert raw_cfg["env"]["eval"]["final_success_distance"] == "${algorithm.final_success_distance}"
+    assert raw_cfg["env"]["eval"]["premature_stop_coeff"] == "${algorithm.premature_stop_coeff}"
+    assert raw_cfg["env"]["eval"]["stall_patience"] == "${algorithm.stall_patience}"
+    assert raw_cfg["env"]["eval"]["stall_penalty_coeff"] == "${algorithm.stall_penalty_coeff}"
     assert (
         raw_cfg["env"]["eval"]["ndtw_gt_path"]
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
