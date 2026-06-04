@@ -148,11 +148,12 @@ number of subgoals in the episode
 
 ```text
 sum(r_progress over valid reward steps)
+r_progress = progress_reward_coef * normalized_progress / num_subgoals
 ```
 
 表示一个 episode 中累计获得的 progress reward。
 
-该指标用于判断 dense progress reward 对总 reward 的贡献是否稳定，以及是否随 `num_subgoals` 或 episode difficulty 出现系统性偏移。
+该指标用于判断 dense progress reward 对总 reward 的贡献是否稳定。由于 `r_progress` 已按 `num_subgoals` 归一化，该值的理论预算不应随 subgoal 数量线性增长。
 
 ### env/cumulative_subgoal_success_reward
 

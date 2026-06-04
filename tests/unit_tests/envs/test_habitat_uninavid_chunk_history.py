@@ -632,8 +632,8 @@ def test_habitat_subgoal_reward_dispatch_uses_dense_reward_and_attaches_metrics(
         infos=infos,
     )
 
-    assert reward.tolist() == [0.25]
-    assert infos["episode"]["r_progress"].tolist() == [0.25]
+    assert reward.tolist() == [0.125]
+    assert infos["episode"]["r_progress"].tolist() == [0.125]
     assert infos["episode"]["active_subgoal_index"].tolist() == [0.0]
 
 

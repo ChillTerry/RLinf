@@ -47,10 +47,25 @@ def test_progress_is_normalized_by_active_subgoal_initial_distance():
         valid_mask=np.array([True]),
     )
 
-    assert math.isclose(reward[0], 0.25, rel_tol=1e-6)
-    assert math.isclose(components["r_progress"][0], 0.25, rel_tol=1e-6)
+    assert math.isclose(reward[0], 0.125, rel_tol=1e-6)
+    assert math.isclose(components["r_progress"][0], 0.125, rel_tol=1e-6)
     assert components["normalized_progress"][0] == 0.25
     assert tracker.active_subgoal_index.tolist() == [0]
+
+
+def test_progress_reward_is_normalized_by_episode_subgoal_count():
+    tracker = _tracker(progress_reward_coef=1.0)
+    tracker.reset([0], [[4.0, 8.0, 12.0]])
+
+    reward, components = tracker.compute_step(
+        distances_to_subgoals=[[3.0, 7.0, 11.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert components["normalized_progress"][0] == 0.25
+    assert math.isclose(components["r_progress"][0], 0.25 / 3.0, rel_tol=1e-6)
+    assert math.isclose(reward[0], 0.25 / 3.0, rel_tol=1e-6)
 
 
 def test_progress_is_clipped_to_unit_scale():
@@ -100,7 +115,9 @@ def test_subgoal_success_bonus_is_normalized_by_subgoal_count():
     assert tracker.active_subgoal_index.tolist() == [1]
     assert tracker.completed_subgoal_count.tolist() == [1]
     assert math.isclose(tracker.initial_distance_to_active_subgoal[0], 2.0, rel_tol=1e-6)
-    assert math.isclose(reward[0], 3.8666666667, rel_tol=1e-6)
+    assert math.isclose(components["normalized_progress"][0], 0.8666666667, rel_tol=1e-6)
+    assert math.isclose(components["r_progress"][0], 0.2888888889, rel_tol=1e-6)
+    assert math.isclose(reward[0], 3.2888888889, rel_tol=1e-6)
 
 
 def test_switch_without_precision_bonus_permanently_loses_that_bonus():
@@ -117,7 +134,9 @@ def test_switch_without_precision_bonus_permanently_loses_that_bonus():
     assert tracker.active_subgoal_index.tolist() == [1]
     assert tracker.completed_subgoal_count.tolist() == [1]
     assert tracker.cumulative_subgoal_success[0] == 0.0
-    assert math.isclose(reward[0], 0.75, rel_tol=1e-6)
+    assert math.isclose(components["normalized_progress"][0], 0.75, rel_tol=1e-6)
+    assert math.isclose(components["r_progress"][0], 0.25, rel_tol=1e-6)
+    assert math.isclose(reward[0], 0.25, rel_tol=1e-6)
 
     _, second_components = tracker.compute_step(
         distances_to_subgoals=[[0.2, 0.4, 3.0]],
@@ -261,7 +280,9 @@ def test_premature_stop_is_penalized_before_all_subgoals_finish():
     )
 
     assert components["r_stop"][0] == -4.0
-    assert math.isclose(reward[0], -3.8333333333, rel_tol=1e-6)
+    assert math.isclose(components["normalized_progress"][0], 1.0 / 6.0, rel_tol=1e-6)
+    assert math.isclose(components["r_progress"][0], 1.0 / 12.0, rel_tol=1e-6)
+    assert math.isclose(reward[0], -3.9166666667, rel_tol=1e-6)
     assert tracker.active_subgoal_index.tolist() == [0]
 
 
