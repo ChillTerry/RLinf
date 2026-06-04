@@ -45,11 +45,15 @@ class SubgoalRewardTracker:
             self.num_envs, dtype=np.float32
         )
         self.non_positive_progress_steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.valid_reward_steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.stall_penalty_steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.cumulative_normalized_progress = np.zeros(self.num_envs, dtype=np.float32)
         self.cumulative_progress = np.zeros(self.num_envs, dtype=np.float32)
         self.cumulative_subgoal_success = np.zeros(self.num_envs, dtype=np.float32)
         self.cumulative_penalty = np.zeros(self.num_envs, dtype=np.float32)
         self.cumulative_stop = np.zeros(self.num_envs, dtype=np.float32)
         self.subgoal_success_given = [[False] for _ in range(self.num_envs)]
+        self.stall_penalty_given = [[False] for _ in range(self.num_envs)]
         self.all_subgoals_finished = np.zeros(self.num_envs, dtype=bool)
 
     def reset(self, env_indices, distances_to_subgoals):
@@ -64,11 +68,15 @@ class SubgoalRewardTracker:
                 distances[0], self.config.distance_epsilon
             )
             self.non_positive_progress_steps[env_idx] = 0
+            self.valid_reward_steps[env_idx] = 0
+            self.stall_penalty_steps[env_idx] = 0
+            self.cumulative_normalized_progress[env_idx] = 0.0
             self.cumulative_progress[env_idx] = 0.0
             self.cumulative_subgoal_success[env_idx] = 0.0
             self.cumulative_penalty[env_idx] = 0.0
             self.cumulative_stop[env_idx] = 0.0
             self.subgoal_success_given[env_idx] = [False] * len(distances)
+            self.stall_penalty_given[env_idx] = [False] * len(distances)
             self.all_subgoals_finished[env_idx] = False
 
     def compute_step(self, distances_to_subgoals, is_stop, valid_mask):
@@ -84,13 +92,21 @@ class SubgoalRewardTracker:
             distances = self._validate_distances(distances)
             active_idx = int(self.active_subgoal_index[env_idx])
             final_distance = float(distances[-1])
+            self.valid_reward_steps[env_idx] += 1
 
             if self.all_subgoals_finished[env_idx]:
                 stop_reward = self._stop_reward(env_idx, final_distance, is_stop[env_idx])
                 self.cumulative_stop[env_idx] += stop_reward
                 reward[env_idx] = stop_reward
                 components["r_stop"][env_idx] = stop_reward
-                self._write_state_components(components, env_idx, 0.0, final_distance)
+                self._write_state_components(
+                    components,
+                    env_idx,
+                    0.0,
+                    final_distance,
+                    final_distance,
+                    is_stop[env_idx],
+                )
                 continue
 
             active_distance = float(distances[active_idx])
@@ -117,6 +133,8 @@ class SubgoalRewardTracker:
                 self.config.stall_patience
             ):
                 penalty = -float(self.config.stall_penalty_coeff)
+                self.stall_penalty_steps[env_idx] += 1
+                self.stall_penalty_given[env_idx][active_idx] = True
 
             subgoal_success = 0.0
             is_final_subgoal = active_idx == int(self.num_subgoals[env_idx]) - 1
@@ -157,6 +175,7 @@ class SubgoalRewardTracker:
             self.cumulative_subgoal_success[env_idx] += subgoal_success
             self.cumulative_penalty[env_idx] += penalty
             self.cumulative_stop[env_idx] += stop_reward
+            self.cumulative_normalized_progress[env_idx] += normalized_progress
 
             components["r_progress"][env_idx] = progress_reward
             components["r_subgoal_success"][env_idx] = subgoal_success
@@ -167,6 +186,8 @@ class SubgoalRewardTracker:
                 env_idx,
                 normalized_progress,
                 active_distance,
+                final_distance,
+                is_stop[env_idx],
             )
 
         return reward, components
@@ -197,6 +218,28 @@ class SubgoalRewardTracker:
             "cumulative_subgoal_success": self.cumulative_subgoal_success.copy(),
             "cumulative_penalty": self.cumulative_penalty.copy(),
             "cumulative_stop": self.cumulative_stop.copy(),
+            "num_subgoals": self.num_subgoals.astype(np.float32).copy(),
+            "num_intermediate_subgoals": np.maximum(
+                self.num_subgoals.astype(np.float32) - 1.0,
+                0.0,
+            ),
+            "subgoal_completion_ratio": np.zeros(self.num_envs, dtype=np.float32),
+            "precision_subgoal_success_ratio": np.zeros(
+                self.num_envs, dtype=np.float32
+            ),
+            "stall_penalty_rate": np.zeros(self.num_envs, dtype=np.float32),
+            "any_stall_penalty_subgoal": np.zeros(self.num_envs, dtype=np.float32),
+            "stall_then_goal_success": np.zeros(self.num_envs, dtype=np.float32),
+            "first_stall_penalty_rate": np.zeros(self.num_envs, dtype=np.float32),
+            "premature_stop_ratio": np.zeros(self.num_envs, dtype=np.float32),
+            "final_goal_success_ratio": np.zeros(self.num_envs, dtype=np.float32),
+            "distance_to_final_goal": np.zeros(self.num_envs, dtype=np.float32),
+            "stop_action_ratio": np.zeros(self.num_envs, dtype=np.float32),
+            "mean_normalized_progress": np.zeros(self.num_envs, dtype=np.float32),
+            "cumulative_progress_reward": self.cumulative_progress.copy(),
+            "cumulative_subgoal_success_reward": self.cumulative_subgoal_success.copy(),
+            "cumulative_penalty_reward": self.cumulative_penalty.copy(),
+            "cumulative_stop_reward": self.cumulative_stop.copy(),
         }
 
     def _write_state_components(
@@ -205,6 +248,8 @@ class SubgoalRewardTracker:
         env_idx: int,
         normalized_progress: float,
         distance_to_active_subgoal: float,
+        distance_to_final_goal: float,
+        is_stop: bool,
     ):
         components["active_subgoal_index"][env_idx] = float(
             self.active_subgoal_index[env_idx]
@@ -226,6 +271,62 @@ class SubgoalRewardTracker:
             self.cumulative_penalty[env_idx]
         )
         components["cumulative_stop"][env_idx] = float(self.cumulative_stop[env_idx])
+        components["num_subgoals"][env_idx] = float(self.num_subgoals[env_idx])
+        components["num_intermediate_subgoals"][env_idx] = float(
+            max(int(self.num_subgoals[env_idx]) - 1, 0)
+        )
+        components["subgoal_completion_ratio"][env_idx] = self._safe_ratio(
+            float(self.completed_subgoal_count[env_idx]),
+            float(self.num_subgoals[env_idx]),
+        )
+        components["precision_subgoal_success_ratio"][env_idx] = self._safe_ratio(
+            float(sum(self.subgoal_success_given[env_idx][:-1])),
+            float(max(int(self.num_subgoals[env_idx]) - 1, 1)),
+        )
+        components["stall_penalty_rate"][env_idx] = self._safe_ratio(
+            float(self.stall_penalty_steps[env_idx]),
+            float(self.valid_reward_steps[env_idx]),
+        )
+        has_stall = any(self.stall_penalty_given[env_idx])
+        final_goal_success = bool(
+            is_stop
+            and distance_to_final_goal <= float(self.config.final_success_distance)
+        )
+        premature_stop = bool(is_stop and not self.all_subgoals_finished[env_idx])
+        components["any_stall_penalty_subgoal"][env_idx] = float(has_stall)
+        components["stall_then_goal_success"][env_idx] = float(
+            has_stall and final_goal_success
+        )
+        components["first_stall_penalty_rate"][env_idx] = self._safe_ratio(
+            float(sum(self.stall_penalty_given[env_idx])),
+            float(self.num_subgoals[env_idx]),
+        )
+        components["premature_stop_ratio"][env_idx] = float(premature_stop)
+        components["final_goal_success_ratio"][env_idx] = float(final_goal_success)
+        components["distance_to_final_goal"][env_idx] = float(distance_to_final_goal)
+        components["stop_action_ratio"][env_idx] = float(is_stop)
+        components["mean_normalized_progress"][env_idx] = self._safe_ratio(
+            float(self.cumulative_normalized_progress[env_idx]),
+            float(self.valid_reward_steps[env_idx]),
+        )
+        components["cumulative_progress_reward"][env_idx] = float(
+            self.cumulative_progress[env_idx]
+        )
+        components["cumulative_subgoal_success_reward"][env_idx] = float(
+            self.cumulative_subgoal_success[env_idx]
+        )
+        components["cumulative_penalty_reward"][env_idx] = float(
+            self.cumulative_penalty[env_idx]
+        )
+        components["cumulative_stop_reward"][env_idx] = float(
+            self.cumulative_stop[env_idx]
+        )
+
+    @staticmethod
+    def _safe_ratio(numerator: float, denominator: float) -> float:
+        if denominator <= 0.0:
+            return 0.0
+        return float(numerator) / float(denominator)
 
     @staticmethod
     def _validate_distances(distances):

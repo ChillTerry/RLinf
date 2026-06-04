@@ -150,6 +150,106 @@ def test_stall_penalty_starts_after_patience_threshold():
     assert math.isclose(second_reward[0], -1.625, rel_tol=1e-6)
 
 
+def test_subgoal_reward_tensorboard_diagnostics_track_episode_state():
+    tracker = _tracker(stall_patience=2, stall_penalty_coeff=1.5)
+    tracker.reset([0], [[4.0, 2.0, 3.0]])
+
+    _, first_components = tracker.compute_step(
+        distances_to_subgoals=[[4.0, 2.0, 3.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, second_components = tracker.compute_step(
+        distances_to_subgoals=[[4.2, 2.0, 3.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, third_components = tracker.compute_step(
+        distances_to_subgoals=[[0.4, 1.5, 2.5]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert third_components["num_subgoals"][0] == 3.0
+    assert math.isclose(
+        third_components["subgoal_completion_ratio"][0],
+        1.0 / 3.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        third_components["precision_subgoal_success_ratio"][0],
+        0.5,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        third_components["stall_penalty_rate"][0],
+        1.0 / 3.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        third_components["first_stall_penalty_rate"][0],
+        1.0 / 3.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        third_components["mean_normalized_progress"][0],
+        0.3,
+        rel_tol=1e-6,
+    )
+    assert third_components["any_stall_penalty_subgoal"][0] == 1.0
+    assert third_components["stall_then_goal_success"][0] == 0.0
+    assert third_components["final_goal_success_ratio"][0] == 0.0
+    assert third_components["premature_stop_ratio"][0] == 0.0
+    assert third_components["stop_action_ratio"][0] == 0.0
+    assert third_components["distance_to_final_goal"][0] == 2.5
+    assert (
+        third_components["cumulative_progress_reward"][0]
+        == tracker.cumulative_progress[0]
+    )
+    assert (
+        third_components["cumulative_subgoal_success_reward"][0]
+        == tracker.cumulative_subgoal_success[0]
+    )
+    assert (
+        third_components["cumulative_penalty_reward"][0]
+        == tracker.cumulative_penalty[0]
+    )
+    assert third_components["cumulative_stop_reward"][0] == tracker.cumulative_stop[0]
+    assert first_components["any_stall_penalty_subgoal"][0] == 0.0
+    assert second_components["any_stall_penalty_subgoal"][0] == 1.0
+
+
+def test_stall_then_goal_success_diagnostic_uses_stall_denominator():
+    tracker = _tracker(stall_patience=1, stop_success_reward_coef=10.0)
+    tracker.reset([0], [[2.0]])
+
+    _, first_components = tracker.compute_step(
+        distances_to_subgoals=[[2.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, second_components = tracker.compute_step(
+        distances_to_subgoals=[[0.4]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, final_components = tracker.compute_step(
+        distances_to_subgoals=[[0.75]],
+        is_stop=np.array([True]),
+        valid_mask=np.array([True]),
+    )
+
+    assert first_components["any_stall_penalty_subgoal"][0] == 1.0
+    assert first_components["stall_then_goal_success"][0] == 0.0
+    assert second_components["any_stall_penalty_subgoal"][0] == 1.0
+    assert second_components["stall_then_goal_success"][0] == 0.0
+    assert final_components["any_stall_penalty_subgoal"][0] == 1.0
+    assert final_components["stall_then_goal_success"][0] == 1.0
+    assert final_components["final_goal_success_ratio"][0] == 1.0
+    assert final_components["stop_action_ratio"][0] == 1.0
+    assert final_components["premature_stop_ratio"][0] == 0.0
+
+
 def test_premature_stop_is_penalized_before_all_subgoals_finish():
     tracker = _tracker(premature_stop_coeff=4.0)
     tracker.reset([0], [[3.0, 5.0]])
