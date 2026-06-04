@@ -119,13 +119,16 @@ class SubgoalRewardTracker:
                 penalty = -float(self.config.stall_penalty_coeff)
 
             subgoal_success = 0.0
+            is_final_subgoal = active_idx == int(self.num_subgoals[env_idx]) - 1
             if (
-                active_distance <= float(self.config.subgoal_success_distance)
+                not is_final_subgoal
+                and active_distance <= float(self.config.subgoal_success_distance)
                 and not self.subgoal_success_given[env_idx][active_idx]
             ):
+                num_rewarded_subgoals = max(int(self.num_subgoals[env_idx]) - 1, 1)
                 subgoal_success = float(
                     self.config.subgoal_success_reward_coef
-                ) / float(self.num_subgoals[env_idx])
+                ) / float(num_rewarded_subgoals)
                 self.subgoal_success_given[env_idx][active_idx] = True
 
             stop_reward = self._stop_reward(env_idx, final_distance, is_stop[env_idx])

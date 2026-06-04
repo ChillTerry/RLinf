@@ -63,9 +63,9 @@ def test_progress_is_clipped_to_unit_scale():
         valid_mask=np.array([True]),
     )
 
-    assert reward[0] == 7.0
+    assert reward[0] == 1.0
     assert components["r_progress"][0] == 1.0
-    assert components["r_subgoal_success"][0] == 6.0
+    assert components["r_subgoal_success"][0] == 0.0
     assert components["normalized_progress"][0] == 1.0
 
 
@@ -95,12 +95,12 @@ def test_subgoal_success_bonus_is_normalized_by_subgoal_count():
         valid_mask=np.array([True]),
     )
 
-    assert math.isclose(components["r_subgoal_success"][0], 2.0, rel_tol=1e-6)
-    assert math.isclose(tracker.cumulative_subgoal_success[0], 2.0, rel_tol=1e-6)
+    assert math.isclose(components["r_subgoal_success"][0], 3.0, rel_tol=1e-6)
+    assert math.isclose(tracker.cumulative_subgoal_success[0], 3.0, rel_tol=1e-6)
     assert tracker.active_subgoal_index.tolist() == [1]
     assert tracker.completed_subgoal_count.tolist() == [1]
     assert math.isclose(tracker.initial_distance_to_active_subgoal[0], 2.0, rel_tol=1e-6)
-    assert math.isclose(reward[0], 2.8666666667, rel_tol=1e-6)
+    assert math.isclose(reward[0], 3.8666666667, rel_tol=1e-6)
 
 
 def test_switch_without_precision_bonus_permanently_loses_that_bonus():
@@ -125,8 +125,8 @@ def test_switch_without_precision_bonus_permanently_loses_that_bonus():
         valid_mask=np.array([True]),
     )
 
-    assert math.isclose(second_components["r_subgoal_success"][0], 2.0, rel_tol=1e-6)
-    assert math.isclose(tracker.cumulative_subgoal_success[0], 2.0, rel_tol=1e-6)
+    assert math.isclose(second_components["r_subgoal_success"][0], 3.0, rel_tol=1e-6)
+    assert math.isclose(tracker.cumulative_subgoal_success[0], 3.0, rel_tol=1e-6)
 
 
 def test_stall_penalty_starts_after_patience_threshold():
@@ -180,7 +180,7 @@ def test_final_stop_success_is_scaled_by_final_distance_after_all_subgoals_finis
         valid_mask=np.array([True]),
     )
 
-    assert first_components["r_subgoal_success"][0] == 6.0
+    assert first_components["r_subgoal_success"][0] == 0.0
     assert tracker.all_subgoals_finished.tolist() == [True]
     assert math.isclose(second_components["r_stop"][0], 7.5, rel_tol=1e-6)
     assert second_reward[0] == 7.5
@@ -201,9 +201,9 @@ def test_stop_on_same_step_as_final_subgoal_switch_is_still_premature():
     )
 
     assert tracker.all_subgoals_finished.tolist() == [True]
-    assert components["r_subgoal_success"][0] == 6.0
+    assert components["r_subgoal_success"][0] == 0.0
     assert components["r_stop"][0] == -4.0
-    assert math.isclose(reward[0], 2.8, rel_tol=1e-6)
+    assert math.isclose(reward[0], -3.2, rel_tol=1e-6)
 
 
 def test_invalid_mask_keeps_reward_and_state_unchanged():
