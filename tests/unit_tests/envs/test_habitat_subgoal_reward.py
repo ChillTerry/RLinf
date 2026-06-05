@@ -31,8 +31,11 @@ def _tracker(num_envs=1, **kwargs):
         stop_success_reward_coef=kwargs.get("stop_success_reward_coef", 10.0),
         final_success_distance=kwargs.get("final_success_distance", 3.0),
         premature_stop_coeff=kwargs.get("premature_stop_coeff", 4.0),
+        failure_stop_coeff=kwargs.get("failure_stop_coeff", 5.0),
         stall_patience=kwargs.get("stall_patience", 3),
         stall_penalty_coeff=kwargs.get("stall_penalty_coeff", 1.0),
+        stall_recovery_patience=kwargs.get("stall_recovery_patience", 2),
+        stall_observation_patience=kwargs.get("stall_observation_patience", 2),
     )
     return SubgoalRewardTracker(num_envs=num_envs, config=config)
 
@@ -167,6 +170,54 @@ def test_stall_penalty_starts_after_patience_threshold():
     assert second_components["r_penalty"][0] == -1.5
     assert first_reward[0] == 0.0
     assert math.isclose(second_reward[0], -1.625, rel_tol=1e-6)
+
+
+def test_stalled_state_requires_consecutive_positive_progress_to_recover():
+    tracker = _tracker(
+        progress_reward_coef=1.0,
+        stall_patience=2,
+        stall_penalty_coeff=1.5,
+        stall_recovery_patience=2,
+        stall_observation_patience=1,
+    )
+    tracker.reset([0], [[4.0]])
+
+    _, first_components = tracker.compute_step(
+        distances_to_subgoals=[[4.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, second_components = tracker.compute_step(
+        distances_to_subgoals=[[4.5]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, recovery_components = tracker.compute_step(
+        distances_to_subgoals=[[4.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, observation_components = tracker.compute_step(
+        distances_to_subgoals=[[4.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    _, stalled_components = tracker.compute_step(
+        distances_to_subgoals=[[4.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert first_components["r_penalty"][0] == 0.0
+    assert second_components["r_penalty"][0] == -1.5
+    assert recovery_components["r_penalty"][0] == 0.0
+    assert observation_components["r_penalty"][0] == 0.0
+    assert stalled_components["r_penalty"][0] == -1.5
+    assert math.isclose(
+        stalled_components["stall_penalty_rate"][0],
+        2.0 / 5.0,
+        rel_tol=1e-6,
+    )
 
 
 def test_subgoal_reward_tensorboard_diagnostics_track_episode_state():
@@ -305,6 +356,33 @@ def test_final_stop_success_is_scaled_by_final_distance_after_all_subgoals_finis
     assert tracker.all_subgoals_finished.tolist() == [True]
     assert math.isclose(second_components["r_stop"][0], 7.5, rel_tol=1e-6)
     assert second_reward[0] == 7.5
+
+
+def test_final_stop_failure_is_penalized_after_all_subgoals_finish():
+    tracker = _tracker(
+        failure_stop_coeff=5.0,
+        final_success_distance=3.0,
+        stop_success_reward_coef=10.0,
+    )
+    tracker.reset([0], [[2.0]])
+
+    _, first_components = tracker.compute_step(
+        distances_to_subgoals=[[0.4]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    second_reward, second_components = tracker.compute_step(
+        distances_to_subgoals=[[3.5]],
+        is_stop=np.array([True]),
+        valid_mask=np.array([True]),
+    )
+
+    assert first_components["r_stop"][0] == 0.0
+    assert tracker.all_subgoals_finished.tolist() == [True]
+    assert second_components["r_stop"][0] == -5.0
+    assert second_components["final_goal_success_ratio"][0] == 0.0
+    assert second_components["premature_stop_ratio"][0] == 0.0
+    assert second_reward[0] == -5.0
 
 
 def test_stop_on_same_step_as_final_subgoal_switch_is_still_premature():

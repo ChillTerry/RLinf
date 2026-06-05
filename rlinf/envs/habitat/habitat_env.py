@@ -204,8 +204,13 @@ class HabitatEnv(gym.Env):
                     stop_success_reward_coef=float(self.cfg.stop_success_reward_coef),
                     final_success_distance=float(self.cfg.final_success_distance),
                     premature_stop_coeff=float(self.cfg.premature_stop_coeff),
+                    failure_stop_coeff=float(self.cfg.failure_stop_coeff),
                     stall_patience=int(self.cfg.stall_patience),
                     stall_penalty_coeff=float(self.cfg.stall_penalty_coeff),
+                    stall_recovery_patience=int(self.cfg.stall_recovery_patience),
+                    stall_observation_patience=int(
+                        self.cfg.stall_observation_patience
+                    ),
                 ),
             )
 

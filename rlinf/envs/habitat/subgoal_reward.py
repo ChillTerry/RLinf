@@ -26,8 +26,11 @@ class SubgoalRewardConfig:
     stop_success_reward_coef: float
     final_success_distance: float
     premature_stop_coeff: float
+    failure_stop_coeff: float
     stall_patience: int
     stall_penalty_coeff: float
+    stall_recovery_patience: int
+    stall_observation_patience: int
     distance_epsilon: float = 1.0e-6
 
 
@@ -45,6 +48,11 @@ class SubgoalRewardTracker:
             self.num_envs, dtype=np.float32
         )
         self.non_positive_progress_steps = np.zeros(self.num_envs, dtype=np.int32)
+        self.stalled = np.zeros(self.num_envs, dtype=bool)
+        self.stall_recovery_progress_steps = np.zeros(
+            self.num_envs, dtype=np.int32
+        )
+        self.stall_observation_steps = np.zeros(self.num_envs, dtype=np.int32)
         self.valid_reward_steps = np.zeros(self.num_envs, dtype=np.int32)
         self.stall_penalty_steps = np.zeros(self.num_envs, dtype=np.int32)
         self.cumulative_normalized_progress = np.zeros(self.num_envs, dtype=np.float32)
@@ -68,6 +76,9 @@ class SubgoalRewardTracker:
                 distances[0], self.config.distance_epsilon
             )
             self.non_positive_progress_steps[env_idx] = 0
+            self.stalled[env_idx] = False
+            self.stall_recovery_progress_steps[env_idx] = 0
+            self.stall_observation_steps[env_idx] = 0
             self.valid_reward_steps[env_idx] = 0
             self.stall_penalty_steps[env_idx] = 0
             self.cumulative_normalized_progress[env_idx] = 0.0
@@ -127,16 +138,42 @@ class SubgoalRewardTracker:
                 / float(self.num_subgoals[env_idx])
             )
 
-            if normalized_progress <= 0.0:
+            penalty = 0.0
+            if self.stalled[env_idx]:
+                if normalized_progress > 0.0:
+                    self.stall_recovery_progress_steps[env_idx] += 1
+                    self.stall_observation_steps[env_idx] = 0
+                    if self.stall_recovery_progress_steps[env_idx] >= int(
+                        self.config.stall_recovery_patience
+                    ):
+                        self.stalled[env_idx] = False
+                        self.non_positive_progress_steps[env_idx] = 0
+                        self.stall_recovery_progress_steps[env_idx] = 0
+                        self.stall_observation_steps[env_idx] = 0
+                elif normalized_progress == 0.0:
+                    self.stall_recovery_progress_steps[env_idx] = 0
+                    self.stall_observation_steps[env_idx] += 1
+                    if self.stall_observation_steps[env_idx] > int(
+                        self.config.stall_observation_patience
+                    ):
+                        penalty = -float(self.config.stall_penalty_coeff)
+                else:
+                    self.stall_recovery_progress_steps[env_idx] = 0
+                    self.stall_observation_steps[env_idx] = 0
+                    penalty = -float(self.config.stall_penalty_coeff)
+            elif normalized_progress <= 0.0:
                 self.non_positive_progress_steps[env_idx] += 1
+                if self.non_positive_progress_steps[env_idx] >= int(
+                    self.config.stall_patience
+                ):
+                    self.stalled[env_idx] = True
+                    self.stall_recovery_progress_steps[env_idx] = 0
+                    self.stall_observation_steps[env_idx] = 0
+                    penalty = -float(self.config.stall_penalty_coeff)
             else:
                 self.non_positive_progress_steps[env_idx] = 0
 
-            penalty = 0.0
-            if self.non_positive_progress_steps[env_idx] >= int(
-                self.config.stall_patience
-            ):
-                penalty = -float(self.config.stall_penalty_coeff)
+            if penalty < 0.0:
                 self.stall_penalty_steps[env_idx] += 1
                 self.stall_penalty_given[env_idx][active_idx] = True
 
@@ -169,6 +206,9 @@ class SubgoalRewardTracker:
                         next_distance, self.config.distance_epsilon
                     )
                     self.non_positive_progress_steps[env_idx] = 0
+                    self.stalled[env_idx] = False
+                    self.stall_recovery_progress_steps[env_idx] = 0
+                    self.stall_observation_steps[env_idx] = 0
             else:
                 self.previous_distance_to_active_subgoal[env_idx] = active_distance
 
@@ -199,6 +239,8 @@ class SubgoalRewardTracker:
     def _stop_reward(self, env_idx: int, final_distance: float, is_stop: bool) -> float:
         if not is_stop:
             return 0.0
+        if final_distance > float(self.config.final_success_distance):
+            return -float(self.config.failure_stop_coeff)
         if not self.all_subgoals_finished[env_idx]:
             return -float(self.config.premature_stop_coeff)
         success_scale = 1.0 - min(

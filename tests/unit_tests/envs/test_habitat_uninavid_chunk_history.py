@@ -77,18 +77,21 @@ def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
     assert "success_reward_coef" not in raw_cfg["algorithm"]
     assert "ndtw_reward_coef" not in raw_cfg["algorithm"]
     assert raw_cfg["algorithm"]["reward_mode"] == "subgoal_progress"
-    assert raw_cfg["algorithm"]["progress_reward_coef"] == 1.0
-    assert raw_cfg["algorithm"]["subgoal_success_reward_coef"] == 6.0
-    assert raw_cfg["algorithm"]["subgoal_switch_distance"] == 1.0
-    assert raw_cfg["algorithm"]["subgoal_success_distance"] == 0.5
-    assert raw_cfg["algorithm"]["stop_success_reward_coef"] == 10.0
-    assert raw_cfg["algorithm"]["final_success_distance"] == 3.0
-    assert raw_cfg["algorithm"]["premature_stop_coeff"] == 4.0
-    assert raw_cfg["algorithm"]["stall_patience"] == 3
-    assert raw_cfg["algorithm"]["stall_penalty_coeff"] == 1.0
+    assert raw_cfg["algorithm"]["progress_reward_coef"] == 20
+    assert raw_cfg["algorithm"]["subgoal_success_reward_coef"] == 10
+    assert raw_cfg["algorithm"]["subgoal_switch_distance"] == 1.5
+    assert raw_cfg["algorithm"]["subgoal_success_distance"] == 1.0
+    assert raw_cfg["algorithm"]["stop_success_reward_coef"] == 10
+    assert raw_cfg["algorithm"]["final_success_distance"] == 2.0
+    assert raw_cfg["algorithm"]["premature_stop_coeff"] == 0
+    assert raw_cfg["algorithm"]["failure_stop_coeff"] == 10
+    assert raw_cfg["algorithm"]["stall_patience"] == 8
+    assert raw_cfg["algorithm"]["stall_penalty_coeff"] == 0.2
+    assert raw_cfg["algorithm"]["stall_recovery_patience"] == 3
+    assert raw_cfg["algorithm"]["stall_observation_patience"] == 6
     assert raw_cfg["algorithm"]["filter_rewards"] is False
-    assert raw_cfg["algorithm"]["rewards_lower_bound"] == -1000000000.0
-    assert raw_cfg["algorithm"]["rewards_upper_bound"] == 1000000000.0
+    assert raw_cfg["algorithm"]["rewards_lower_bound"] == -10.0
+    assert raw_cfg["algorithm"]["rewards_upper_bound"] == 10.0
     assert "success_reward_coef" not in raw_cfg["env"]["train"]
     assert "ndtw_reward_coef" not in raw_cfg["env"]["train"]
     assert raw_cfg["env"]["train"]["reward_mode"] == "${algorithm.reward_mode}"
@@ -99,11 +102,23 @@ def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
     assert raw_cfg["env"]["train"]["stop_success_reward_coef"] == "${algorithm.stop_success_reward_coef}"
     assert raw_cfg["env"]["train"]["final_success_distance"] == "${algorithm.final_success_distance}"
     assert raw_cfg["env"]["train"]["premature_stop_coeff"] == "${algorithm.premature_stop_coeff}"
+    assert (
+        raw_cfg["env"]["train"]["failure_stop_coeff"]
+        == "${algorithm.failure_stop_coeff}"
+    )
     assert raw_cfg["env"]["train"]["stall_patience"] == "${algorithm.stall_patience}"
     assert raw_cfg["env"]["train"]["stall_penalty_coeff"] == "${algorithm.stall_penalty_coeff}"
     assert (
+        raw_cfg["env"]["train"]["stall_recovery_patience"]
+        == "${algorithm.stall_recovery_patience}"
+    )
+    assert (
+        raw_cfg["env"]["train"]["stall_observation_patience"]
+        == "${algorithm.stall_observation_patience}"
+    )
+    assert (
         raw_cfg["env"]["train"]["data_path"]
-        == "${env.data_path_dir}/${env.train.split}/r2r_train_with_subgoals.json"
+        == "${env.data_path_dir}/${env.train.split}/${env.train.split}_subgoal.json.gz"
     )
     assert (
         raw_cfg["env"]["train"]["ndtw_gt_path"]
@@ -119,15 +134,27 @@ def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
     assert raw_cfg["env"]["eval"]["stop_success_reward_coef"] == "${algorithm.stop_success_reward_coef}"
     assert raw_cfg["env"]["eval"]["final_success_distance"] == "${algorithm.final_success_distance}"
     assert raw_cfg["env"]["eval"]["premature_stop_coeff"] == "${algorithm.premature_stop_coeff}"
+    assert (
+        raw_cfg["env"]["eval"]["failure_stop_coeff"]
+        == "${algorithm.failure_stop_coeff}"
+    )
     assert raw_cfg["env"]["eval"]["stall_patience"] == "${algorithm.stall_patience}"
     assert raw_cfg["env"]["eval"]["stall_penalty_coeff"] == "${algorithm.stall_penalty_coeff}"
     assert (
+        raw_cfg["env"]["eval"]["stall_recovery_patience"]
+        == "${algorithm.stall_recovery_patience}"
+    )
+    assert (
+        raw_cfg["env"]["eval"]["stall_observation_patience"]
+        == "${algorithm.stall_observation_patience}"
+    )
+    assert (
         raw_cfg["env"]["eval"]["data_path"]
-        == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz"
+        == "${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}.json.gz"
     )
     assert (
         raw_cfg["env"]["eval"]["ndtw_gt_path"]
-        == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
+        == "${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_gt.json.gz"
     )
 
 
@@ -567,6 +594,7 @@ def test_habitat_subgoal_reward_reset_initializes_tracker():
         stop_success_reward_coef=10.0,
         final_success_distance=3.0,
         premature_stop_coeff=4.0,
+        failure_stop_coeff=5.0,
         stall_patience=3,
         stall_penalty_coeff=1.0,
     )
@@ -581,8 +609,11 @@ def test_habitat_subgoal_reward_reset_initializes_tracker():
             stop_success_reward_coef=10.0,
             final_success_distance=3.0,
             premature_stop_coeff=4.0,
+            failure_stop_coeff=5.0,
             stall_patience=3,
             stall_penalty_coeff=1.0,
+            stall_recovery_patience=2,
+            stall_observation_patience=2,
         ),
     )
     env.env = SimpleNamespace(
@@ -612,8 +643,11 @@ def test_habitat_subgoal_reward_dispatch_uses_dense_reward_and_attaches_metrics(
             stop_success_reward_coef=10.0,
             final_success_distance=3.0,
             premature_stop_coeff=4.0,
+            failure_stop_coeff=5.0,
             stall_patience=3,
             stall_penalty_coeff=1.0,
+            stall_recovery_patience=2,
+            stall_observation_patience=2,
         ),
     )
     env.subgoal_reward.reset([0], [[4.0, 8.0]])
@@ -711,8 +745,11 @@ def test_habitat_step_writes_subgoal_reward_metrics_after_current_step(tmp_path)
             stop_success_reward_coef=10.0,
             final_success_distance=3.0,
             premature_stop_coeff=4.0,
+            failure_stop_coeff=5.0,
             stall_patience=3,
             stall_penalty_coeff=1.0,
+            stall_recovery_patience=2,
+            stall_observation_patience=2,
         ),
     )
     env.subgoal_reward.reset([0], [[4.0]])
