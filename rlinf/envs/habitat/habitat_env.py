@@ -614,7 +614,7 @@ class HabitatEnv(gym.Env):
 
         metadata = self.env.get_current_episode_goal_distances()
         reward, components = self.subgoal_reward.compute_step(
-            distances_to_subgoals=metadata["distances_to_goals"],
+            distances_to_goals=metadata["distances_to_goals"],
             is_stop=is_stop,
             valid_mask=valid_reward_mask,
         )

@@ -624,7 +624,8 @@ def test_habitat_subgoal_reward_reset_initializes_tracker():
 
     env._reset_subgoal_reward_state(np.array([0, 1]))
 
-    assert env.subgoal_reward.num_subgoals.tolist() == [2, 1]
+    assert env.subgoal_reward.num_goals.tolist() == [2, 1]
+    assert env.subgoal_reward.num_subgoals.tolist() == [1, 0]
     assert env.subgoal_reward.previous_distance_to_active_subgoal.tolist() == [4.0, 3.0]
 
 

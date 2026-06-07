@@ -71,17 +71,17 @@ algorithm:
 
   reward_mode: subgoal_progress
   progress_reward_coef: 20
-  subgoal_success_reward_coef: 10
+  subgoal_success_reward_coef: 0
   stop_success_reward_coef: 20
   premature_stop_coeff: 0
   failure_stop_coeff: 10
-  stall_penalty_coeff: 0.2
-  stall_patience: 8
+  stall_penalty_coeff: 0.0
+  stall_patience: 9
   stall_recovery_patience: 3
   stall_observation_patience: 6
   final_success_distance: 2.0
-  subgoal_switch_distance: 1.5
-  subgoal_success_distance: 1.0
+  subgoal_switch_distance: 2.0
+  subgoal_success_distance: 2.0
   filter_rewards: False
   rewards_lower_bound: -10.0
   rewards_upper_bound: 10.0

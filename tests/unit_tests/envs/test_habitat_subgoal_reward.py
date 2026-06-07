@@ -45,7 +45,7 @@ def test_progress_is_normalized_by_active_subgoal_initial_distance():
     tracker.reset([0], [[4.0, 8.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[3.0, 7.0]],
+        distances_to_goals=[[3.0, 7.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -61,7 +61,7 @@ def test_progress_reward_is_normalized_by_episode_subgoal_count():
     tracker.reset([0], [[4.0, 8.0, 12.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[3.0, 7.0, 11.0]],
+        distances_to_goals=[[3.0, 7.0, 11.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -76,7 +76,7 @@ def test_progress_is_clipped_to_unit_scale():
     tracker.reset([0], [[2.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[0.0]],
+        distances_to_goals=[[0.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -92,7 +92,7 @@ def test_negative_progress_produces_negative_progress_reward():
     tracker.reset([0], [[4.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[5.0]],
+        distances_to_goals=[[5.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -108,7 +108,7 @@ def test_subgoal_success_bonus_is_normalized_by_subgoal_count():
     tracker.reset([0], [[3.0, 4.0, 5.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[0.4, 2.0, 4.0]],
+        distances_to_goals=[[0.4, 2.0, 4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -128,7 +128,7 @@ def test_switch_without_precision_bonus_permanently_loses_that_bonus():
     tracker.reset([0], [[3.0, 4.0, 5.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[0.75, 2.0, 4.0]],
+        distances_to_goals=[[0.75, 2.0, 4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -142,7 +142,7 @@ def test_switch_without_precision_bonus_permanently_loses_that_bonus():
     assert math.isclose(reward[0], 0.25, rel_tol=1e-6)
 
     _, second_components = tracker.compute_step(
-        distances_to_subgoals=[[0.2, 0.4, 3.0]],
+        distances_to_goals=[[0.2, 0.4, 3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -156,12 +156,12 @@ def test_stall_penalty_starts_after_patience_threshold():
     tracker.reset([0], [[4.0]])
 
     first_reward, first_components = tracker.compute_step(
-        distances_to_subgoals=[[4.0]],
+        distances_to_goals=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     second_reward, second_components = tracker.compute_step(
-        distances_to_subgoals=[[4.5]],
+        distances_to_goals=[[4.5]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -183,27 +183,27 @@ def test_stalled_state_requires_consecutive_positive_progress_to_recover():
     tracker.reset([0], [[4.0]])
 
     _, first_components = tracker.compute_step(
-        distances_to_subgoals=[[4.0]],
+        distances_to_goals=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, second_components = tracker.compute_step(
-        distances_to_subgoals=[[4.5]],
+        distances_to_goals=[[4.5]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, recovery_components = tracker.compute_step(
-        distances_to_subgoals=[[4.0]],
+        distances_to_goals=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, observation_components = tracker.compute_step(
-        distances_to_subgoals=[[4.0]],
+        distances_to_goals=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, stalled_components = tracker.compute_step(
-        distances_to_subgoals=[[4.0]],
+        distances_to_goals=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -225,25 +225,27 @@ def test_subgoal_reward_tensorboard_diagnostics_track_episode_state():
     tracker.reset([0], [[4.0, 2.0, 3.0]])
 
     _, first_components = tracker.compute_step(
-        distances_to_subgoals=[[4.0, 2.0, 3.0]],
+        distances_to_goals=[[4.0, 2.0, 3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, second_components = tracker.compute_step(
-        distances_to_subgoals=[[4.2, 2.0, 3.0]],
+        distances_to_goals=[[4.2, 2.0, 3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, third_components = tracker.compute_step(
-        distances_to_subgoals=[[0.4, 1.5, 2.5]],
+        distances_to_goals=[[0.4, 1.5, 2.5]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
 
-    assert third_components["num_subgoals"][0] == 3.0
+    assert third_components["num_goals"][0] == 3.0
+    assert third_components["num_subgoals"][0] == 2.0
+    assert third_components["num_intermediate_subgoals"][0] == 2.0
     assert math.isclose(
         third_components["subgoal_completion_ratio"][0],
-        1.0 / 3.0,
+        1.0 / 2.0,
         rel_tol=1e-6,
     )
     assert math.isclose(
@@ -272,19 +274,13 @@ def test_subgoal_reward_tensorboard_diagnostics_track_episode_state():
     assert third_components["premature_stop_ratio"][0] == 0.0
     assert third_components["stop_action_ratio"][0] == 0.0
     assert third_components["distance_to_final_goal"][0] == 2.5
+    assert third_components["cumulative_progress"][0] == tracker.cumulative_progress[0]
     assert (
-        third_components["cumulative_progress_reward"][0]
-        == tracker.cumulative_progress[0]
-    )
-    assert (
-        third_components["cumulative_subgoal_success_reward"][0]
+        third_components["cumulative_subgoal_success"][0]
         == tracker.cumulative_subgoal_success[0]
     )
-    assert (
-        third_components["cumulative_penalty_reward"][0]
-        == tracker.cumulative_penalty[0]
-    )
-    assert third_components["cumulative_stop_reward"][0] == tracker.cumulative_stop[0]
+    assert third_components["cumulative_penalty"][0] == tracker.cumulative_penalty[0]
+    assert third_components["cumulative_stop"][0] == tracker.cumulative_stop[0]
     assert first_components["any_stall_penalty_subgoal"][0] == 0.0
     assert second_components["any_stall_penalty_subgoal"][0] == 1.0
 
@@ -294,17 +290,17 @@ def test_stall_then_goal_success_diagnostic_uses_stall_denominator():
     tracker.reset([0], [[2.0]])
 
     _, first_components = tracker.compute_step(
-        distances_to_subgoals=[[2.0]],
+        distances_to_goals=[[2.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, second_components = tracker.compute_step(
-        distances_to_subgoals=[[0.4]],
+        distances_to_goals=[[0.4]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
     _, final_components = tracker.compute_step(
-        distances_to_subgoals=[[0.75]],
+        distances_to_goals=[[0.75]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
@@ -325,7 +321,7 @@ def test_premature_stop_is_penalized_before_all_subgoals_finish():
     tracker.reset([0], [[3.0, 5.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[2.5, 4.5]],
+        distances_to_goals=[[2.5, 4.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
@@ -337,28 +333,48 @@ def test_premature_stop_is_penalized_before_all_subgoals_finish():
     assert tracker.active_subgoal_index.tolist() == [0]
 
 
-def test_final_stop_success_is_scaled_by_final_distance_after_all_subgoals_finish():
+def test_single_goal_stop_success_does_not_require_subgoal_switch():
     tracker = _tracker(stop_success_reward_coef=10.0, final_success_distance=3.0)
     tracker.reset([0], [[2.0]])
 
-    first_reward, first_components = tracker.compute_step(
-        distances_to_subgoals=[[0.4]],
-        is_stop=np.array([False]),
-        valid_mask=np.array([True]),
-    )
-    second_reward, second_components = tracker.compute_step(
-        distances_to_subgoals=[[0.75]],
+    reward, components = tracker.compute_step(
+        distances_to_goals=[[1.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
 
-    assert first_components["r_subgoal_success"][0] == 0.0
     assert tracker.all_subgoals_finished.tolist() == [True]
-    assert math.isclose(second_components["r_stop"][0], 7.5, rel_tol=1e-6)
-    assert second_reward[0] == 7.5
+    assert components["r_subgoal_success"][0] == 0.0
+    assert math.isclose(components["r_progress"][0], 0.25, rel_tol=1e-6)
+    assert math.isclose(components["r_stop"][0], 10.0, rel_tol=1e-6)
+    assert components["premature_stop_ratio"][0] == 0.0
+    assert math.isclose(reward[0], 10.25, rel_tol=1e-6)
 
 
-def test_final_stop_failure_is_penalized_after_all_subgoals_finish():
+def test_finalgoal_progress_continues_after_all_subgoals_finish():
+    tracker = _tracker(progress_reward_coef=1.0)
+    tracker.reset([0], [[3.0, 5.0]])
+
+    _, first_components = tracker.compute_step(
+        distances_to_goals=[[0.75, 4.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    second_reward, second_components = tracker.compute_step(
+        distances_to_goals=[[0.5, 3.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert tracker.all_subgoals_finished.tolist() == [True]
+    assert first_components["r_subgoal_success"][0] == 0.0
+    assert math.isclose(second_components["normalized_progress"][0], 0.25, rel_tol=1e-6)
+    assert math.isclose(second_components["r_progress"][0], 0.125, rel_tol=1e-6)
+    assert second_components["r_stop"][0] == 0.0
+    assert math.isclose(second_reward[0], 0.125, rel_tol=1e-6)
+
+
+def test_final_stop_failure_is_penalized_when_finalgoal_is_too_far():
     tracker = _tracker(
         failure_stop_coeff=5.0,
         final_success_distance=3.0,
@@ -366,43 +382,38 @@ def test_final_stop_failure_is_penalized_after_all_subgoals_finish():
     )
     tracker.reset([0], [[2.0]])
 
-    _, first_components = tracker.compute_step(
-        distances_to_subgoals=[[0.4]],
-        is_stop=np.array([False]),
-        valid_mask=np.array([True]),
-    )
-    second_reward, second_components = tracker.compute_step(
-        distances_to_subgoals=[[3.5]],
+    reward, components = tracker.compute_step(
+        distances_to_goals=[[3.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
 
-    assert first_components["r_stop"][0] == 0.0
     assert tracker.all_subgoals_finished.tolist() == [True]
-    assert second_components["r_stop"][0] == -5.0
-    assert second_components["final_goal_success_ratio"][0] == 0.0
-    assert second_components["premature_stop_ratio"][0] == 0.0
-    assert second_reward[0] == -5.0
+    assert components["r_stop"][0] == -5.0
+    assert components["final_goal_success_ratio"][0] == 0.0
+    assert components["premature_stop_ratio"][0] == 0.0
+    assert math.isclose(reward[0], -5.75, rel_tol=1e-6)
 
 
-def test_stop_on_same_step_as_final_subgoal_switch_is_still_premature():
+def test_stop_on_same_step_as_last_subgoal_switch_can_succeed_at_finalgoal():
     tracker = _tracker(
         premature_stop_coeff=4.0,
         stop_success_reward_coef=10.0,
         final_success_distance=3.0,
     )
-    tracker.reset([0], [[2.0]])
+    tracker.reset([0], [[2.0, 1.5]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[0.4]],
+        distances_to_goals=[[0.4, 1.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
 
     assert tracker.all_subgoals_finished.tolist() == [True]
-    assert components["r_subgoal_success"][0] == 0.0
-    assert components["r_stop"][0] == -4.0
-    assert math.isclose(reward[0], -3.2, rel_tol=1e-6)
+    assert math.isclose(components["r_subgoal_success"][0], 6.0, rel_tol=1e-6)
+    assert math.isclose(components["r_stop"][0], 10.0, rel_tol=1e-6)
+    assert components["premature_stop_ratio"][0] == 0.0
+    assert math.isclose(reward[0], 16.4, rel_tol=1e-6)
 
 
 def test_invalid_mask_keeps_reward_and_state_unchanged():
@@ -410,7 +421,7 @@ def test_invalid_mask_keeps_reward_and_state_unchanged():
     tracker.reset([0], [[4.0, 5.0]])
 
     reward, components = tracker.compute_step(
-        distances_to_subgoals=[[0.2, 1.0]],
+        distances_to_goals=[[0.2, 1.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([False]),
     )
