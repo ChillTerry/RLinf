@@ -37,16 +37,6 @@ def test_env_worker_keeps_record_video_wrapper_for_non_habitat():
     assert worker._should_wrap_record_video(env_cfg) is True
 
 
-def test_env_worker_uses_record_video_wrapper_for_habitat_wrapper_mode():
-    worker = object.__new__(EnvWorker)
-    env_cfg = SimpleNamespace(
-        env_type="habitat",
-        video_cfg=SimpleNamespace(save_video=True, save_mode="wrapper"),
-    )
-
-    assert worker._should_wrap_record_video(env_cfg) is True
-
-
 def test_env_worker_does_not_wrap_record_video_when_disabled():
     worker = object.__new__(EnvWorker)
     env_cfg = SimpleNamespace(

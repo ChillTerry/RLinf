@@ -307,16 +307,13 @@ class EnvWorker(Worker):
         if not save_video:
             return False
 
-        # The worker owns generic RecordVideo wrapping; Habitat owns its
-        # env-specific success/failure video writer. Keep the shared worker
-        # branch isolated to Habitat and let video_cfg.save_mode choose.
-        save_mode = str(self._cfg_get(video_cfg, "save_mode", "episode")).lower()
-        if save_mode not in {"episode", "wrapper"}:
-            raise ValueError(
-                f"Unsupported Habitat video save_mode={save_mode!r}. "
-                "Expected one of ['episode', 'wrapper']."
-            )
-        return save_mode == "wrapper"
+        env_type = self._cfg_get(env_cfg, "env_type", None)
+        if isinstance(env_type, SupportedEnvType):
+            env_type = env_type.value
+        if env_type != SupportedEnvType.HABITAT.value:
+            return True
+
+        return False
 
     @staticmethod
     def _cfg_get(cfg, key: str, default=None):

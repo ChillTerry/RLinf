@@ -459,7 +459,10 @@ class HabitatEnv(gym.Env):
         task_descs = []
         token_list = []
         episode_ids = self.env.get_current_episode_metadata()["episode_id"]
-        should_render_video = info_lists is not None and self.cfg.video_cfg.save_video
+        video_cfg = self.cfg.video_cfg
+        should_render_video = (
+            info_lists is not None and video.cfg_get(video_cfg, "save_video", False)
+        )
 
         for i in range(len(obs_list)):
             image = {}

@@ -61,15 +61,6 @@ def test_should_save_rollout_video_defaults_to_habitat_mode():
     assert video.should_save_rollout_video(SimpleNamespace(save_video=True)) is True
 
 
-def test_should_save_rollout_video_skips_wrapper_mode():
-    assert (
-        video.should_save_rollout_video(
-            SimpleNamespace(save_video=True, save_mode="wrapper")
-        )
-        is False
-    )
-
-
 def test_record_rollout_video_frames_appends_numpy_frames():
     render_images = {}
     obs = {

@@ -23,11 +23,6 @@ from rlinf.envs.habitat.extensions.utils import render_topdown_map
 from rlinf.envs.utils import save_rollout_video
 
 
-EPISODE_VIDEO_SAVE_MODE = "episode"
-WRAPPER_VIDEO_SAVE_MODE = "wrapper"
-VIDEO_SAVE_MODES = {EPISODE_VIDEO_SAVE_MODE, WRAPPER_VIDEO_SAVE_MODE}
-
-
 def cfg_get(cfg, key: str, default=None):
     if cfg is None:
         return default
@@ -36,20 +31,8 @@ def cfg_get(cfg, key: str, default=None):
     return getattr(cfg, key, default)
 
 
-def get_save_mode(video_cfg, default=EPISODE_VIDEO_SAVE_MODE):
-    save_mode = str(cfg_get(video_cfg, "save_mode", default)).lower()
-    if save_mode not in VIDEO_SAVE_MODES:
-        raise ValueError(
-            f"Unsupported Habitat video save_mode={save_mode!r}. "
-            f"Expected one of {sorted(VIDEO_SAVE_MODES)}."
-        )
-    return save_mode
-
-
 def should_save_rollout_video(video_cfg):
-    return bool(cfg_get(video_cfg, "save_video", False)) and (
-        get_save_mode(video_cfg) == EPISODE_VIDEO_SAVE_MODE
-    )
+    return bool(cfg_get(video_cfg, "save_video", False))
 
 
 def get_video_cfg(owner):
