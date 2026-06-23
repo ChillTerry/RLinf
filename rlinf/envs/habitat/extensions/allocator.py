@@ -21,6 +21,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 _MB_PER_GB = 1024.0
 
@@ -90,6 +92,51 @@ def vram_balance_episode_sequences(
     return episode_sequences
 
 
+def random_episode_sequences(
+    episodes,
+    *,
+    seed: int,
+    auto_reset: bool,
+    total_num_processes: int,
+    num_group: int,
+    total_num_envs: int,
+    max_steps_per_rollout_epoch: int,
+    max_episode_steps: int,
+) -> EpisodeSequences:
+    episode_ids = [episode.episode_id for episode in episodes]
+    total_episode_count = len(episode_ids)
+    episode_ids = trim_episode_ids(
+        episode_ids,
+        mode=get_assignment_mode(auto_reset),
+        total_num_processes=total_num_processes,
+        num_group=num_group,
+        total_num_envs=total_num_envs,
+        max_steps_per_rollout_epoch=max_steps_per_rollout_epoch,
+        max_episode_steps=max_episode_steps,
+    )
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(episode_ids)
+
+    dropped_episode_count = total_episode_count - len(episode_ids)
+    episode_sequences = assign_random_episode_sequences(
+        episode_ids,
+        total_num_processes=total_num_processes,
+        num_group=num_group,
+    )
+
+    logger.info(
+        "Randomly assigned %s Habitat episodes across %s processes and %s groups "
+        "with seed=%s; dropped %s episodes.",
+        len(episode_ids),
+        total_num_processes,
+        num_group,
+        seed,
+        dropped_episode_count,
+    )
+    return episode_sequences
+
+
 def build_episode_records(
     episodes, scene_weights: dict[str, int]
 ) -> list[EpisodeRecord]:
@@ -123,18 +170,92 @@ def trim_episode_records(
     max_steps_per_rollout_epoch: int,
     max_episode_steps: int,
 ) -> list[EpisodeRecord]:
+    target_count = get_trimmed_episode_count(
+        len(records),
+        mode=mode,
+        total_num_processes=total_num_processes,
+        num_group=num_group,
+        total_num_envs=total_num_envs,
+        max_steps_per_rollout_epoch=max_steps_per_rollout_epoch,
+        max_episode_steps=max_episode_steps,
+    )
+    return records[:target_count]
+
+
+def trim_episode_ids(
+    episode_ids: list[EpisodeId],
+    *,
+    mode: str,
+    total_num_processes: int,
+    num_group: int,
+    total_num_envs: int,
+    max_steps_per_rollout_epoch: int,
+    max_episode_steps: int,
+) -> list[EpisodeId]:
+    target_count = get_trimmed_episode_count(
+        len(episode_ids),
+        mode=mode,
+        total_num_processes=total_num_processes,
+        num_group=num_group,
+        total_num_envs=total_num_envs,
+        max_steps_per_rollout_epoch=max_steps_per_rollout_epoch,
+        max_episode_steps=max_episode_steps,
+    )
+    return episode_ids[:target_count]
+
+
+def get_trimmed_episode_count(
+    episode_count: int,
+    *,
+    mode: str,
+    total_num_processes: int,
+    num_group: int,
+    total_num_envs: int,
+    max_steps_per_rollout_epoch: int,
+    max_episode_steps: int,
+) -> int:
     if mode == "eval":
         assert max_steps_per_rollout_epoch % max_episode_steps == 0, (
             "max_steps_per_rollout_epoch must be divisible by max_episode_steps"
         )
         slot_count = int(max_steps_per_rollout_epoch / max_episode_steps)
-        target_count = total_num_envs * slot_count
-    elif mode == "train":
+        return total_num_envs * slot_count
+    if mode == "train":
         granularity = total_num_processes * num_group
-        target_count = (len(records) // granularity) * granularity
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-    return records[:target_count]
+        return (episode_count // granularity) * granularity
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def assign_random_episode_sequences(
+    episode_ids: list[EpisodeId],
+    *,
+    total_num_processes: int,
+    num_group: int,
+) -> EpisodeSequences:
+    """Return shuffled episode ids as [process_idx][group_idx][slot_idx]."""
+    if not episode_ids:
+        return [[[] for _ in range(num_group)] for _ in range(total_num_processes)]
+
+    total_streams = total_num_processes * num_group
+    if len(episode_ids) % total_streams != 0:
+        raise ValueError(
+            "episode count must be divisible by total_num_processes * num_group"
+        )
+
+    slot_count = len(episode_ids) // total_streams
+    sequences = [
+        [[] for _ in range(num_group)] for _ in range(total_num_processes)
+    ]
+
+    cursor = 0
+    for process_idx in range(total_num_processes):
+        for group_idx in range(num_group):
+            sequences[process_idx][group_idx] = episode_ids[
+                cursor : cursor + slot_count
+            ]
+            cursor += slot_count
+
+    return sequences
 
 
 def assign_episode_sequences(

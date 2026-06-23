@@ -240,6 +240,55 @@ def test_habitat_eval_uninavid_uses_weighted_reward_config():
     )
 
 
+def test_random_episode_sequences_are_reproducible_by_seed():
+    episodes = [
+        SimpleNamespace(episode_id=str(episode_idx), scene_id=f"scene-{episode_idx}")
+        for episode_idx in range(12)
+    ]
+
+    first = random_episode_sequences(
+        episodes,
+        seed=123,
+        auto_reset=False,
+        total_num_processes=2,
+        num_group=3,
+        total_num_envs=6,
+        max_steps_per_rollout_epoch=128,
+        max_episode_steps=64,
+    )
+    second = random_episode_sequences(
+        episodes,
+        seed=123,
+        auto_reset=False,
+        total_num_processes=2,
+        num_group=3,
+        total_num_envs=6,
+        max_steps_per_rollout_epoch=128,
+        max_episode_steps=64,
+    )
+    different_seed = random_episode_sequences(
+        episodes,
+        seed=456,
+        auto_reset=False,
+        total_num_processes=2,
+        num_group=3,
+        total_num_envs=6,
+        max_steps_per_rollout_epoch=128,
+        max_episode_steps=64,
+    )
+
+    flattened = [
+        episode_id
+        for process_sequences in first
+        for group_sequence in process_sequences
+        for episode_id in group_sequence
+    ]
+
+    assert first == second
+    assert first != different_seed
+    assert sorted(flattened, key=int) == [str(episode_idx) for episode_idx in range(12)]
+
+
 def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
     dummy_dataset = SimpleNamespace(
         episodes=[
@@ -261,7 +310,7 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
     )
     monkeypatch.setattr(
         habitat_env_module,
-        "vram_balance_episode_sequences",
+        "random_episode_sequences",
         lambda *args, **kwargs: [[["7", "19"]]],
     )
 
