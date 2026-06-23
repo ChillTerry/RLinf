@@ -119,8 +119,11 @@ env:
     stop_success_reward_coef: ${algorithm.stop_success_reward_coef}
     final_success_distance: ${algorithm.final_success_distance}
     premature_stop_coeff: ${algorithm.premature_stop_coeff}
+    failure_stop_coeff: ${algorithm.failure_stop_coeff}
     stall_patience: ${algorithm.stall_patience}
     stall_penalty_coeff: ${algorithm.stall_penalty_coeff}
+    stall_recovery_patience: ${algorithm.stall_recovery_patience}
+    stall_observation_patience: ${algorithm.stall_observation_patience}
     split: train
     scenes_dir: ${env.scenes_dir}
     data_path: ${env.data_path_dir}/${env.train.split}/r2r_train_with_subgoals.json
@@ -150,8 +153,11 @@ env:
     stop_success_reward_coef: ${algorithm.stop_success_reward_coef}
     final_success_distance: ${algorithm.final_success_distance}
     premature_stop_coeff: ${algorithm.premature_stop_coeff}
+    failure_stop_coeff: ${algorithm.failure_stop_coeff}
     stall_patience: ${algorithm.stall_patience}
     stall_penalty_coeff: ${algorithm.stall_penalty_coeff}
+    stall_recovery_patience: ${algorithm.stall_recovery_patience}
+    stall_observation_patience: ${algorithm.stall_observation_patience}
     split: val_unseen
     scenes_dir: ${env.scenes_dir}
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz

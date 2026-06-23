@@ -15,8 +15,9 @@
 import math
 
 import numpy as np
+import pytest
 
-from rlinf.envs.habitat.subgoal_reward import (
+from rlinf.envs.habitat.extensions.subgoal import (
     SubgoalRewardConfig,
     SubgoalRewardTracker,
 )
@@ -69,6 +70,37 @@ def test_progress_reward_is_normalized_by_episode_subgoal_count():
     assert components["normalized_progress"][0] == 0.25
     assert math.isclose(components["r_progress"][0], 0.25 / 3.0, rel_tol=1e-6)
     assert math.isclose(reward[0], 0.25 / 3.0, rel_tol=1e-6)
+
+
+def test_reset_rejects_zero_initial_active_target_distance():
+    tracker = _tracker()
+
+    with pytest.raises(ValueError, match="reference distance.*positive"):
+        tracker.reset([0], [[0.0, 4.0]])
+
+
+def test_switch_to_final_goal_rejects_zero_reference_distance():
+    tracker = _tracker()
+    tracker.reset([0], [[3.0, 5.0]])
+
+    with pytest.raises(ValueError, match="reference distance.*positive"):
+        tracker.compute_step(
+            distances_to_goals=[[0.5, 0.0]],
+            is_stop=np.array([False]),
+            valid_mask=np.array([True]),
+        )
+
+
+def test_switch_to_next_subgoal_rejects_zero_reference_distance():
+    tracker = _tracker()
+    tracker.reset([0], [[3.0, 5.0, 7.0]])
+
+    with pytest.raises(ValueError, match="reference distance.*positive"):
+        tracker.compute_step(
+            distances_to_goals=[[0.5, 0.0, 4.0]],
+            is_stop=np.array([False]),
+            valid_mask=np.array([True]),
+        )
 
 
 def test_progress_is_clipped_to_unit_scale():

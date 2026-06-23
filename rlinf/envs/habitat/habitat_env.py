@@ -19,7 +19,6 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Union
 
-import cv2
 import gym
 import habitat
 import numpy as np
@@ -31,10 +30,9 @@ from habitat_baselines.config.default import get_config
 from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
 
-from rlinf.envs.habitat.extensions import measures
+from rlinf.envs.habitat.extensions import measures, video
 from rlinf.envs.habitat.extensions.allocator import vram_balance_episode_sequences
-from rlinf.envs.habitat.extensions.utils import render_topdown_map
-from rlinf.envs.habitat.subgoal_reward import (
+from rlinf.envs.habitat.extensions.subgoal import (
     SubgoalRewardConfig,
     SubgoalRewardTracker,
 )
@@ -185,6 +183,7 @@ class HabitatEnv(gym.Env):
 
         self.metrics_cfg = cfg.metrics_cfg
         self.video_cfg = cfg.video_cfg
+        self.render_images = {}
         self.current_raw_obs = None
 
         self.env_config = self.env.get_env_attr("config")[0]
@@ -208,9 +207,7 @@ class HabitatEnv(gym.Env):
                     stall_patience=int(self.cfg.stall_patience),
                     stall_penalty_coeff=float(self.cfg.stall_penalty_coeff),
                     stall_recovery_patience=int(self.cfg.stall_recovery_patience),
-                    stall_observation_patience=int(
-                        self.cfg.stall_observation_patience
-                    ),
+                    stall_observation_patience=int(self.cfg.stall_observation_patience),
                 ),
             )
 
@@ -341,6 +338,17 @@ class HabitatEnv(gym.Env):
 
         self.current_raw_obs = raw_obs
         obs = self._wrap_obs(raw_obs, info_lists)
+        video_cfg = video.get_video_cfg(self)
+        if video.should_save_rollout_video(video_cfg):
+            episode_ids = self.env.get_current_episode_metadata()["episode_id"]
+            video.record_rollout_video_frames(self.render_images, obs, episode_ids)
+            video.flush_rollout_videos(
+                self.render_images,
+                first_done_mask,
+                infos,
+                episode_ids,
+                video_cfg,
+            )
 
         if self.ignore_terminations:
             terminations[:] = False
@@ -462,16 +470,7 @@ class HabitatEnv(gym.Env):
             if self.cfg.model_type == "cma":
                 image["depth"] = obs["depth"]
             if should_render_video:
-                image["topdown_map"] = render_topdown_map(info)
-                image_size = (image["rgb"].shape[1], image["rgb"].shape[0])
-                image["topdown_map"] = cv2.resize(
-                    image["topdown_map"],
-                    dsize=image_size,
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                image["main_images"] = np.concatenate(
-                    (image["rgb"], image["topdown_map"]), axis=1
-                )
+                image["main_images"] = video.build_rollout_video_frame(obs, info)
 
             inst = str(obs["instruction"].get("text", ""))
             # token is used for CMA algorithm, please refer to
@@ -610,7 +609,9 @@ class HabitatEnv(gym.Env):
         if is_stop is None:
             raise RuntimeError("subgoal_progress reward mode requires is_stop.")
         if valid_reward_mask is None:
-            raise RuntimeError("subgoal_progress reward mode requires valid_reward_mask.")
+            raise RuntimeError(
+                "subgoal_progress reward mode requires valid_reward_mask."
+            )
 
         metadata = self.env.get_current_episode_goal_distances()
         reward, components = self.subgoal_reward.compute_step(

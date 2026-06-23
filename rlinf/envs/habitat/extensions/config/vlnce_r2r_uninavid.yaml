@@ -3,6 +3,7 @@
 defaults:
   - /benchmark/nav/vln_r2r
   - /habitat/task/measurements:
+    - top_down_map
     - ndtw
   - _self_
 

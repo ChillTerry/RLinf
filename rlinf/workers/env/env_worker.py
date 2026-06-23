@@ -274,7 +274,7 @@ class EnvWorker(Worker):
                 total_num_processes=self._world_size * self.stage_num,
                 worker_info=self.worker_info,
             )
-            if env_cfg.video_cfg.save_video:
+            if self._should_wrap_record_video(env_cfg):
                 env = RecordVideo(env, env_cfg.video_cfg)
             if env_cfg.get("data_collection", None) and getattr(
                 env_cfg.data_collection, "enabled", False
@@ -300,6 +300,31 @@ class EnvWorker(Worker):
                 )
             env_list.append(env)
         return env_list
+
+    def _should_wrap_record_video(self, env_cfg) -> bool:
+        video_cfg = self._cfg_get(env_cfg, "video_cfg", None)
+        save_video = bool(self._cfg_get(video_cfg, "save_video", False))
+        if not save_video:
+            return False
+
+        # The worker owns generic RecordVideo wrapping; Habitat owns its
+        # env-specific success/failure video writer. Keep the shared worker
+        # branch isolated to Habitat and let video_cfg.save_mode choose.
+        save_mode = str(self._cfg_get(video_cfg, "save_mode", "episode")).lower()
+        if save_mode not in {"episode", "wrapper"}:
+            raise ValueError(
+                f"Unsupported Habitat video save_mode={save_mode!r}. "
+                "Expected one of ['episode', 'wrapper']."
+            )
+        return save_mode == "wrapper"
+
+    @staticmethod
+    def _cfg_get(cfg, key: str, default=None):
+        if cfg is None:
+            return default
+        if hasattr(cfg, "get"):
+            return cfg.get(key, default)
+        return getattr(cfg, key, default)
 
     def _setup_dst_rank_map(self) -> dict[str, list[tuple[int, int]]]:
         """Compute destination rank map for this env worker.

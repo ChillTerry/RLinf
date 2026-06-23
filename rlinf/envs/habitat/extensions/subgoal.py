@@ -31,7 +31,6 @@ class SubgoalRewardConfig:
     stall_penalty_coeff: float
     stall_recovery_patience: int
     stall_observation_patience: int
-    distance_epsilon: float = 1.0e-6
 
 
 class SubgoalRewardTracker:
@@ -76,8 +75,10 @@ class SubgoalRewardTracker:
             self.num_goals[env_idx] = num_goals
             self.num_subgoals[env_idx] = num_subgoals
             self.previous_distance_to_active_subgoal[env_idx] = distances[0]
-            self.initial_distance_to_active_subgoal[env_idx] = max(
-                distances[0], self.config.distance_epsilon
+            self.initial_distance_to_active_subgoal[env_idx] = (
+                self._require_positive_reference_distance(
+                    distances[0],
+                )
             )
             self.non_positive_progress_steps[env_idx] = 0
             self.stalled[env_idx] = False
@@ -118,10 +119,7 @@ class SubgoalRewardTracker:
                 float(self.previous_distance_to_active_subgoal[env_idx])
                 - active_distance
             )
-            denominator = max(
-                float(self.initial_distance_to_active_subgoal[env_idx]),
-                self.config.distance_epsilon,
-            )
+            denominator = float(self.initial_distance_to_active_subgoal[env_idx])
             normalized_progress = float(
                 np.clip(progress_delta / denominator, -1.0, 1.0)
             )
@@ -194,8 +192,10 @@ class SubgoalRewardTracker:
                     self.all_subgoals_finished[env_idx] = True
                     self.active_subgoal_index[env_idx] = finalgoal_idx
                     self.previous_distance_to_active_subgoal[env_idx] = final_distance
-                    self.initial_distance_to_active_subgoal[env_idx] = max(
-                        final_distance, self.config.distance_epsilon
+                    self.initial_distance_to_active_subgoal[env_idx] = (
+                        self._require_positive_reference_distance(
+                            final_distance,
+                        )
                     )
                     self.non_positive_progress_steps[env_idx] = 0
                     self.stalled[env_idx] = False
@@ -205,8 +205,10 @@ class SubgoalRewardTracker:
                     self.active_subgoal_index[env_idx] = next_idx
                     next_distance = float(distances[next_idx])
                     self.previous_distance_to_active_subgoal[env_idx] = next_distance
-                    self.initial_distance_to_active_subgoal[env_idx] = max(
-                        next_distance, self.config.distance_epsilon
+                    self.initial_distance_to_active_subgoal[env_idx] = (
+                        self._require_positive_reference_distance(
+                            next_distance,
+                        )
                     )
                     self.non_positive_progress_steps[env_idx] = 0
                     self.stalled[env_idx] = False
@@ -362,10 +364,21 @@ class SubgoalRewardTracker:
         return float(numerator) / float(denominator)
 
     @staticmethod
+    def _require_positive_reference_distance(distance):
+        distance = float(distance)
+        if distance <= 0.0:
+            raise ValueError(
+                "Active target reference distance must be positive; "
+            )
+        return distance
+
+    @staticmethod
     def _validate_distances(distances):
         distances = np.asarray(distances, dtype=np.float32)
         if distances.ndim != 1 or len(distances) == 0:
             raise ValueError("Goal distances must be a non-empty 1D sequence.")
         if not np.all(np.isfinite(distances)):
             raise ValueError("Goal distances must be finite.")
+        if np.any(distances < 0.0):
+            raise ValueError("Goal distances must be non-negative.")
         return distances
