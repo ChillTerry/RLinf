@@ -30,8 +30,8 @@ from habitat_baselines.config.default import get_config
 from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
 
-from rlinf.envs.habitat.extensions import measures, video
-from rlinf.envs.habitat.extensions.allocator import vram_balance_episode_sequences
+from rlinf.envs.habitat.extensions import measures, rxr_dataset, video  # noqa: F401
+from rlinf.envs.habitat.extensions.allocator import random_episode_sequences
 from rlinf.envs.habitat.extensions.subgoal import (
     SubgoalRewardConfig,
     SubgoalRewardTracker,
@@ -41,8 +41,6 @@ from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
     to_tensor,
 )
-
-measures.pass_format_check()
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +78,9 @@ def build_habitat_global_plan(
             ep for ep in habitat_dataset.episodes if ep.scene_id in sampled_scene_id_set
         ]
 
-    episode_sequences = vram_balance_episode_sequences(
+    episode_sequences = random_episode_sequences(
         habitat_dataset.episodes,
+        seed = cfg.seed,
         auto_reset=cfg.auto_reset,
         total_num_processes=total_num_processes,
         num_group=num_group,
@@ -115,7 +114,19 @@ def build_habitat_overrides(cfg, *, max_episode_steps: int) -> list[str]:
                 f"habitat.task.measurements.ndtw.GT_PATH={ndtw_gt_path}",
             ]
         )
+    rxr_roles = getattr(cfg, "rxr_roles", None)
+    if rxr_roles is not None:
+        overrides.append(f"+habitat.dataset.ROLES={_format_hydra_list(rxr_roles)}")
+    rxr_languages = getattr(cfg, "rxr_languages", None)
+    if rxr_languages is not None:
+        overrides.append(
+            f"+habitat.dataset.LANGUAGES={_format_hydra_list(rxr_languages)}"
+        )
     return overrides
+
+
+def _format_hydra_list(values) -> str:
+    return "[" + ",".join(str(value) for value in values) + "]"
 
 
 def get_sampled_habitat_scene_ids(

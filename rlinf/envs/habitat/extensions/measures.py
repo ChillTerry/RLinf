@@ -210,6 +210,3 @@ class OracleSPL(Measure):
         spl = task.measurements.measures["spl"].get_metric()
         self._metric = max(self._metric, spl)
 
-
-def pass_format_check():
-    pass

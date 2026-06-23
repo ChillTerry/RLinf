@@ -21,11 +21,11 @@ from omegaconf import OmegaConf
 
 import rlinf.envs.habitat.habitat_env as habitat_env_module
 from rlinf.envs.habitat.extensions import video
-from rlinf.envs.habitat.habitat_env import HabitatEnv
-from rlinf.envs.habitat.subgoal_reward import (
+from rlinf.envs.habitat.extensions.subgoal import (
     SubgoalRewardConfig,
     SubgoalRewardTracker,
 )
+from rlinf.envs.habitat.habitat_env import HabitatEnv
 
 
 def test_uninavid_habitat_extension_config_composes_with_local_schema():
