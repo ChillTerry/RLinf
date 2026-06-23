@@ -25,10 +25,9 @@ def test_habitat_rxr_grpo_uninavid_uses_rxr_paths_and_task_config():
     assert raw_cfg["runner"]["logger"]["experiment_name"] == (
         "habitat_rxr_grpo_uninavid"
     )
-    assert raw_cfg["cluster"]["component_placement"]["actor"] == "4-6"
-    assert raw_cfg["cluster"]["component_placement"]["rollout"] == 7
-    assert raw_cfg["cluster"]["component_placement"]["env"] == 4
-    assert raw_cfg["actor"]["global_batch_size"] == 504
+    assert raw_cfg["cluster"]["component_placement"]["actor,env,rollout"] == "4-7"
+    assert raw_cfg["actor"]["global_batch_size"] == 512
+    assert raw_cfg["actor"]["model"]["drop_overlong_train_metadata"] is True
     assert raw_cfg["env"]["data_path_dir"] == "VLN-CE/datasets/rxr"
     assert raw_cfg["env"]["rxr_role"] == "guide"
     assert raw_cfg["env"]["rxr_languages"] == ["en-US", "en-IN"]

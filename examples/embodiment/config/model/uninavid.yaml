@@ -16,6 +16,7 @@ video_fps: 1
 compress_type: "grid:2"
 tune_vision_encoder: false
 model_max_length: 1024
+drop_overlong_train_metadata: false
 add_value_head: false
 load_to_device: true
 run_type: "eval"

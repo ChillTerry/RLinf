@@ -434,12 +434,19 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 raise ValueError(
                     "UniNaVid train metadata requires model_max_length > max_new_tokens."
                 )
-        prompt_inputs_embeds, prompt_attention_mask = (
-            self._left_pad_prompt_forward_inputs(
-                prompt_inputs_embeds,
-                prompt_attention_mask,
-                target_len=prompt_len,
-            )
+        drop_overlong_train_metadata = bool(
+            self._cfg_get(cfg, "drop_overlong_train_metadata", default=False)
+        )
+        overlong_train_metadata_mask = None
+        (
+            prompt_inputs_embeds,
+            prompt_attention_mask,
+            overlong_train_metadata_mask,
+        ) = self._left_pad_prompt_forward_inputs(
+            prompt_inputs_embeds=prompt_inputs_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            target_len=prompt_len,
+            mask_overlong=drop_overlong_train_metadata,
         )
         prev_logprobs, response_mask = self._compute_generation_score_logprobs(
             generated_scores=generated_scores,
@@ -471,6 +478,18 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         if action_token_mask.shape[1] != response_len:
             raise ValueError(
                 "UniNaVid action token mask length must match response length."
+            )
+        if (
+            overlong_train_metadata_mask is not None
+            and overlong_train_metadata_mask.any()
+        ):
+            prev_logprobs = prev_logprobs.masked_fill(
+                overlong_train_metadata_mask[:, None, None],
+                0.0,
+            )
+            action_token_mask = action_token_mask.masked_fill(
+                overlong_train_metadata_mask[:, None],
+                False,
             )
         metadata = {
             "prev_logprobs": prev_logprobs.detach(),
@@ -827,31 +846,43 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         prompt_inputs_embeds: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
         target_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        current_len = int(prompt_inputs_embeds.shape[1])
-        if current_len > target_len:
+        *,
+        mask_overlong: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        prompt_token_mask = prompt_attention_mask.to(torch.bool)
+        prompt_token_lengths = prompt_token_mask.sum(dim=1)
+        overlong_mask = prompt_token_lengths.gt(target_len)
+        if overlong_mask.any() and not mask_overlong:
             raise ValueError(
                 "UniNaVid train metadata prompt length exceeds "
                 "model_max_length - max_new_tokens."
             )
-        if current_len == target_len:
-            return prompt_inputs_embeds, prompt_attention_mask
 
-        pad_len = target_len - current_len
-        embed_pad = prompt_inputs_embeds.new_zeros(
+        padded_embeds = prompt_inputs_embeds.new_zeros(
             (
                 prompt_inputs_embeds.shape[0],
-                pad_len,
+                target_len,
                 prompt_inputs_embeds.shape[2],
             )
         )
-        mask_pad = prompt_attention_mask.new_zeros(
-            (prompt_attention_mask.shape[0], pad_len)
+        padded_attention_mask = prompt_attention_mask.new_zeros(
+            (prompt_attention_mask.shape[0], target_len)
         )
-        return (
-            torch.cat([embed_pad, prompt_inputs_embeds], dim=1),
-            torch.cat([mask_pad, prompt_attention_mask], dim=1),
-        )
+        for batch_idx, token_length_tensor in enumerate(prompt_token_lengths):
+            token_length = int(token_length_tensor.item())
+            if token_length == 0:
+                continue
+            token_embeds = prompt_inputs_embeds[batch_idx][prompt_token_mask[batch_idx]]
+            if overlong_mask[batch_idx] and mask_overlong:
+                token_embeds = token_embeds[-target_len:]
+                token_length = target_len
+            start = target_len - token_length
+            padded_embeds[batch_idx, start:] = token_embeds
+            padded_attention_mask[batch_idx, start:] = 1
+
+        if not mask_overlong:
+            overlong_mask = None
+        return padded_embeds, padded_attention_mask, overlong_mask
 
     def _pad_response_forward_inputs(
         self,

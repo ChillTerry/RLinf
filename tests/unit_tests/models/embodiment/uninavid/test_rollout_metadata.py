@@ -321,6 +321,118 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
     torch.testing.assert_close(metadata["prev_logprobs"], expected)
 
 
+def test_uninavid_train_metadata_rejects_overlong_prompt_by_default(monkeypatch):
+    policy = UniNaVidForActionPrediction(
+        tokenizer=_Tokenizer(),
+        model=_GenerateModel(outputs=None),
+        image_processor=None,
+    )
+    policy.cfg = SimpleNamespace(model_max_length=5)
+    prompt_inputs_embeds = torch.ones((1, 4, 2), dtype=torch.float32)
+    prompt_attention_mask = torch.ones((1, 4), dtype=torch.long)
+    response_ids = torch.tensor([[1, 2]], dtype=torch.long)
+    generated_scores = torch.zeros((1, 2, 3), dtype=torch.float32)
+
+    def fake_generate_outputs(env_obs, generation_kwargs, *, return_scores=False):
+        assert return_scores is True
+        return (
+            ["stop"],
+            prompt_inputs_embeds,
+            prompt_attention_mask,
+            response_ids,
+            generated_scores,
+        )
+
+    monkeypatch.setattr(policy, "_generate_batch_outputs", fake_generate_outputs)
+
+    with pytest.raises(
+        ValueError,
+        match="prompt length exceeds model_max_length - max_new_tokens",
+    ):
+        policy._predict_train_batch(
+            env_obs={},
+            generation_kwargs={"max_new_tokens": 2},
+            num_action_chunks=1,
+        )
+
+
+def test_uninavid_train_metadata_can_mask_overlong_prompt_rows(monkeypatch):
+    policy = UniNaVidForActionPrediction(
+        tokenizer=_Tokenizer(),
+        model=_GenerateModel(outputs=None),
+        image_processor=None,
+    )
+    policy.cfg = SimpleNamespace(
+        model_max_length=5,
+        drop_overlong_train_metadata=True,
+    )
+    prompt_inputs_embeds = torch.tensor(
+        [
+            [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]],
+            [[4.0, 4.0], [5.0, 5.0], [6.0, 6.0], [7.0, 7.0]],
+        ],
+        dtype=torch.float32,
+    )
+    prompt_attention_mask = torch.tensor(
+        [
+            [0, 1, 1, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=torch.long,
+    )
+    response_ids = torch.tensor([[6375, 5040], [6375, 5040]], dtype=torch.long)
+    generated_scores = torch.zeros((2, 2, 7000), dtype=torch.float32)
+
+    def fake_generate_outputs(env_obs, generation_kwargs, *, return_scores=False):
+        assert return_scores is True
+        return (
+            ["forward stop", "forward stop"],
+            prompt_inputs_embeds,
+            prompt_attention_mask,
+            response_ids,
+            generated_scores,
+        )
+
+    monkeypatch.setattr(policy, "_generate_batch_outputs", fake_generate_outputs)
+
+    actions, metadata = policy._predict_train_batch(
+        env_obs={},
+        generation_kwargs={"max_new_tokens": 2},
+        num_action_chunks=1,
+    )
+
+    forward_inputs = metadata["forward_inputs"]
+    assert actions.shape == (2, 1, 1)
+    assert forward_inputs["prompt_inputs_embeds"].shape == (2, 3, 2)
+    assert forward_inputs["prompt_attention_mask"].tolist() == [
+        [1, 1, 1],
+        [1, 1, 1],
+    ]
+    torch.testing.assert_close(
+        forward_inputs["prompt_inputs_embeds"][0],
+        torch.tensor(
+            [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]],
+            dtype=torch.float32,
+        ),
+    )
+    torch.testing.assert_close(
+        forward_inputs["prompt_inputs_embeds"][1],
+        torch.tensor(
+            [[5.0, 5.0], [6.0, 6.0], [7.0, 7.0]],
+            dtype=torch.float32,
+        ),
+    )
+    assert forward_inputs["response_mask"].tolist() == [
+        [True, True],
+        [True, True],
+    ]
+    assert forward_inputs["action_token_mask"].tolist() == [
+        [True, False],
+        [False, False],
+    ]
+    assert metadata["prev_logprobs"][1].eq(0).all()
+
+
 def test_uninavid_train_metadata_records_response_text_diagnostic_counts(
     monkeypatch,
 ):
