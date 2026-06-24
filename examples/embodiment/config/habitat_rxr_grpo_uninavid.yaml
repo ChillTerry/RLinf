@@ -129,8 +129,8 @@ env:
     stall_observation_patience: ${algorithm.stall_observation_patience}
     split: train
     scenes_dir: ${env.scenes_dir}
-    data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}.json.gz
-    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_gt.json.gz
+    data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_reachable.json.gz
+    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_gt_reachable.json.gz
     rxr_roles: ${env.rxr_roles}
     rxr_languages: ${env.rxr_languages}
     init_params:
@@ -165,8 +165,8 @@ env:
     stall_observation_patience: ${algorithm.stall_observation_patience}
     split: val_unseen
     scenes_dir: ${env.scenes_dir}
-    data_path: ${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_${env.rxr_role}.json.gz
-    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_${env.rxr_role}_gt.json.gz
+    data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_reachable.json.gz
+    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_gt_reachable.json.gz
     rxr_roles: ${env.rxr_roles}
     rxr_languages: ${env.rxr_languages}
     init_params:

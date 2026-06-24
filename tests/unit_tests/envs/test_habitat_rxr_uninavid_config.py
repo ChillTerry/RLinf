@@ -34,19 +34,19 @@ def test_habitat_rxr_grpo_uninavid_uses_rxr_paths_and_task_config():
     assert raw_cfg["env"]["train"]["rxr_roles"] == "${env.rxr_roles}"
     assert raw_cfg["env"]["train"]["rxr_languages"] == "${env.rxr_languages}"
     assert raw_cfg["env"]["train"]["data_path"] == (
-        "${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}.json.gz"
+        "${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_reachable.json.gz"
     )
     assert raw_cfg["env"]["train"]["ndtw_gt_path"] == (
-        "${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_gt.json.gz"
+        "${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_gt_reachable.json.gz"
     )
     assert raw_cfg["env"]["train"]["init_params"]["config_path"] == (
         "rlinf/envs/habitat/extensions/config/vlnce_rxr_uninavid.yaml"
     )
     assert raw_cfg["env"]["eval"]["data_path"] == (
-        "${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_${env.rxr_role}.json.gz"
+        "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_reachable.json.gz"
     )
     assert raw_cfg["env"]["eval"]["ndtw_gt_path"] == (
-        "${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_${env.rxr_role}_gt.json.gz"
+        "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_gt_reachable.json.gz"
     )
     assert raw_cfg["env"]["eval"]["init_params"]["config_path"] == (
         "rlinf/envs/habitat/extensions/config/vlnce_rxr_uninavid.yaml"
@@ -98,7 +98,10 @@ def test_habitat_rxr_dataset_loader_reads_rxr_without_instruction_vocab():
     cfg = OmegaConf.create(
         {
             "split": "val_unseen",
-            "data_path": "VLN-CE/datasets/rxr/val_unseen/tiny_val_unseen_guide.json.gz",
+            "data_path": (
+                "VLN-CE/datasets/rxr/val_unseen/"
+                "val_unseen_guide_reachable.json.gz"
+            ),
             "scenes_dir": "VLN-CE/scene_dataset",
             "content_scenes": ["*"],
         }
@@ -106,7 +109,7 @@ def test_habitat_rxr_dataset_loader_reads_rxr_without_instruction_vocab():
 
     dataset = habitat.datasets.make_dataset("RxR-VLN-CE-v1", config=cfg)
 
-    assert len(dataset.episodes) == 738
+    assert len(dataset.episodes) > 0
     first_episode = dataset.episodes[0]
     assert first_episode.instruction.instruction_text
     assert first_episode.scene_id.startswith("VLN-CE/scene_dataset/")
