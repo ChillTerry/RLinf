@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gzip
+import json
+
 from omegaconf import OmegaConf
 
 from rlinf.envs.habitat.habitat_env import build_habitat_overrides
@@ -36,7 +39,7 @@ def test_habitat_rxr_grpo_uninavid_uses_rxr_paths_and_task_config():
     assert raw_cfg["env"]["train"]["data_path"] == (
         "${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_reachable.json.gz"
     )
-    assert raw_cfg["env"]["train"]["ndtw_gt_path"] == (
+    assert raw_cfg["env"]["train"]["gt_path"] == (
         "${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_gt_reachable.json.gz"
     )
     assert raw_cfg["env"]["train"]["init_params"]["config_path"] == (
@@ -45,7 +48,7 @@ def test_habitat_rxr_grpo_uninavid_uses_rxr_paths_and_task_config():
     assert raw_cfg["env"]["eval"]["data_path"] == (
         "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_reachable.json.gz"
     )
-    assert raw_cfg["env"]["eval"]["ndtw_gt_path"] == (
+    assert raw_cfg["env"]["eval"]["gt_path"] == (
         "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_gt_reachable.json.gz"
     )
     assert raw_cfg["env"]["eval"]["init_params"]["config_path"] == (
@@ -78,7 +81,7 @@ def test_habitat_rxr_dataset_fields_are_added_as_hydra_overrides():
             "split": "val_unseen",
             "data_path": "VLN-CE/datasets/rxr/val_unseen/val_unseen_guide.json.gz",
             "scenes_dir": "VLN-CE/scene_dataset",
-            "ndtw_gt_path": (
+            "gt_path": (
                 "VLN-CE/datasets/rxr/val_unseen/val_unseen_guide_gt.json.gz"
             ),
             "rxr_roles": ["guide"],
@@ -113,3 +116,54 @@ def test_habitat_rxr_dataset_loader_reads_rxr_without_instruction_vocab():
     first_episode = dataset.episodes[0]
     assert first_episode.instruction.instruction_text
     assert first_episode.scene_id.startswith("VLN-CE/scene_dataset/")
+
+
+def test_habitat_rxr_dataset_loader_filters_configured_languages(tmp_path):
+    import habitat
+
+    dataset_path = tmp_path / "train_guide.json.gz"
+    scenes_dir = tmp_path / "scenes"
+    scenes_dir.mkdir()
+    episodes = [
+        _rxr_episode("1", "English US", "en-US"),
+        _rxr_episode("2", "English India", "en-IN"),
+        _rxr_episode("3", "Hindi", "hi-IN"),
+        _rxr_episode("4", "Telugu", "te-IN"),
+    ]
+    with gzip.open(dataset_path, "wt", encoding="utf-8") as file_obj:
+        json.dump({"episodes": episodes}, file_obj)
+
+    cfg = OmegaConf.create(
+        {
+            "split": "train",
+            "data_path": str(dataset_path),
+            "scenes_dir": str(scenes_dir),
+            "content_scenes": ["*"],
+            "LANGUAGES": ["en-US", "en-IN"],
+        }
+    )
+
+    dataset = habitat.datasets.make_dataset("RxR-VLN-CE-v1", config=cfg)
+
+    assert [episode.episode_id for episode in dataset.episodes] == ["1", "2"]
+    assert [
+        episode.instruction.instruction_text for episode in dataset.episodes
+    ] == ["English US", "English India"]
+
+
+def _rxr_episode(episode_id, instruction_text, language):
+    return {
+        "episode_id": episode_id,
+        "trajectory_id": int(episode_id),
+        "scene_id": "mp3d/example/example.glb",
+        "info": {"role": "guide"},
+        "instruction": {
+            "instruction_id": episode_id,
+            "instruction_text": instruction_text,
+            "language": language,
+        },
+        "reference_path": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        "start_position": [0.0, 0.0, 0.0],
+        "start_rotation": [0.0, 0.0, 0.0, 1.0],
+        "goals": [{"position": [1.0, 0.0, 0.0], "radius": 3.0}],
+    }

@@ -5,7 +5,7 @@ seed: 0
 group_size: 1
 success_reward_coef: 10.0
 ndtw_reward_coef: 5.0
-ndtw_gt_path: null
+gt_path: null
 total_num_envs: null
 auto_reset: False
 ignore_terminations: False

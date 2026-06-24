@@ -110,8 +110,9 @@ env:
 
   train:
     total_num_envs: 32
-    max_episode_steps: 128
-    max_steps_per_rollout_epoch: 128
+    max_episode_steps: 200
+    max_steps_per_rollout_epoch: 200
+    max_gt_action_length: 150
     group_size: ${algorithm.group_size}
     model_type: ${actor.model.model_type}
     reward_mode: ${algorithm.reward_mode}
@@ -130,7 +131,7 @@ env:
     split: train
     scenes_dir: ${env.scenes_dir}
     data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_reachable.json.gz
-    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_gt_reachable.json.gz
+    gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_${env.rxr_role}_gt_reachable.json.gz
     rxr_roles: ${env.rxr_roles}
     rxr_languages: ${env.rxr_languages}
     init_params:
@@ -144,8 +145,8 @@ env:
 
   eval:
     total_num_envs: 32
-    max_episode_steps: 100
-    max_steps_per_rollout_epoch: 800
+    max_episode_steps: 150
+    max_steps_per_rollout_epoch: 3450
     group_size: 1
     auto_reset: True
     ignore_terminations: True
@@ -165,8 +166,8 @@ env:
     stall_observation_patience: ${algorithm.stall_observation_patience}
     split: val_unseen
     scenes_dir: ${env.scenes_dir}
-    data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_reachable.json.gz
-    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_${env.rxr_role}_gt_reachable.json.gz
+    data_path: ${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_${env.rxr_role}_reachable.json.gz
+    gt_path: ${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_${env.rxr_role}_gt_reachable.json.gz
     rxr_roles: ${env.rxr_roles}
     rxr_languages: ${env.rxr_languages}
     init_params:

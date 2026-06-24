@@ -68,7 +68,7 @@ def test_habitat_r2r_env_default_uses_weighted_reward_config():
     assert "reward_mode" not in raw_cfg
     assert cfg.success_reward_coef == 10.0
     assert cfg.ndtw_reward_coef == 5.0
-    assert cfg.ndtw_gt_path is None
+    assert cfg.gt_path is None
 
 
 def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
@@ -147,7 +147,7 @@ def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
         == "${env.data_path_dir}/${env.train.split}/r2r_train_with_subgoals.json"
     )
     assert (
-        raw_cfg["env"]["train"]["ndtw_gt_path"]
+        raw_cfg["env"]["train"]["gt_path"]
         == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
     )
     assert "success_reward_coef" not in raw_cfg["env"]["eval"]
@@ -203,7 +203,7 @@ def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz"
     )
     assert (
-        raw_cfg["env"]["eval"]["ndtw_gt_path"]
+        raw_cfg["env"]["eval"]["gt_path"]
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
     )
 
@@ -225,7 +225,7 @@ def test_habitat_eval_uninavid_uses_weighted_reward_config():
     )
     assert raw_cfg["env"]["train"]["split"] == "train"
     assert (
-        raw_cfg["env"]["train"]["ndtw_gt_path"]
+        raw_cfg["env"]["train"]["gt_path"]
         == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
     )
     assert "reward_mode" not in raw_cfg["env"]["eval"]
@@ -235,7 +235,7 @@ def test_habitat_eval_uninavid_uses_weighted_reward_config():
     )
     assert raw_cfg["env"]["eval"]["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
     assert (
-        raw_cfg["env"]["eval"]["ndtw_gt_path"]
+        raw_cfg["env"]["eval"]["gt_path"]
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
     )
 
@@ -319,7 +319,7 @@ def test_habitat_env_fn_params_override_ndtw_config(monkeypatch):
         init_params=SimpleNamespace(config_path="dummy-config.yaml"),
         split="train",
         data_path="/tmp/r2r/train/train.json.gz",
-        ndtw_gt_path="/tmp/r2r/train/train_gt.json.gz",
+        gt_path="/tmp/r2r/train/train_gt.json.gz",
         scenes_dir="/tmp/scenes",
         seed=42,
         auto_reset=True,

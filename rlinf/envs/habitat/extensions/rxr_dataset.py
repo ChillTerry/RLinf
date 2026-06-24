@@ -40,19 +40,35 @@ class RxRVLNDatasetV1(Dataset):
             return
 
         dataset_filename = config.data_path.format(split=config.split)
+        languages = getattr(config, "LANGUAGES", None)
         with gzip.open(dataset_filename, "rt", encoding="utf-8") as file_obj:
-            self.from_json(file_obj.read(), scenes_dir=config.scenes_dir)
+            self.from_json(
+                file_obj.read(),
+                scenes_dir=config.scenes_dir,
+                languages=languages,
+            )
 
         self.episodes = list(
             filter(self.build_content_scenes_filter(config), self.episodes)
         )
 
-    def from_json(self, json_str: str, scenes_dir: Optional[str] = None) -> None:
+    def from_json(
+        self,
+        json_str: str,
+        scenes_dir: Optional[str] = None,
+        languages: Optional[list[str]] = None,
+    ) -> None:
         deserialized = json.loads(json_str)
+        language_set = _filter_set(languages)
 
         for episode_data in deserialized["episodes"]:
-            episode_data = dict(episode_data)
             instruction_data = episode_data["instruction"]
+            if language_set is not None:
+                language = instruction_data.get("language")
+                if language not in language_set:
+                    continue
+
+            episode_data = dict(episode_data)
             episode_data["instruction"] = {
                 "instruction_text": instruction_data["instruction_text"],
                 "instruction_tokens": instruction_data.get("instruction_tokens"),
@@ -70,3 +86,11 @@ class RxRVLNDatasetV1(Dataset):
             for goal_idx, goal in enumerate(episode.goals):
                 episode.goals[goal_idx] = NavigationGoal(**goal)
             self.episodes.append(episode)
+
+
+def _filter_set(values) -> Optional[set[str]]:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        return {values}
+    return {str(value) for value in values}

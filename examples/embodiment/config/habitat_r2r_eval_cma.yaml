@@ -96,7 +96,7 @@ env:
     split: train
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
+    gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     group_size: ${algorithm.group_size}
 
   eval:
@@ -111,7 +111,7 @@ env:
     data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
     success_reward_coef: ${algorithm.success_reward_coef}
     ndtw_reward_coef: ${algorithm.ndtw_reward_coef}
-    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
+    gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
     scenes_dir: ${env.scenes_dir}
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_cma.yaml"

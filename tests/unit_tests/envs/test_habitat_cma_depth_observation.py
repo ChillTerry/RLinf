@@ -63,7 +63,7 @@ def _make_habitat_cfg(
         ndtw_reward_coef=5.0,
         split="val_seen",
         data_path=str(R2R_ROOT / "val_seen/val_seen.json.gz"),
-        ndtw_gt_path=str(R2R_ROOT / "val_seen/val_seen_gt.json.gz"),
+        gt_path=str(R2R_ROOT / "val_seen/val_seen_gt.json.gz"),
         scenes_dir=str(SCENES_DIR),
         init_params=SimpleNamespace(
             config_path=config_path,

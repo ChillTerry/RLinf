@@ -126,8 +126,8 @@ env:
     stall_observation_patience: ${algorithm.stall_observation_patience}
     split: train
     scenes_dir: ${env.scenes_dir}
-    data_path: ${env.data_path_dir}/${env.train.split}/r2r_train_with_subgoals.json
-    ndtw_gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
+    data_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}.json.gz
+    gt_path: ${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
     metrics_cfg:
@@ -160,8 +160,8 @@ env:
     stall_observation_patience: ${algorithm.stall_observation_patience}
     split: val_unseen
     scenes_dir: ${env.scenes_dir}
-    data_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}.json.gz
-    ndtw_gt_path: ${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz
+    data_path: ${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}.json.gz
+    gt_path: ${env.data_path_dir}/${env.eval.split}/tiny_${env.eval.split}_gt.json.gz
     init_params:
       config_path: "rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml"
     metrics_cfg:

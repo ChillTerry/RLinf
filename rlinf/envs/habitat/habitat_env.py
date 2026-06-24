@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import gzip
 import json
 import logging
 import os
@@ -31,7 +32,10 @@ from hydra.core.config_store import ConfigStore
 from hydra.core.global_hydra import GlobalHydra
 
 from rlinf.envs.habitat.extensions import measures, rxr_dataset, video  # noqa: F401
-from rlinf.envs.habitat.extensions.allocator import random_episode_sequences
+from rlinf.envs.habitat.extensions.allocator import (
+    filter_episodes_by_gt_action_length,
+    random_episode_sequences,
+)
 from rlinf.envs.habitat.extensions.subgoal import (
     SubgoalRewardConfig,
     SubgoalRewardTracker,
@@ -78,6 +82,33 @@ def build_habitat_global_plan(
             ep for ep in habitat_dataset.episodes if ep.scene_id in sampled_scene_id_set
         ]
 
+    max_gt_action_length = getattr(cfg, "max_gt_action_length", None)
+    if max_gt_action_length is not None:
+        gt_path = getattr(cfg, "gt_path", None)
+        if gt_path is None:
+            raise ValueError("max_gt_action_length requires gt_path.")
+        gt_data = load_habitat_gt_data(gt_path)
+        habitat_dataset.episodes, dropped_episode_ids = (
+            filter_episodes_by_gt_action_length(
+                habitat_dataset.episodes,
+                gt_data,
+                max_action_length=int(max_gt_action_length),
+            )
+        )
+        if not habitat_dataset.episodes:
+            raise ValueError(
+                "No Habitat episodes remain after filtering GT action length "
+                f"> {int(max_gt_action_length)}."
+            )
+        if dropped_episode_ids:
+            logger.info(
+                "Dropped %s Habitat episodes with GT action length > %s; "
+                "first ids: %s",
+                len(dropped_episode_ids),
+                int(max_gt_action_length),
+                dropped_episode_ids[:50],
+            )
+
     episode_sequences = random_episode_sequences(
         habitat_dataset.episodes,
         seed = cfg.seed,
@@ -106,12 +137,12 @@ def build_habitat_overrides(cfg, *, max_episode_steps: int) -> list[str]:
         "habitat.environment.iterator_options.shuffle=False",
         "habitat.environment.iterator_options.group_by_scene=False",
     ]
-    ndtw_gt_path = getattr(cfg, "ndtw_gt_path", None)
-    if ndtw_gt_path is not None:
+    gt_path = getattr(cfg, "gt_path", None)
+    if gt_path is not None:
         overrides.extend(
             [
                 f"habitat.task.measurements.ndtw.SPLIT={cfg.split}",
-                f"habitat.task.measurements.ndtw.GT_PATH={ndtw_gt_path}",
+                f"habitat.task.measurements.ndtw.GT_PATH={gt_path}",
             ]
         )
     rxr_roles = getattr(cfg, "rxr_roles", None)
@@ -127,6 +158,11 @@ def build_habitat_overrides(cfg, *, max_episode_steps: int) -> list[str]:
 
 def _format_hydra_list(values) -> str:
     return "[" + ",".join(str(value) for value in values) + "]"
+
+
+def load_habitat_gt_data(gt_path: str) -> dict:
+    with gzip.open(gt_path, "rt", encoding="utf-8") as file_obj:
+        return json.load(file_obj)
 
 
 def get_sampled_habitat_scene_ids(

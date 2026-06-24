@@ -57,6 +57,36 @@ def get_assignment_mode(auto_reset: bool) -> str:
     return "train"
 
 
+def get_episode_id(episode) -> str:
+    if isinstance(episode, dict):
+        return str(episode["episode_id"])
+    return str(episode.episode_id)
+
+
+def filter_episodes_by_gt_action_length(
+    episodes,
+    gt_data: dict,
+    *,
+    max_action_length: int,
+):
+    kept_episodes = []
+    dropped_episode_ids = []
+    for episode in episodes:
+        episode_id = get_episode_id(episode)
+        if episode_id not in gt_data:
+            raise KeyError(f"Missing GT for episode_id={episode_id}")
+        actions = gt_data[episode_id].get("actions")
+        if actions is None:
+            raise KeyError(f"Missing GT actions for episode_id={episode_id}")
+
+        if len(actions) <= max_action_length:
+            kept_episodes.append(episode)
+        else:
+            dropped_episode_ids.append(episode_id)
+
+    return kept_episodes, dropped_episode_ids
+
+
 def vram_balance_episode_sequences(
     episodes,
     *,

@@ -34,7 +34,7 @@ def test_habitat_eval_cma_uses_current_reward_config():
     assert raw_env_eval["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_env_eval["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
     assert (
-        raw_env_eval["ndtw_gt_path"]
+        raw_env_eval["gt_path"]
         == "${env.data_path_dir}/${env.eval.split}/${env.eval.split}_gt.json.gz"
     )
     assert (
@@ -56,7 +56,7 @@ def test_habitat_grpo_cma_uses_current_reward_config():
     assert raw_env_train["success_reward_coef"] == "${algorithm.success_reward_coef}"
     assert raw_env_train["ndtw_reward_coef"] == "${algorithm.ndtw_reward_coef}"
     assert (
-        raw_env_train["ndtw_gt_path"]
+        raw_env_train["gt_path"]
         == "${env.data_path_dir}/${env.train.split}/${env.train.split}_gt.json.gz"
     )
     assert (
