@@ -17,6 +17,9 @@ compress_type: "grid:2"
 tune_vision_encoder: false
 model_max_length: 1024
 drop_overlong_train_metadata: false
+log_response_token_stats: false
+response_token_stats_path: null
+response_token_stats_max_samples: 0
 add_value_head: false
 load_to_device: true
 run_type: "eval"

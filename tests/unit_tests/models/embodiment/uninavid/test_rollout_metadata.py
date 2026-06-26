@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -106,6 +107,72 @@ def test_uninavid_generation_scores_compute_prev_logprobs_and_response_mask():
     torch.testing.assert_close(prev_logprobs, expected)
     assert response_mask.tolist() == [[True, True, False]]
     assert prev_logprobs[0, 2, 0].item() == 0.0
+
+
+def test_uninavid_response_token_stats_logging_writes_jsonl(tmp_path, monkeypatch):
+    policy = UniNaVidForActionPrediction(
+        tokenizer=_Tokenizer(),
+        model=_GenerateModel(outputs=None),
+        image_processor=None,
+    )
+    policy.cfg = SimpleNamespace(
+        log_response_token_stats=True,
+        response_token_stats_path=str(tmp_path / "response_stats.jsonl"),
+        response_token_stats_max_samples=10,
+    )
+    monkeypatch.setenv("RANK", "6")
+
+    env_obs = {
+        "states": torch.tensor([101, 102], dtype=torch.long),
+        "task_descriptions": ["go left", "go right"],
+        "languages": ["en-US", "en-IN"],
+    }
+    response_mask = torch.tensor(
+        [
+            [True, True, False],
+            [True, True, True],
+        ]
+    )
+
+    policy._maybe_log_response_token_stats(
+        env_obs=env_obs,
+        output_texts=["forward, left", "right, stop"],
+        response_mask=response_mask,
+        mode="train",
+        num_action_chunks=4,
+    )
+    policy._maybe_log_response_token_stats(
+        env_obs=env_obs,
+        output_texts=["stop", "forward"],
+        response_mask=torch.tensor([[True], [True]]),
+        mode="train",
+        num_action_chunks=4,
+    )
+
+    lines = (tmp_path / "response_stats_rank_6.jsonl").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    records = [json.loads(line) for line in lines]
+
+    assert records[0] == {
+        "split": None,
+        "mode": "train",
+        "rank": 6,
+        "global_step": None,
+        "episode_id": 101,
+        "step": 0,
+        "slot_id": 0,
+        "language": "en-US",
+        "response_token_len": 2,
+        "parsed_actions": ["forward", "left"],
+        "parsed_action_count": 2,
+        "response_text": "forward, left",
+    }
+    assert records[1]["episode_id"] == 102
+    assert records[1]["step"] == 0
+    assert records[1]["response_token_len"] == 3
+    assert records[2]["episode_id"] == 101
+    assert records[2]["step"] == 1
 
 
 def test_uninavid_masked_logprob_gather_skips_negative_infinity_pad_logits():

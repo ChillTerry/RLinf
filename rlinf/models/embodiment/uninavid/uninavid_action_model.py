@@ -14,7 +14,10 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -43,6 +46,7 @@ from rlinf.models.embodiment.uninavid.nav_rollout import (
     empty_rollout_metadata,
     episode_id_from_obs,
     get_slot_cache,
+    parse_uninavid_action_names,
     parse_uninavid_actions,
     select_slot_rgb_frames,
 )
@@ -74,6 +78,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         self.image_processor = image_processor
         self.torch_dtype = torch_dtype
         self._nav_caches: dict[int, UniNaVidNavCache] = {}
+        self._response_token_stats_written = 0
+        self._response_token_stats_steps: dict[int, tuple[int, int]] = {}
 
         self._initialize_fsdp_wrap_metadata()
 
@@ -353,9 +359,16 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         *,
         num_action_chunks: int,
     ):
-        output_texts, _, _, _, _ = self._generate_batch_outputs(
+        output_texts, _, _, response_ids, _ = self._generate_batch_outputs(
             env_obs,
             generation_kwargs,
+        )
+        self._maybe_log_response_token_stats(
+            env_obs=env_obs,
+            output_texts=output_texts,
+            response_mask=self._build_response_mask(response_ids),
+            mode="eval",
+            num_action_chunks=num_action_chunks,
         )
         action_chunks = []
         for output_text in output_texts:
@@ -491,6 +504,13 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 overlong_train_metadata_mask[:, None],
                 False,
             )
+        self._maybe_log_response_token_stats(
+            env_obs=env_obs,
+            output_texts=output_texts,
+            response_mask=response_mask,
+            mode="train",
+            num_action_chunks=num_action_chunks,
+        )
         metadata = {
             "prev_logprobs": prev_logprobs.detach(),
             "prev_values": None,
@@ -619,6 +639,118 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                     delattr(self.model.config, "run_type")
             else:
                 self.model.config.run_type = original_run_type
+
+    def _maybe_log_response_token_stats(
+        self,
+        *,
+        env_obs: dict[str, Any],
+        output_texts: list[str],
+        response_mask: torch.Tensor,
+        mode: str,
+        num_action_chunks: int,
+    ) -> None:
+        cfg = getattr(self, "cfg", None)
+        if not bool(self._cfg_get(cfg, "log_response_token_stats", default=False)):
+            return
+        stats_path = self._cfg_get(
+            cfg,
+            "response_token_stats_path",
+            default=None,
+        )
+        if not stats_path:
+            return
+
+        max_samples = int(
+            self._cfg_get(cfg, "response_token_stats_max_samples", default=0)
+        )
+        if max_samples > 0 and self._response_token_stats_written >= max_samples:
+            return
+
+        rank = self._get_response_token_stats_rank()
+        output_path = self._resolve_response_token_stats_path(str(stats_path), rank)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        global_step = getattr(self, "global_step", None)
+        response_lengths = response_mask.to(torch.bool).sum(dim=1).detach().cpu()
+        records = []
+        for slot_id, output_text in enumerate(output_texts):
+            if max_samples > 0 and self._response_token_stats_written >= max_samples:
+                break
+
+            episode_id = episode_id_from_obs(env_obs, slot_id)
+            step = self._next_response_token_stats_step(slot_id, episode_id)
+            parsed_actions = parse_uninavid_action_names(
+                output_text,
+                num_action_chunks,
+            )
+            records.append(
+                {
+                    "mode": mode,
+                    "rank": rank,
+                    "global_step": global_step,
+                    "episode_id": episode_id,
+                    "step": step,
+                    "slot_id": slot_id,
+                    "language": self._get_env_obs_list_value(
+                        env_obs,
+                        "languages",
+                        slot_id,
+                    ),
+                    "response_token_len": int(response_lengths[slot_id].item()),
+                    "parsed_actions": parsed_actions,
+                    "parsed_action_count": len(parsed_actions),
+                    "response_text": output_text,
+                }
+            )
+            self._response_token_stats_written += 1
+
+        if not records:
+            return
+        with output_path.open("a", encoding="utf-8") as file_obj:
+            for record in records:
+                file_obj.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _next_response_token_stats_step(self, slot_id: int, episode_id: int) -> int:
+        previous = self._response_token_stats_steps.get(slot_id)
+        if previous is None or previous[0] != episode_id:
+            step = 0
+        else:
+            step = previous[1]
+        self._response_token_stats_steps[slot_id] = (episode_id, step + 1)
+        return step
+
+    @staticmethod
+    def _get_env_obs_list_value(
+        env_obs: dict[str, Any],
+        key: str,
+        slot_id: int,
+    ) -> Any:
+        values = env_obs.get(key)
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            value = values[slot_id]
+            if value.numel() == 1:
+                return value.item()
+            return value.detach().cpu().tolist()
+        return values[slot_id]
+
+    @staticmethod
+    def _get_response_token_stats_rank() -> int:
+        for env_key in ("RANK", "LOCAL_RANK"):
+            value = os.environ.get(env_key)
+            if value is not None:
+                return int(value)
+        return 0
+
+    @staticmethod
+    def _resolve_response_token_stats_path(path: str, rank: int) -> Path:
+        if "{rank}" in path:
+            return Path(path.format(rank=rank))
+        output_path = Path(path)
+        suffix = output_path.suffix
+        stem = output_path.stem if suffix else output_path.name
+        return output_path.with_name(f"{stem}_rank_{rank}{suffix}")
 
     def _build_navigation_input_ids(self, navigation_prompt: str) -> torch.Tensor:
         from rlinf.models.embodiment.uninavid import conversation as conversation_lib
