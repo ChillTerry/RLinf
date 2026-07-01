@@ -18,6 +18,7 @@ from typing import Optional
 
 import torch
 
+from rlinf.algorithms.losses import compute_ppo_actor_loss, compute_ppo_critic_loss
 from rlinf.scheduler import Worker
 
 
@@ -89,6 +90,40 @@ def prepare_uninavid_token_level_loss_inputs(
             raise ValueError("UniNaVid entropy must match logprobs shape.")
         prepared["entropy"] = entropy
     return prepared
+
+
+def compute_uninavid_actor_critic_loss(
+    *,
+    actor_loss_mask: torch.Tensor,
+    critic_loss_mask: torch.Tensor,
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    prev_values: torch.Tensor,
+    value_clip: float,
+    huber_delta: float,
+    loss_mask_sum: Optional[torch.Tensor] = None,
+    max_episode_steps: Optional[int] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    actor_loss, actor_metrics = compute_ppo_actor_loss(
+        loss_mask=actor_loss_mask,
+        **kwargs,
+    )
+    critic_loss, critic_metrics = compute_ppo_critic_loss(
+        values=values,
+        returns=returns,
+        prev_values=prev_values,
+        value_clip=value_clip,
+        huber_delta=huber_delta,
+        loss_mask=critic_loss_mask,
+        loss_mask_sum=loss_mask_sum,
+        max_episode_steps=max_episode_steps,
+    )
+
+    metrics = {}
+    metrics.update(actor_metrics)
+    metrics.update(critic_metrics)
+    return actor_loss + critic_loss, metrics
 
 
 def _zero_actor_diagnostics() -> dict[str, float]:

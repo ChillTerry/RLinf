@@ -265,6 +265,9 @@ class MultiStepRolloutWorker(Worker):
                 "eval" if self.cfg.algorithm.loss_type == "embodied_dagger" else mode
             )
             kwargs = {**kwargs, "mode": rollout_mode}
+            kwargs["calculate_values"] = self._should_calculate_values_for_uninavid(
+                mode=mode
+            )
             if mode == "eval":
                 kwargs["num_action_chunks"] = get_effective_num_action_chunks(
                     self.cfg.actor.model,
@@ -340,6 +343,14 @@ class MultiStepRolloutWorker(Worker):
 
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
+
+    def _should_calculate_values_for_uninavid(self, mode: str) -> bool:
+        if mode != "train":
+            return False
+        return bool(
+            self.cfg.algorithm.adv_type == "gae"
+            or self.cfg.actor.model.get("add_value_head", False)
+        )
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None

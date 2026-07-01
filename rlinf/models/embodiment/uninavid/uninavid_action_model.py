@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.models.embodiment.uninavid.constants import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
@@ -71,15 +72,42 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         model,
         image_processor,
         torch_dtype: torch.dtype | None = None,
+        cfg=None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
         self.model = model
         self.image_processor = image_processor
         self.torch_dtype = torch_dtype
+        self.cfg = cfg
         self._nav_caches: dict[int, UniNaVidNavCache] = {}
         self._response_token_stats_written = 0
         self._response_token_stats_steps: dict[int, tuple[int, int]] = {}
+
+        if self._cfg_get(cfg, "add_value_head", default=False):
+            self.value_head = ValueHead(
+                input_dim=self._get_hidden_size_for_value_head(),
+                hidden_sizes=tuple(
+                    self._cfg_get(
+                        cfg,
+                        "value_head_hidden_sizes",
+                        default=(512, 128),
+                    )
+                ),
+                output_dim=1,
+                activation=self._cfg_get(
+                    cfg,
+                    "value_head_activation",
+                    default="relu",
+                ),
+                bias_last=self._cfg_get(
+                    cfg,
+                    "value_head_bias_last",
+                    default=False,
+                ),
+            )
+            if torch_dtype is not None:
+                self.value_head = self.value_head.to(dtype=torch_dtype)
 
         self._initialize_fsdp_wrap_metadata()
 
@@ -226,6 +254,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             model=model,
             image_processor=image_processor,
             torch_dtype=dtype,
+            cfg=cfg,
         )
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
@@ -267,22 +296,22 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         compute_values: bool = False,
         **kwargs,
     ) -> dict[str, torch.Tensor | None]:
-        if compute_values:
-            raise NotImplementedError(
-                "UniNaVid GRPO training does not use critic values."
-            )
-
         prompt_inputs_embeds = forward_inputs["prompt_inputs_embeds"]
         prompt_attention_mask = forward_inputs["prompt_attention_mask"]
         response_ids = forward_inputs["response_ids"]
         response_mask = forward_inputs["response_mask"].to(torch.bool)
 
-        response_logits = self._compute_logits_from_embeds(
+        logits_result = self._compute_logits_from_embeds(
             prompt_inputs_embeds=prompt_inputs_embeds,
             prompt_attention_mask=prompt_attention_mask,
             response_ids=response_ids,
             response_mask=response_mask,
+            return_hidden_state=compute_values,
         )
+        if compute_values:
+            response_logits, final_hidden, prompt_len = logits_result
+        else:
+            response_logits = logits_result
 
         logprobs = None
         if compute_logprobs:
@@ -300,7 +329,14 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             entropy = -(probs * token_logprobs_all).sum(dim=-1, keepdim=True)
             entropy = entropy * response_mask.unsqueeze(-1).to(entropy.dtype)
 
-        return {"logprobs": logprobs, "entropy": entropy, "values": None}
+        values = None
+        if compute_values:
+            values = self._compute_value_from_pre_response_hidden(
+                final_hidden=final_hidden,
+                prompt_len=prompt_len,
+            )
+
+        return {"logprobs": logprobs, "entropy": entropy, "values": values}
 
     def predict_action_batch(
         self,
@@ -310,11 +346,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         mode: str = "eval",
         **kwargs,
     ):
-        if calculate_values:
-            raise NotImplementedError(
-                "UniNaVid does not provide critic values for GRPO training."
-            )
-
         num_action_chunks = self._get_num_action_chunks(
             mode=mode,
             override=kwargs.pop("num_action_chunks", None),
@@ -324,6 +355,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 env_obs,
                 kwargs,
                 num_action_chunks=num_action_chunks,
+                calculate_values=calculate_values,
             )
 
         return self._predict_eval_batch(
@@ -387,6 +419,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         generation_kwargs: dict[str, Any],
         *,
         num_action_chunks: int,
+        calculate_values: bool = False,
     ):
         (
             output_texts,
@@ -504,6 +537,23 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 overlong_train_metadata_mask[:, None],
                 False,
             )
+        prev_values = None
+        if calculate_values:
+            with torch.no_grad():
+                prev_values = self._compute_values_from_forward_inputs(
+                    prompt_inputs_embeds=prompt_inputs_embeds,
+                    prompt_attention_mask=prompt_attention_mask,
+                    response_ids=response_ids,
+                    response_mask=response_mask,
+                )
+            if (
+                overlong_train_metadata_mask is not None
+                and overlong_train_metadata_mask.any()
+            ):
+                prev_values = prev_values.masked_fill(
+                    overlong_train_metadata_mask[:, None],
+                    0.0,
+                )
         self._maybe_log_response_token_stats(
             env_obs=env_obs,
             output_texts=output_texts,
@@ -513,7 +563,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         )
         metadata = {
             "prev_logprobs": prev_logprobs.detach(),
-            "prev_values": None,
+            "prev_values": prev_values.detach() if prev_values is not None else None,
             "forward_inputs": {
                 "prompt_inputs_embeds": prompt_inputs_embeds.detach(),
                 "prompt_attention_mask": prompt_attention_mask.detach(),
@@ -1155,7 +1205,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         prompt_attention_mask: torch.Tensor,
         response_ids: torch.Tensor,
         response_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        return_hidden_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, int]:
         response_embeds = self._embed_response_ids(response_ids)
         full_inputs_embeds = torch.cat([prompt_inputs_embeds, response_embeds], dim=1)
         full_attention_mask = torch.cat(
@@ -1166,10 +1217,58 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             inputs_embeds=full_inputs_embeds,
             attention_mask=full_attention_mask,
             use_cache=False,
+            output_hidden_states=return_hidden_state,
             return_dict=True,
         )
         prompt_len = prompt_inputs_embeds.shape[1]
-        return outputs.logits[:, prompt_len - 1 : -1, :]
+        response_logits = outputs.logits[:, prompt_len - 1 : -1, :]
+        if not return_hidden_state:
+            return response_logits
+        if outputs.hidden_states is None:
+            raise RuntimeError("UniNaVid value head requires output_hidden_states=True.")
+        final_hidden = outputs.hidden_states[-1]
+        return response_logits, final_hidden, prompt_len
+
+    def _compute_values_from_forward_inputs(
+        self,
+        *,
+        prompt_inputs_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        response_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        _, final_hidden, prompt_len = self._compute_logits_from_embeds(
+            prompt_inputs_embeds=prompt_inputs_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            response_ids=response_ids,
+            response_mask=response_mask,
+            return_hidden_state=True,
+        )
+        return self._compute_value_from_pre_response_hidden(
+            final_hidden=final_hidden,
+            prompt_len=prompt_len,
+        )
+
+    def _compute_value_from_pre_response_hidden(
+        self,
+        *,
+        final_hidden: torch.Tensor,
+        prompt_len: int,
+    ) -> torch.Tensor:
+        if not hasattr(self, "value_head"):
+            raise RuntimeError("UniNaVid value computation requires value_head.")
+        value_feature = final_hidden[:, prompt_len - 1, :]
+        return self.value_head(value_feature).float()
+
+    def _get_hidden_size_for_value_head(self) -> int:
+        config = getattr(self.model, "config", None)
+        hidden_size = getattr(config, "hidden_size", None)
+        if hidden_size is None and hasattr(self.model, "get_model"):
+            inner_config = getattr(self.model.get_model(), "config", None)
+            hidden_size = getattr(inner_config, "hidden_size", None)
+        if hidden_size is None:
+            raise AttributeError("UniNaVid model config must expose hidden_size.")
+        return int(hidden_size)
 
     def _move_images(self, images, *, device: torch.device):
         if images is None:

@@ -1568,11 +1568,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         from rlinf.algorithms.registry import get_policy_loss
                         from rlinf.algorithms.utils import postprocess_loss_metric
                         from rlinf.models.embodiment.uninavid.rl_loss import (
+                            compute_uninavid_actor_critic_loss,
                             compute_uninavid_actor_diagnostic_stats,
                             compute_uninavid_reference_drift_diagnostics,
                             prepare_uninavid_token_level_loss_inputs,
                         )
 
+                        chunk_loss_mask = loss_mask
                         prepared_loss_inputs = prepare_uninavid_token_level_loss_inputs(
                             logprobs=output_dict["logprobs"],
                             old_logprobs=prev_logprobs,
@@ -1585,26 +1587,67 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             entropy=output_dict.get("entropy"),
                         )
 
-                        loss_fn = get_policy_loss(self.cfg.algorithm.loss_type)
                         loss_agg_func = get_loss_agg_func(
                             self.cfg.algorithm.loss_agg_func
                         )
-                        loss, metrics_data = loss_fn(
-                            task_type=self.cfg.runner.task_type,
-                            loss_agg_func=loss_agg_func,
-                            clip_ratio_c=self.cfg.algorithm.get("clip_ratio_c", 3.0),
-                            clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
-                            clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
-                            clip_log_ratio_min=self.cfg.algorithm.get(
-                                "clip_log_ratio_min", None
-                            ),
-                            clip_log_ratio_max=self.cfg.algorithm.get(
-                                "clip_log_ratio_max", None
-                            ),
-                            fast_path_zero_loss_mask=False,
-                            critic_warmup=critic_warmup,
-                            **prepared_loss_inputs,
-                        )
+                        if self.cfg.algorithm.loss_type == "actor_critic":
+                            num_action_chunks = int(
+                                self.cfg.actor.model.get("num_action_chunks", 1)
+                            )
+                            chunk_horizon = (
+                                int(self.cfg.env.train.max_episode_steps)
+                                // num_action_chunks
+                            )
+                            loss, metrics_data = compute_uninavid_actor_critic_loss(
+                                logprobs=prepared_loss_inputs["logprobs"],
+                                old_logprobs=prepared_loss_inputs["old_logprobs"],
+                                advantages=prepared_loss_inputs["advantages"],
+                                actor_loss_mask=prepared_loss_inputs["loss_mask"],
+                                values=output_dict["values"],
+                                returns=returns,
+                                prev_values=prev_values,
+                                critic_loss_mask=chunk_loss_mask,
+                                loss_mask_sum=loss_mask_sum,
+                                max_episode_steps=chunk_horizon,
+                                loss_agg_func=loss_agg_func,
+                                clip_ratio_c=self.cfg.algorithm.get(
+                                    "clip_ratio_c", 3.0
+                                ),
+                                clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
+                                clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
+                                clip_log_ratio_min=self.cfg.algorithm.get(
+                                    "clip_log_ratio_min", None
+                                ),
+                                clip_log_ratio_max=self.cfg.algorithm.get(
+                                    "clip_log_ratio_max", None
+                                ),
+                                fast_path_zero_loss_mask=False,
+                                critic_warmup=critic_warmup,
+                                value_clip=self.cfg.algorithm.get("value_clip", None),
+                                huber_delta=self.cfg.algorithm.get(
+                                    "huber_delta", None
+                                ),
+                            )
+                        else:
+                            loss_fn = get_policy_loss(self.cfg.algorithm.loss_type)
+                            loss, metrics_data = loss_fn(
+                                task_type=self.cfg.runner.task_type,
+                                loss_agg_func=loss_agg_func,
+                                clip_ratio_c=self.cfg.algorithm.get(
+                                    "clip_ratio_c", 3.0
+                                ),
+                                clip_ratio_low=self.cfg.algorithm.clip_ratio_low,
+                                clip_ratio_high=self.cfg.algorithm.clip_ratio_high,
+                                clip_log_ratio_min=self.cfg.algorithm.get(
+                                    "clip_log_ratio_min", None
+                                ),
+                                clip_log_ratio_max=self.cfg.algorithm.get(
+                                    "clip_log_ratio_max", None
+                                ),
+                                fast_path_zero_loss_mask=False,
+                                critic_warmup=critic_warmup,
+                                **prepared_loss_inputs,
+                            )
                         metrics_data = postprocess_loss_metric(metrics_data)
                         diagnostic_stats, log_ratio_abs_values = (
                             compute_uninavid_actor_diagnostic_stats(
