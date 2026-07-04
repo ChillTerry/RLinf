@@ -47,7 +47,7 @@ algorithm:
   kl_penalty: kl
 
   update_epoch: 1
-  rollout_epoch: 1
+  rollout_epoch: 4
   eval_rollout_epoch: 1
   group_size: 4
 
@@ -70,16 +70,16 @@ algorithm:
   gae_lambda: 0.95
 
   reward_mode: subgoal_progress
-  progress_reward_coef: 20
+  progress_reward_coef: 10
   subgoal_success_reward_coef: 0
-  stop_success_reward_coef: 20
+  stop_success_reward_coef: 10
   premature_stop_coeff: 0
-  failure_stop_coeff: 10
+  failure_stop_coeff: 0
   stall_penalty_coeff: 0.0
   stall_patience: 9
   stall_recovery_patience: 3
   stall_observation_patience: 6
-  final_success_distance: 2.0
+  final_success_distance: 3.0
   subgoal_switch_distance: 2.0
   subgoal_success_distance: 2.0
   filter_rewards: False
@@ -97,7 +97,7 @@ algorithm:
     add_BOS: False
 
   length_params:
-    max_new_token: 256
+    max_new_token: 128
 
 env:
   group_name: "EnvGroup"
@@ -139,9 +139,9 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
-    total_num_envs: 112
-    max_episode_steps: 200
-    max_steps_per_rollout_epoch: 3200
+    total_num_envs: 32
+    max_episode_steps: 100
+    max_steps_per_rollout_epoch: 800
     group_size: 1
     auto_reset: True
     ignore_terminations: True
@@ -189,18 +189,19 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 8
-  global_batch_size: 32
+  global_batch_size: 512
   seed: 42
   enable_offload: True
 
   model:
     num_action_chunks: 4
     eval_num_action_chunks: 2
+    model_max_length: 768
     model_path: "VLN-CE/models/uninavid_weights/uninavid-7b-full-224-video-fps-1-grid-2"
     vision_tower: "VLN-CE/models/uninavid_weights/eva_vit_g.pth"
 
   optim:
-    lr: 1.0e-6
+    lr: 3.0e-6
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
