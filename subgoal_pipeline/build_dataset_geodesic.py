@@ -104,6 +104,107 @@ def _build_geodesic_subgoal_dicts(steps: list[MemoryStep], selected_indices: lis
     return subgoals
 
 
+def parse_gpus(spec: str) -> list[int]:
+    spec = (spec or "").strip()
+    if not spec:
+        raise RuntimeError("--gpus must be a non-empty comma-separated list, e.g. '0,1,2,3'.")
+    gpu_ids: list[int] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            raise RuntimeError(f"--gpus has an empty entry in '{spec}'.")
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise RuntimeError(f"--gpus entry '{token}' is not an integer.") from exc
+        if value < 0:
+            raise RuntimeError(f"--gpus entry '{token}' must be a non-negative integer.")
+        gpu_ids.append(value)
+    if not gpu_ids:
+        raise RuntimeError("--gpus parsed to an empty list.")
+    return gpu_ids
+
+
+def validate_num_processes_vs_gpus(num_processes: int, num_gpus: int) -> None:
+    if num_processes < 1:
+        raise RuntimeError(f"--num_processes must be >= 1, got {num_processes}.")
+    if num_gpus < 1:
+        raise RuntimeError(f"--gpus count must be >= 1, got {num_gpus}.")
+    if num_processes < num_gpus:
+        raise RuntimeError(
+            f"--num_processes ({num_processes}) must be >= GPU count ({num_gpus})."
+        )
+
+
+def bucket_groups_by_scene(
+    groups: list[tuple[int, list[int], int]],
+    source_episode_by_id: dict[int, dict],
+) -> dict[str, list[tuple[int, list[int], int]]]:
+    buckets: dict[str, list[tuple[int, list[int], int]]] = {}
+    for trajectory_id, episode_ids, representative_id in groups:
+        source = source_episode_by_id.get(int(representative_id)) or {}
+        scene_id = str(source.get("scene_id") or "")
+        buckets.setdefault(scene_id, []).append(
+            (int(trajectory_id), [int(v) for v in episode_ids], int(representative_id))
+        )
+    return buckets
+
+
+def assign_scenes_to_gpus(scene_list: list[str], gpu_ids: list[int]) -> dict[int, list[str]]:
+    if not gpu_ids:
+        raise RuntimeError("gpu_ids must be non-empty.")
+    assignment: dict[int, list[str]] = {int(g): [] for g in gpu_ids}
+    for k, scene_id in enumerate(scene_list):
+        assignment[int(gpu_ids[k % len(gpu_ids)])].append(scene_id)
+    return assignment
+
+
+def compute_workers_per_gpu(
+    num_processes: int,
+    gpu_ids: list[int],
+    scenes_per_gpu: dict[int, int],
+) -> dict[int, int]:
+    if not gpu_ids:
+        raise RuntimeError("gpu_ids must be non-empty.")
+    active_gpus = [int(g) for g in gpu_ids if int(scenes_per_gpu.get(int(g), 0)) > 0]
+    if not active_gpus:
+        return {}
+    n_active = len(active_gpus)
+    base = num_processes // n_active
+    remainder = num_processes % n_active
+    out: dict[int, int] = {}
+    for idx, gpu_id in enumerate(active_gpus):
+        scene_count = int(scenes_per_gpu.get(int(gpu_id), 0))
+        workers = base + (1 if idx < remainder else 0)
+        out[int(gpu_id)] = max(1, min(workers, scene_count))
+    return out
+
+
+def aggregate_summaries(summaries: list[dict]) -> dict:
+    processed = 0
+    skipped = 0
+    scenes_processed = 0
+    scenes_failed = 0
+    failed: list[dict] = []
+    for s in summaries:
+        s_processed = int(s.get("processed", 0))
+        s_failed = s.get("failed") or []
+        processed += s_processed
+        skipped += int(s.get("skipped", 0))
+        if s_processed > 0:
+            scenes_processed += 1
+        elif s_failed:
+            scenes_failed += 1
+        failed.extend(s_failed)
+    return {
+        "scenes_processed": scenes_processed,
+        "scenes_failed": scenes_failed,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
 def build_dataset_geodesic(args: argparse.Namespace) -> None:
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
