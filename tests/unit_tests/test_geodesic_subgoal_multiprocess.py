@@ -86,3 +86,19 @@ def test_aggregate_summaries():
     assert agg["processed"] == 5
     assert agg["skipped"] == 1
     assert len(agg["failed"]) == 4
+
+
+def test_multiprocess_arg_defaults():
+    parser = bdg.build_arg_parser()
+    args = parser.parse_args(["--subgoal_distance", "3.0"])
+    assert args.num_processes == 1
+    assert args.gpus == "0"
+
+
+def test_multiprocess_args_parsed():
+    parser = bdg.build_arg_parser()
+    args = parser.parse_args(
+        ["--subgoal_distance", "3.0", "--num_processes", "8", "--gpus", "0,1,2,3"]
+    )
+    assert args.num_processes == 8
+    assert args.gpus == "0,1,2,3"

@@ -490,6 +490,65 @@ def process_scene(
     }
 
 
+def _dispatch_workers(
+    gpu_ids: list[int],
+    gpu_to_scenes: dict[int, list[str]],
+    workers_per_gpu: dict[int, int],
+    scene_to_groups: dict[str, list],
+    gt_trajectories: dict,
+    source_episode_by_id: dict,
+    base_kwargs: dict,
+) -> list[dict]:
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    spawn_ctx = mp.get_context("spawn")
+    summaries: list[dict] = []
+    pools: list[ProcessPoolExecutor] = []
+    futures: list = []
+    for gpu_id in gpu_ids:
+        scenes = gpu_to_scenes.get(int(gpu_id), [])
+        if not scenes:
+            continue
+        max_workers = int(workers_per_gpu[int(gpu_id)])
+        pool = ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=spawn_ctx,
+            initializer=init_worker,
+            initargs=(int(gpu_id),),
+        )
+        pools.append(pool)
+        for scene_id in scenes:
+            scene_groups = scene_to_groups[scene_id]
+            rep_ids = [
+                int(rid) for _tid, _eids, rid in scene_groups
+                if int(rid) in gt_trajectories and int(rid) in source_episode_by_id
+            ]
+            gt_subset = {rid: gt_trajectories[rid] for rid in rep_ids}
+            source_subset = {rid: source_episode_by_id[rid] for rid in rep_ids}
+            kw = dict(base_kwargs)
+            kw.update(
+                scene_id=scene_id,
+                scene_groups=[
+                    (int(t), [int(v) for v in eids], int(rid))
+                    for t, eids, rid in scene_groups
+                ],
+                gt_subset=gt_subset,
+                source_subset=source_subset,
+            )
+            futures.append(pool.submit(process_scene, **kw))
+    for fut in futures:
+        try:
+            summaries.append(fut.result())
+        except Exception as exc:
+            summaries.append(
+                {"scene_id": "?", "processed": 0, "skipped": 0, "failed": [{"error": repr(exc)}]}
+            )
+    for pool in pools:
+        pool.shutdown(wait=True)
+    return summaries
+
+
 def build_dataset_geodesic(args: argparse.Namespace) -> None:
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -583,7 +642,6 @@ def build_dataset_geodesic(args: argparse.Namespace) -> None:
         for _trajectory_id, episode_ids, _representative_id in groups
         for episode_id in episode_ids
     }
-    representative_ids = [int(representative_id) for _tid, _ids, representative_id in groups]
     print(
         "Selected trajectory groups: "
         f"trajectories={len(groups)} episodes={len(selected_episode_ids)} "
@@ -604,186 +662,65 @@ def build_dataset_geodesic(args: argparse.Namespace) -> None:
         print(f"First selected groups: {json.dumps(preview, indent=2, ensure_ascii=False)}")
         return
 
-    import habitat
-    from habitat.config import read_write
-    from habitat_baselines.config.default import get_config as get_habitat_config
-
-    from rlinf.envs.habitat.extensions import measures as _rlinf_measures  # noqa: F401
-
     habitat_data_path = prepare_habitat_data_path(
         data_path=str(train_json_path),
         split=str(args.split),
         out_dir=str(out_root),
     )
-    cfg = get_habitat_config(str(args.config))
-    with read_write(cfg):
-        cfg.habitat.dataset.split = str(args.split)
-        cfg.habitat.dataset.data_path = habitat_data_path
-        cfg.habitat.dataset.scenes_dir = str(args.scenes_dir)
-        ndtw_measure = cfg.habitat.task.measurements.ndtw
-        ndtw_measure.SPLIT = str(args.split)
-        ndtw_measure.GT_PATH = str(Path(args.gt_json).resolve())
-        cfg.habitat.task.measurements.top_down_map.draw_shortest_path = False
+    gpu_ids = parse_gpus(str(args.gpus))
+    num_processes = int(args.num_processes)
+    validate_num_processes_vs_gpus(num_processes, len(gpu_ids))
 
-    env = habitat.Env(config=cfg)
-    env_episode_by_id = {int(ep.episode_id): ep for ep in env.episodes}
-    missing_env = [eid for eid in representative_ids if eid not in env_episode_by_id]
-    if missing_env:
-        raise RuntimeError(f"Representative episodes missing from Habitat env, e.g. {missing_env[:5]}")
+    if remaining_max_traj >= 0:
+        groups = groups[:remaining_max_traj]
 
-    max_steps = int(cfg.habitat.environment.max_episode_steps)
-    subgoal_distance = float(args.subgoal_distance)
-    failures: list[dict] = []
+    scene_to_groups = bucket_groups_by_scene(groups, source_episode_by_id)
+    scene_list = sorted(scene_to_groups.keys())
+    gpu_to_scenes = assign_scenes_to_gpus(scene_list, gpu_ids)
+    scenes_per_gpu = {int(g): len(scenes) for g, scenes in gpu_to_scenes.items()}
+    workers_per_gpu = compute_workers_per_gpu(num_processes, gpu_ids, scenes_per_gpu)
 
-    try:
-        for group_idx, (trajectory_id, episode_ids, representative_id) in enumerate(groups):
-            if remaining_max_traj >= 0 and group_idx >= remaining_max_traj:
-                break
+    print(
+        f"Multiprocess: num_processes={num_processes} gpus={gpu_ids} "
+        f"scenes={len(scene_list)} workers_per_gpu={workers_per_gpu}"
+    )
 
-            source_episode = source_episode_by_id[int(representative_id)]
-            env_episode = env_episode_by_id[int(representative_id)]
-            gt_trajectory = gt_trajectories[int(representative_id)]
-            instruction = instruction_text(source_episode).strip()
-            artifact_name = f"traj{int(trajectory_id):06d}_rep_episode_id{int(representative_id):06d}"
-            artifact_dir = out_root / artifact_name
-            artifact_dir.mkdir(parents=True, exist_ok=True)
+    base_kwargs = {
+        "config_path": str(args.config),
+        "split": str(args.split),
+        "scenes_dir": str(args.scenes_dir),
+        "gt_json": str(args.gt_json),
+        "habitat_data_path": habitat_data_path,
+        "out_dir": str(out_root),
+        "subgoal_distance": float(args.subgoal_distance),
+        "subgoal_radius": float(args.subgoal_radius),
+        "no_video": bool(args.no_video),
+        "video_fps": int(args.video_fps),
+        "video_highlight_frames": int(args.video_highlight_frames),
+        "no_topdown": bool(args.no_topdown),
+        "topdown_max_size": int(args.topdown_max_size),
+        "overwrite": bool(args.overwrite),
+        "continue_on_error": bool(args.continue_on_error),
+        "train_json_path": str(train_json_path),
+    }
 
-            if (artifact_dir / "subgoals_geodesic.json").exists() and not args.overwrite:
-                print(f"[skip] {artifact_name} existing subgoals_geodesic.json")
-                subgoals_by_trajectory[int(trajectory_id)] = load_json(
-                    artifact_dir / "subgoals_geodesic.json"
-                )
-                continue
+    summaries = _dispatch_workers(
+        gpu_ids, gpu_to_scenes, workers_per_gpu, scene_to_groups,
+        gt_trajectories, source_episode_by_id, base_kwargs,
+    )
+    agg = aggregate_summaries(summaries)
+    for failure in agg["failed"]:
+        append_jsonl(out_root / "failures.jsonl", failure)
 
-            episode_label = (
-                f"{artifact_name} scene={source_episode.get('scene_id')} "
-                f"traj={trajectory_id} group_size={len(episode_ids)}"
-            )
-            print(
-                f"\n[{group_idx + 1}/{len(groups)}] Processing {episode_label} "
-                f"actions={len(gt_trajectory.actions)}"
-            )
-
-            try:
-                steps, rollout_info = replay_gt_actions_in_memory(
-                    env=env,
-                    episode=env_episode,
-                    gt_trajectory=gt_trajectory,
-                    max_steps=max_steps,
-                )
-                if not steps:
-                    raise RuntimeError("GT replay produced no frames.")
-
-                final_goal_position, _goals_payload = extract_goal_payload(env_episode)
-                if final_goal_position is None:
-                    raise RuntimeError(f"episode {representative_id} has no goal position.")
-
-                selected = select_geodesic_subgoal_steps(
-                    steps=steps,
-                    sim=env.sim,
-                    subgoal_distance=subgoal_distance,
-                    final_goal_position=list(final_goal_position),
-                    episode_label=episode_label,
-                )
-                raw_subgoals = _build_geodesic_subgoal_dicts(steps, selected)
-                enriched = enrich_subgoals_from_memory(subgoals=raw_subgoals, steps=steps)
-                final = enriched[-1]
-                final["subgoal_position"] = list(final_goal_position)
-                final["subgoal_position_source"] = "original_train.goals[0].position"
-                final["agent_position_at_keyframe"] = list(final_goal_position)
-                final["is_final_goal"] = True
-
-                meta = build_episode_meta(
-                    episode=env_episode,
-                    source_episode=source_episode,
-                    gt_trajectory=gt_trajectory,
-                    steps=steps,
-                    rollout_info=rollout_info,
-                    habitat_data_path=habitat_data_path,
-                    input_data_path=str(train_json_path),
-                )
-                payload = {
-                    "instruction": instruction,
-                    "scene_id": meta.get("scene_id"),
-                    "episode_id": int(representative_id),
-                    "trajectory_id": int(trajectory_id),
-                    "trajectory_episode_ids": [int(v) for v in episode_ids],
-                    "subgoal_selection_method": "geodesic_distance",
-                    "subgoal_distance": subgoal_distance,
-                    "sampled_frame_steps": [int(item["best_step"]) for item in enriched],
-                    "goal_position": list(final_goal_position),
-                    "goal_position_source": "original_train.goals[0].position",
-                    "subgoals": enriched,
-                    "postprocess_notes": [],
-                }
-                validate_subgoal_payload(payload)
-
-                write_json(artifact_dir / "subgoals_geodesic.json", payload, pretty=True)
-                write_source_episode_artifact(
-                    out_dir=artifact_dir,
-                    source_episode=source_episode,
-                    meta=meta,
-                    selected_episode_ids=episode_ids,
-                    representative_id=representative_id,
-                )
-
-                topdown_metric = None
-                if not args.no_video or not args.no_topdown:
-                    metrics = env.get_metrics()
-                    td_key = (
-                        "top_down_map_vlnce"
-                        if "top_down_map_vlnce" in metrics
-                        else "top_down_map"
-                    )
-                    topdown_metric = metrics.get(td_key)
-                    if topdown_metric is None:
-                        print(
-                            f"  !! top_down_map metric unavailable; "
-                            f"skipping topdown for {artifact_name}"
-                        )
-
-                if not args.no_video:
-                    write_subgoal_video_from_memory(
-                        output_path=artifact_dir / "subgoals_geodesic.mp4",
-                        steps=steps,
-                        subgoals=enriched,
-                        fps=int(args.video_fps),
-                        highlight_frames=int(args.video_highlight_frames),
-                        topdown_metric=topdown_metric,
-                        sim=env.sim,
-                        instruction=instruction,
-                        subgoal_radius=float(args.subgoal_radius),
-                    )
-
-                if topdown_metric is not None:
-                    write_topdown_image_from_memory(
-                        output_path=artifact_dir / "topdown_subgoals.png",
-                        topdown_metric=topdown_metric,
-                        subgoals=enriched,
-                        sim=env.sim,
-                        radius=float(args.subgoal_radius),
-                        max_size=int(args.topdown_max_size),
-                    )
-
-                subgoals_by_trajectory[int(trajectory_id)] = payload
-                print(
-                    f"  -> saved {artifact_dir}; subgoals={len(enriched)} "
-                    f"distance={subgoal_distance}"
-                )
-            except Exception as exc:
-                failure = {
-                    "trajectory_id": int(trajectory_id),
-                    "episode_ids": [int(v) for v in episode_ids],
-                    "representative_episode_id": int(representative_id),
-                    "error": repr(exc),
-                }
-                failures.append(failure)
-                append_jsonl(out_root / "failures.jsonl", failure)
-                if not args.continue_on_error:
-                    raise
-                print(f"  !! failed {artifact_name}: {exc!r}")
-    finally:
-        env.close()
+    subgoals_by_trajectory: dict[int, dict] = {}
+    for payload_path in sorted(out_root.glob("traj*/subgoals_geodesic.json")):
+        try:
+            payload = load_json(payload_path)
+        except Exception:
+            continue
+        trajectory_id = int(payload.get("trajectory_id", -1))
+        if trajectory_id >= 0:
+            subgoals_by_trajectory[trajectory_id] = payload
 
     output_episodes: list[dict] = []
     modified = 0
@@ -825,13 +762,21 @@ def build_dataset_geodesic(args: argparse.Namespace) -> None:
         "max_gt_actions": int(args.max_gt_actions),
         "min_gt_actions": int(args.min_gt_actions),
         "subgoal_radius": float(args.subgoal_radius),
-        "subgoal_distance": subgoal_distance,
+        "subgoal_distance": float(args.subgoal_distance),
         "subgoal_selection_method": "geodesic_distance",
+        "parallel_mode": True,
+        "num_processes": num_processes,
+        "gpus": gpu_ids,
+        "workers_per_gpu": workers_per_gpu,
+        "scenes_total": len(scene_list),
+        "scenes_per_gpu": scenes_per_gpu,
+        "scenes_processed": int(agg["scenes_processed"]),
+        "scenes_failed": int(agg["scenes_failed"]),
         "resumed_trajectories": len(done_trajectory_ids),
         "resumed_episodes": int(done_episode_count),
         "remaining_target_episodes": int(remaining_target),
         "remaining_max_trajectories": int(remaining_max_traj),
-        "failures": failures,
+        "failures": agg["failed"],
         **group_stats,
     }
     write_json(output_json, output_data, pretty=bool(args.pretty_output))
@@ -839,7 +784,8 @@ def build_dataset_geodesic(args: argparse.Namespace) -> None:
         "\nDone: "
         f"wrote={output_json} episodes={len(output_episodes)} "
         f"modified={modified} selected_without_payload={skipped_selected_without_payload} "
-        f"failures={len(failures)}"
+        f"scenes_processed={agg['scenes_processed']} scenes_failed={agg['scenes_failed']} "
+        f"failures={len(agg['failed'])}"
     )
 
 
@@ -868,6 +814,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         required=True,
         help="Geodesic distance interval D (meters) between consecutive sub-goals.",
+    )
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=1,
+        help="Total worker process count for parallel rendering (default 1 = single process).",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default="0",
+        help="Comma-separated GPU ids, e.g. '0,1,2,3'. Scenes are round-robin distributed by count.",
     )
     parser.add_argument("--include_unselected", action="store_true")
     parser.add_argument("--pretty_output", action="store_true")
