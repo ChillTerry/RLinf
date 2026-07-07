@@ -133,7 +133,7 @@ def call_openai_for_episode(
     ]
     user_content: List[dict] = [
         {
-            "type": "input_text",
+            "type": "text",
             "text": build_user_text(instruction=instruction, steps=frame_infos),
         }
     ]
@@ -144,30 +144,34 @@ def call_openai_for_episode(
             image_format=str(args.image_format),
             jpeg_quality=int(args.jpeg_quality),
         )
-        user_content.append({"type": "input_image", "image_url": f"data:{mime};base64,{b64}"})
+        user_content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
     print(
         f"  -> OpenAI subgoal select: model={args.model} frames={len(sampled_steps)} "
         f"reasoning_effort={args.reasoning_effort}"
     )
     t0 = time.time()
-    resp = client.responses.create(
-        model=str(args.model),
-        reasoning={"effort": str(args.reasoning_effort)},
-        max_output_tokens=int(args.max_output_tokens),
-        input=[
+    kwargs: Dict[str, Any] = {
+        "model": str(args.model),
+        "messages": [
             {"role": "system", "content": build_system_prompt(min_step_gap=int(args.min_step_gap))},
             {"role": "user", "content": user_content},
         ],
-        text={
-            "format": {
-                "type": "json_schema",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
                 "name": "navigation_subgoals",
                 "strict": True,
                 "schema": build_output_schema(),
-            }
+            },
         },
-    )
+    }
+    if str(args.reasoning_effort).lower() != "none":
+        kwargs["reasoning_effort"] = str(args.reasoning_effort)
+        kwargs["max_completion_tokens"] = int(args.max_output_tokens)
+    else:
+        kwargs["max_tokens"] = int(args.max_output_tokens)
+    resp = client.chat.completions.create(**kwargs)
     print(f"  <- OpenAI returned in {time.time() - t0:.1f}s")
 
     usage = extract_usage_dict(resp)
@@ -181,6 +185,18 @@ def call_openai_for_episode(
 
 
 def extract_output_text(resp: Any) -> str:
+    # Chat Completions: resp.choices[0].message.content
+    choices = getattr(resp, "choices", None)
+    if choices is None and isinstance(resp, dict):
+        choices = resp.get("choices")
+    if choices:
+        first = choices[0]
+        message = first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+        if message is not None:
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+            if content:
+                return str(content)
+
     output_text = getattr(resp, "output_text", None)
     if output_text:
         return str(output_text)

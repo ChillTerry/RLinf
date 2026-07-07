@@ -123,9 +123,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset_json",
         type=str,
-        default="R2R_VLNCE_v1-3_preprocessed/train/r2r_train_with_subgoals.json",
+        default="VLN-CE/datasets/rxr/train/train_guide_subgoals_reachable.json.gz",
     )
-    parser.add_argument("--original_train_json", type=str, default="R2R_VLNCE_v1-3_preprocessed/train/train.json.gz")
+    parser.add_argument("--original_train_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide.json.gz")
     parser.add_argument("--step_offset", type=int, default=2)
     parser.add_argument("--subgoal_radius", type=float, default=3.0)
     parser.add_argument("--no_backup", action="store_true")

@@ -2,8 +2,8 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List
 
+import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
 
 from .replay import MemoryStep
 
@@ -49,67 +49,97 @@ class VideoWriter:
             raise RuntimeError(f"ffmpeg exited with code {ret}: {self.output_path}")
 
 
-def resolve_font_path(font_path: str = "") -> str:
-    candidates = []
-    if font_path:
-        candidates.append(Path(font_path))
-    candidates.extend(
-        [
-            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-            Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
-            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-        ]
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError("No usable font found. Pass --video_font_path explicitly.")
-
-
-def draw_center_highlight(
-    overlay: Image.Image,
+def _wrap_lines(
     text: str,
-    font: ImageFont.FreeTypeFont,
-    box_color: tuple,
-    text_fill: tuple,
-    stroke_fill: tuple,
-    padding_x: int,
-    padding_y: int,
-    line_spacing: int,
-) -> None:
-    draw = ImageDraw.Draw(overlay)
-    max_width = int(overlay.width * 0.82)
+    *,
+    font: int,
+    font_scale: float,
+    thickness: int,
+    max_width: int,
+) -> List[str]:
+    """Wrap text so each line fits within max_width measured by cv2."""
     words = str(text).split()
+    if not words:
+        return [str(text)]
+
     lines: List[str] = []
     cur = ""
-    for word in words or [str(text)]:
+    for word in words:
         trial = word if not cur else f"{cur} {word}"
-        bbox = draw.textbbox((0, 0), trial, font=font, stroke_width=2)
-        if bbox[2] - bbox[0] <= max_width or not cur:
+        (width, _), _ = cv2.getTextSize(trial, font, font_scale, thickness)
+        if width <= max_width or not cur:
             cur = trial
         else:
             lines.append(cur)
             cur = word
     if cur:
         lines.append(cur)
+    return lines
 
-    line_boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=2) for line in lines]
-    widths = [box[2] - box[0] for box in line_boxes]
-    heights = [box[3] - box[1] for box in line_boxes]
-    text_width = max(widths) if widths else 0
-    text_height = sum(heights) + line_spacing * max(0, len(lines) - 1)
+
+def draw_center_highlight(
+    frame: np.ndarray,
+    text: str,
+    *,
+    box_alpha: float = 0.6,
+    padding_x: int = 22,
+    padding_y: int = 16,
+    line_spacing: int = 8,
+) -> np.ndarray:
+    """Draw a centered, darkened highlight box with wrapped text using cv2 builtin font."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 2
+    font_scale = max(0.6, frame.shape[0] / 1600.0)
+    max_width = int(frame.shape[1] * 0.82)
+
+    lines = _wrap_lines(
+        text,
+        font=font,
+        font_scale=font_scale,
+        thickness=thickness,
+        max_width=max_width,
+    )
+
+    line_sizes = [
+        cv2.getTextSize(line, font, font_scale, thickness)[0] for line in lines
+    ]
+    text_width = max((w for w, _ in line_sizes), default=0)
+    text_height = sum(h for _, h in line_sizes) + line_spacing * max(0, len(lines) - 1)
     box_w = text_width + padding_x * 2
     box_h = text_height + padding_y * 2
-    x0 = (overlay.width - box_w) // 2
-    y0 = (overlay.height - box_h) // 2
-    draw.rounded_rectangle((x0, y0, x0 + box_w, y0 + box_h), radius=8, fill=box_color)
+    x0 = (frame.shape[1] - box_w) // 2
+    y0 = (frame.shape[0] - box_h) // 2
+
+    frame = frame.copy()
+    roi = frame[y0 : y0 + box_h, x0 : x0 + box_w]
+    if roi.size:
+        cv2.addWeighted(roi, 1.0 - box_alpha, roi, 0.0, 0.0, roi)
 
     y = y0 + padding_y
-    for line, box, height in zip(lines, line_boxes, heights):
-        line_w = box[2] - box[0]
-        x = x0 + (box_w - line_w) // 2
-        draw.text((x, y), line, font=font, fill=text_fill, stroke_width=2, stroke_fill=stroke_fill)
-        y += height + line_spacing
+    for (line, (_w, h)) in zip(lines, line_sizes):
+        text_y = y + h
+        cv2.putText(
+            frame,
+            line,
+            (x0 + padding_x, text_y),
+            font,
+            font_scale,
+            (0, 0, 0),
+            thickness + 2,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            line,
+            (x0 + padding_x, text_y),
+            font,
+            font_scale,
+            (255, 40, 40),
+            thickness,
+            lineType=cv2.LINE_AA,
+        )
+        y += h + line_spacing
+    return frame
 
 
 def write_subgoal_video_from_memory(
@@ -117,7 +147,6 @@ def write_subgoal_video_from_memory(
     steps: List[MemoryStep],
     subgoals: List[dict],
     fps: int,
-    font_path: str,
     highlight_frames: int,
 ) -> None:
     if not steps:
@@ -139,23 +168,10 @@ def write_subgoal_video_from_memory(
                 active_landmark = highlight_by_step[int(step_info.step)]
                 highlight_remaining = highlight_frames
 
-            frame = Image.fromarray(step_info.rgb).convert("RGBA")
-            overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+            frame = np.asarray(step_info.rgb, dtype=np.uint8)
             if highlight_remaining > 0 and active_landmark:
-                center_font = ImageFont.truetype(font_path, size=max(28, height // 16))
-                draw_center_highlight(
-                    overlay,
-                    active_landmark,
-                    center_font,
-                    box_color=(0, 0, 0, 150),
-                    text_fill=(255, 40, 40, 255),
-                    stroke_fill=(0, 0, 0, 255),
-                    padding_x=22,
-                    padding_y=16,
-                    line_spacing=8,
-                )
-            vis = Image.alpha_composite(frame, overlay).convert("RGB")
-            writer.write_rgb(np.asarray(vis))
+                frame = draw_center_highlight(frame, active_landmark)
+            writer.write_rgb(frame)
 
             if highlight_remaining > 0:
                 highlight_remaining -= 1
@@ -163,4 +179,3 @@ def write_subgoal_video_from_memory(
                     active_landmark = ""
     finally:
         writer.close()
-

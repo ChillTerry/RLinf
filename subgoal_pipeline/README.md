@@ -33,9 +33,9 @@ The final sub-goal is always forced to the original `train.json.gz` goal positio
 Dry-run trajectory selection:
 
 ```bash
-python3 -m streamvln.subgoal_pipeline.build_dataset \
-  --train_json R2R_VLNCE_v1-3_preprocessed/train/train.json.gz \
-  --gt_json R2R_VLNCE_v1-3_preprocessed/train/train_gt.json.gz \
+python3 -m subgoal_pipeline.build_dataset \
+  --train_json VLN-CE/datasets/r2r/train/train.json.gz \
+  --gt_json VLN-CE/datasets/r2r/train/train_gt.json.gz \
   --target_episodes 2000 \
   --max_gt_actions 80 \
   --dry_run_selection
@@ -45,15 +45,16 @@ Build the dataset:
 
 ```bash
 export OPENAI_API_KEY=...
-python3 -m streamvln.subgoal_pipeline.build_dataset \
-  --config config/vln_r2r.yaml \
+python3 -m subgoal_pipeline.build_dataset \
+  --config rlinf/envs/habitat/extensions/config/vlnce_r2r_uninavid.yaml \
   --split train \
-  --train_json R2R_VLNCE_v1-3_preprocessed/train/train.json.gz \
-  --gt_json R2R_VLNCE_v1-3_preprocessed/train/train_gt.json.gz \
+  --train_json VLN-CE/datasets/r2r/train/train.json.gz \
+  --gt_json VLN-CE/datasets/r2r/train/train_gt.json.gz \
+  --scenes_dir VLN-CE/scene_dataset \
   --target_episodes 2000 \
   --max_gt_actions 80 \
   --out_dir results/r2r_subgoal_online_train2000 \
-  --output_json R2R_VLNCE_v1-3_preprocessed/train/r2r_train_with_subgoals.json \
+  --output_json VLN-CE/datasets/r2r/train/r2r_train_with_subgoals.json.gz \
   --model gpt-5.4 \
   --overwrite
 ```
@@ -61,20 +62,20 @@ python3 -m streamvln.subgoal_pipeline.build_dataset \
 Shift non-final sub-goals by two replay steps:
 
 ```bash
-python3 -m streamvln.subgoal_pipeline.shift_subgoals \
+python3 -m subgoal_pipeline.shift_subgoals \
   --out_dir results/r2r_subgoal_online_train2000 \
-  --dataset_json R2R_VLNCE_v1-3_preprocessed/train/r2r_train_with_subgoals.json \
-  --original_train_json R2R_VLNCE_v1-3_preprocessed/train/train.json.gz \
+  --dataset_json VLN-CE/datasets/r2r/train/r2r_train_with_subgoals.json.gz \
+  --original_train_json VLN-CE/datasets/r2r/train/train.json.gz \
   --step_offset 2
 ```
 
 Regularize spacing:
 
 ```bash
-python3 -m streamvln.subgoal_pipeline.regularize_spacing \
+python3 -m subgoal_pipeline.regularize_spacing \
   --out_dir results/r2r_subgoal_online_train2000 \
-  --dataset_json R2R_VLNCE_v1-3_preprocessed/train/r2r_train_with_subgoals.json \
-  --original_train_json R2R_VLNCE_v1-3_preprocessed/train/train.json.gz \
+  --dataset_json VLN-CE/datasets/r2r/train/r2r_train_with_subgoals.json.gz \
+  --original_train_json VLN-CE/datasets/r2r/train/train.json.gz \
   --close_threshold 1.0 \
   --far_threshold 6.0
 ```
@@ -82,8 +83,8 @@ python3 -m streamvln.subgoal_pipeline.regularize_spacing \
 Analyze:
 
 ```bash
-python3 -m streamvln.subgoal_pipeline.analyze_dataset \
-  --dataset_json R2R_VLNCE_v1-3_preprocessed/train/r2r_train_with_subgoals.json \
+python3 -m subgoal_pipeline.analyze_dataset \
+  --dataset_json VLN-CE/datasets/r2r/train/r2r_train_with_subgoals.json.gz \
   --out_dir results/r2r_subgoal_analysis
 ```
 

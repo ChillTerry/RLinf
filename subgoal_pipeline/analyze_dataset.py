@@ -200,7 +200,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset_json",
         type=str,
-        default="R2R_VLNCE_v1-3_preprocessed/train/r2r_train_with_subgoals.json",
+        default="VLN-CE/datasets/rxr/train/train_guide_subgoals_reachable.json.gz",
     )
     parser.add_argument("--out_dir", type=str, default="results/r2r_subgoal_analysis")
     parser.add_argument("--bin_width", type=float, default=0.5)

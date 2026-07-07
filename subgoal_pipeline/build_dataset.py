@@ -17,7 +17,20 @@ from .common import append_jsonl, instruction_text, load_json, prepare_habitat_d
 from .gt import build_dataset_indices, load_ground_truth_trajectories, select_trajectory_groups
 from .openai_client import call_openai_for_episode, sanitize_model_subgoals, usage_record, usage_token_counts
 from .replay import replay_gt_actions_in_memory, sample_memory_steps_with_final
-from .video import resolve_font_path, write_subgoal_video_from_memory
+from .video import write_subgoal_video_from_memory
+
+
+DEFAULT_OPENAI_USER_AGENT = "curl/7.81.0"
+
+
+def build_openai_client_kwargs(args: argparse.Namespace) -> dict:
+    client_kwargs = {"api_key": str(args.api_key).strip()}
+    if str(args.base_url).strip():
+        client_kwargs["base_url"] = str(args.base_url).strip()
+    user_agent = str(getattr(args, "user_agent", "")).strip()
+    if user_agent:
+        client_kwargs["default_headers"] = {"User-Agent": user_agent}
+    return client_kwargs
 
 
 def build_dataset_online(args: argparse.Namespace) -> None:
@@ -74,16 +87,12 @@ def build_dataset_online(args: argparse.Namespace) -> None:
     import habitat
     from habitat.config import read_write
     from habitat_baselines.config.default import get_config as get_habitat_config
-    from streamvln.habitat_extensions import measures as _stream_measures  # noqa: F401
+    from rlinf.envs.habitat.extensions import measures as _rlinf_measures  # noqa: F401
 
     try:
         from openai import OpenAI  # type: ignore
     except ImportError as exc:
         raise RuntimeError("Missing openai dependency. Install it with: pip install openai") from exc
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Please set OPENAI_API_KEY before running GPT sub-goal selection.")
 
     habitat_data_path = prepare_habitat_data_path(
         data_path=str(train_json_path),
@@ -95,6 +104,9 @@ def build_dataset_online(args: argparse.Namespace) -> None:
         cfg.habitat.dataset.split = str(args.split)
         cfg.habitat.dataset.data_path = habitat_data_path
         cfg.habitat.dataset.scenes_dir = str(args.scenes_dir)
+        ndtw_measure = cfg.habitat.task.measurements.ndtw
+        ndtw_measure.SPLIT = str(args.split)
+        ndtw_measure.GT_PATH = str(Path(args.gt_json).resolve())
 
     env = habitat.Env(config=cfg)
     env_episode_by_id = {int(ep.episode_id): ep for ep in env.episodes}
@@ -102,11 +114,7 @@ def build_dataset_online(args: argparse.Namespace) -> None:
     if missing_env:
         raise RuntimeError(f"Representative episodes missing from Habitat env, e.g. {missing_env[:5]}")
 
-    client_kwargs = {"api_key": api_key}
-    if str(args.base_url).strip():
-        client_kwargs["base_url"] = str(args.base_url).strip()
-    client = OpenAI(**client_kwargs)
-    font_path = "" if args.no_video else resolve_font_path(str(args.video_font_path))
+    client = OpenAI(**build_openai_client_kwargs(args))
     max_steps = int(cfg.habitat.environment.max_episode_steps)
 
     subgoals_by_trajectory: Dict[int, dict] = {}
@@ -222,7 +230,6 @@ def build_dataset_online(args: argparse.Namespace) -> None:
                         steps=steps,
                         subgoals=enriched,
                         fps=int(args.video_fps),
-                        font_path=font_path,
                         highlight_frames=int(args.video_highlight_frames),
                     )
 
@@ -287,7 +294,7 @@ def build_dataset_online(args: argparse.Namespace) -> None:
     output_data = deepcopy(train_data)
     output_data["episodes"] = output_episodes
     output_data["_subgoal_generation"] = {
-        "script": "streamvln.subgoal_pipeline.build_dataset",
+        "script": "subgoal_pipeline.build_dataset",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "train_json": str(train_json_path),
         "gt_json": str(args.gt_json),
@@ -314,19 +321,19 @@ def build_dataset_online(args: argparse.Namespace) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build an R2R train split with GPT-selected landmark sub-goals.")
-    parser.add_argument("--config", type=str, default="config/vln_r2r.yaml")
+    parser = argparse.ArgumentParser(description="Build an RxR train split with GPT-selected landmark sub-goals.")
+    parser.add_argument("--config", type=str, default="rlinf/envs/habitat/extensions/config/vlnce_rxr_uninavid.yaml")
     parser.add_argument("--split", type=str, default="train")
-    parser.add_argument("--train_json", type=str, default="R2R_VLNCE_v1-3_preprocessed/train/train.json.gz")
-    parser.add_argument("--gt_json", type=str, default="R2R_VLNCE_v1-3_preprocessed/train/train_gt.json.gz")
-    parser.add_argument("--scenes_dir", type=str, default="data/scene_datasets/")
-    parser.add_argument("--out_dir", type=str, default="results/r2r_subgoal_online_train2000")
+    parser.add_argument("--train_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_reachable.json.gz")
+    parser.add_argument("--gt_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_gt_reachable.json.gz")
+    parser.add_argument("--scenes_dir", type=str, default="VLN-CE/scene_dataset")
+    parser.add_argument("--out_dir", type=str, default="VLN-CE/datasets/rxr/train/train_guide_subgoals_reachable")
     parser.add_argument(
         "--output_json",
         type=str,
-        default="R2R_VLNCE_v1-3_preprocessed/train/r2r_train_with_subgoals.json",
+        default="VLN-CE/datasets/rxr/train/train_guide_subgoals_reachable.json.gz",
     )
-    parser.add_argument("--target_episodes", type=int, default=2000)
+    parser.add_argument("--target_episodes", type=int, default=1)
     parser.add_argument("--max_gt_actions", type=int, default=80)
     parser.add_argument("--subgoal_radius", type=float, default=3.0)
     parser.add_argument(
@@ -348,17 +355,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["none", "low", "medium", "high", "xhigh"],
     )
     parser.add_argument("--max_output_tokens", type=int, default=4096)
-    parser.add_argument("--max_frames", type=int, default=120)
-    parser.add_argument("--frame_stride", type=int, default=1)
+    parser.add_argument("--max_frames", type=int, default=100)
+    parser.add_argument("--frame_stride", type=int, default=2)
     parser.add_argument("--min_step_gap", type=int, default=8)
-    parser.add_argument("--image_format", type=str, default="jpeg", choices=["jpeg", "png"])
+    parser.add_argument("--image_format", type=str, default="png", choices=["jpeg", "png"])
     parser.add_argument("--jpeg_quality", type=int, default=70)
-    parser.add_argument("--base_url", type=str, default=os.getenv("OPENAI_BASE_URL", ""))
+    parser.add_argument("--base_url", type=str, default="")
+    parser.add_argument("--api_key", type=str, default="")
+    parser.add_argument(
+        "--user-agent",
+        dest="user_agent",
+        type=str,
+        default=DEFAULT_OPENAI_USER_AGENT,
+        help="User-Agent sent by the OpenAI SDK client.",
+    )
     parser.add_argument("--usage_log_name", type=str, default="subgoals_openai_usage.jsonl")
     parser.add_argument("--no_video", action="store_true")
     parser.add_argument("--video_fps", type=int, default=6)
     parser.add_argument("--video_highlight_frames", type=int, default=3)
-    parser.add_argument("--video_font_path", type=str, default="")
     return parser
 
 
