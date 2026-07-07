@@ -92,6 +92,19 @@ def test_inf_geodesic_falls_back_to_euclidean(capsys):
     assert "geodesic_distance not finite" in out
 
 
+def test_selector_never_returns_stop_frame_as_intermediate():
+    # D=1 selects every step; stop frame (index 5) is the last step.
+    # final_goal at x=10 is far from the stop frame (x=5), so tail-removal does NOT pop it.
+    # Without the exclusion the stop frame would be returned as an intermediate and collide
+    # with the final sub-goal's best_step in _build_geodesic_subgoal_dicts.
+    steps = [_step(i, [float(i), 0.0, 0.0]) for i in range(6)]
+    selected = build_dataset_geodesic.select_geodesic_subgoal_steps(
+        steps, FakeSim(), subgoal_distance=1.0, final_goal_position=[10.0, 0.0, 0.0]
+    )
+    assert 5 not in selected
+    assert all(i < len(steps) - 1 for i in selected)
+
+
 def test_subgoal_distance_is_required():
     parser = build_dataset_geodesic.build_arg_parser()
     with pytest.raises(SystemExit):

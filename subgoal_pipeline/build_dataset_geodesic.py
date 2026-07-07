@@ -60,7 +60,8 @@ def select_geodesic_subgoal_steps(
     if len(steps) < 2:
         return selected
     anchor = steps[0].agent_position
-    for i in range(1, len(steps)):
+    # The STOP frame (last step) is reserved as the final sub-goal; never select it as an intermediate.
+    for i in range(1, len(steps) - 1):
         d = _geodesic(
             sim, anchor, steps[i].agent_position,
             episode_label=episode_label, step_idx=i,
