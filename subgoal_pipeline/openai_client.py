@@ -224,23 +224,53 @@ def extract_output_text(resp: Any) -> str:
     return "".join(chunks).strip()
 
 
+DROP_SUBGOAL_FLAG = "[drop_subgoal]"
+
+
+def _resolve_best_step(raw: dict, frame_steps: Optional[List[int]]) -> Optional[int]:
+    """Resolve the environment step for a model subgoal.
+
+    Prefer the schema field ``best_step``; fall back to the input-named aliases
+    ``step`` (raw environment step) and ``frame_idx`` (index into the sampled
+    frames list, mapped via ``frame_steps``). Returns ``None`` if no usable
+    step can be recovered.
+    """
+    for key in ("best_step", "step"):
+        value = raw.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    frame_idx = raw.get("frame_idx")
+    if frame_idx is not None and frame_steps:
+        try:
+            idx = int(frame_idx)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= idx < len(frame_steps):
+            return int(frame_steps[idx])
+    return None
+
+
 def sanitize_model_subgoals(
     raw_subgoals: List[dict],
     valid_steps: set,
     final_step: int,
     min_step_gap: int,
+    frame_steps: Optional[List[int]] = None,
 ) -> Tuple[List[dict], List[str]]:
     notes: List[str] = []
     candidates: List[dict] = []
 
     for raw in raw_subgoals:
         if not isinstance(raw, dict):
-            notes.append("dropped a non-object subgoal from model output")
+            notes.append(f"{DROP_SUBGOAL_FLAG} dropped a non-object subgoal from model output")
             continue
-        try:
-            best_step = int(raw["best_step"])
-        except Exception:
-            notes.append(f"dropped subgoal without integer best_step: {raw!r}")
+        best_step = _resolve_best_step(raw, frame_steps)
+        if best_step is None:
+            notes.append(f"{DROP_SUBGOAL_FLAG} dropped subgoal without resolvable best_step: {raw!r}")
             continue
         if best_step not in valid_steps:
             if bool(raw.get("is_final_goal", False)):
@@ -249,7 +279,9 @@ def sanitize_model_subgoals(
                 )
                 best_step = int(final_step)
             else:
-                notes.append(f"dropped subgoal with best_step not in sampled frames: {best_step}")
+                notes.append(
+                    f"{DROP_SUBGOAL_FLAG} dropped subgoal with best_step not in sampled frames: {best_step}"
+                )
                 continue
 
         candidates.append(
@@ -321,7 +353,9 @@ def sanitize_model_subgoals(
 
     while kept and int(final_step) - int(kept[-1]["best_step"]) < int(min_step_gap):
         dropped = kept.pop()
-        notes.append(f"dropped sub-goal too close to final goal at step {int(dropped['best_step'])}")
+        notes.append(
+            f"{DROP_SUBGOAL_FLAG} dropped sub-goal too close to final goal at step {int(dropped['best_step'])}"
+        )
 
     sanitized = kept + [final_item]
     for idx, item in enumerate(sanitized):

@@ -60,6 +60,34 @@ def instruction_text(episode: dict) -> str:
     return str(instruction or "")
 
 
+def episode_language(episode: dict) -> Optional[str]:
+    """Return the instruction language tag if present (RxR), else None (R2R)."""
+    instruction = episode.get("instruction")
+    if isinstance(instruction, dict):
+        language = instruction.get("language")
+        return str(language) if language is not None else None
+    return None
+
+
+def detect_dataset_type(train_data: dict) -> str:
+    """Detect ``'rxr'`` vs ``'r2r'`` from episode structure.
+
+    RxR episodes carry an ``instruction.language`` field (e.g. ``'en-US'``,
+    ``'hi-IN'``); R2R episodes do not. Scans episodes until the first language
+    tag is found.
+    """
+    for episode in train_data.get("episodes", []) or []:
+        if episode_language(episode) is not None:
+            return "rxr"
+    return "r2r"
+
+
+def is_english_instruction(episode: dict) -> bool:
+    """True if the episode instruction language is an English variant."""
+    language = episode_language(episode)
+    return language is not None and language.lower().startswith("en")
+
+
 def extract_goal_payload(episode: Any) -> Tuple[Optional[List[float]], List[dict]]:
     goals = getattr(episode, "goals", None) or []
     goal_position: Optional[List[float]] = None

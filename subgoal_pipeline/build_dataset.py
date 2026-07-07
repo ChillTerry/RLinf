@@ -13,11 +13,19 @@ from .artifacts import (
     validate_subgoal_payload,
     write_source_episode_artifact,
 )
-from .common import append_jsonl, instruction_text, load_json, prepare_habitat_data_path, write_json
+from .common import (
+    append_jsonl,
+    detect_dataset_type,
+    instruction_text,
+    is_english_instruction,
+    load_json,
+    prepare_habitat_data_path,
+    write_json,
+)
 from .gt import build_dataset_indices, load_ground_truth_trajectories, select_trajectory_groups
 from .openai_client import call_openai_for_episode, sanitize_model_subgoals, usage_record, usage_token_counts
 from .replay import replay_gt_actions_in_memory, sample_memory_steps_with_final
-from .video import write_subgoal_video_from_memory
+from .video import write_subgoal_video_from_memory, write_topdown_image_from_memory
 
 
 DEFAULT_OPENAI_USER_AGENT = "curl/7.81.0"
@@ -38,25 +46,95 @@ def build_dataset_online(args: argparse.Namespace) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     output_json = Path(args.output_json)
     if output_json.exists() and not args.overwrite and not args.dry_run_selection:
-        raise RuntimeError(f"{output_json} already exists; pass --overwrite to replace it.")
+        print(f"Output exists; supplementing in place: {output_json}")
 
     train_json_path = Path(args.train_json)
     if train_json_path.suffix != ".gz":
         raise RuntimeError(f"{train_json_path} must be a gzipped train JSON file ending with .gz.")
 
     train_data = load_json(train_json_path)
+    dataset_type = detect_dataset_type(train_data)
+    print(f"Detected dataset type: {dataset_type}")
+    if dataset_type == "rxr":
+        episodes_before = len(train_data.get("episodes") or [])
+        train_data["episodes"] = [
+            ep for ep in train_data.get("episodes", []) if is_english_instruction(ep)
+        ]
+        print(
+            f"rxr English-only filter: {episodes_before} -> {len(train_data['episodes'])} episodes"
+        )
     original_episodes = train_data.get("episodes")
     if not isinstance(original_episodes, list):
         raise RuntimeError(f"{args.train_json} does not contain episodes.")
 
-    source_episode_by_id, _by_trajectory = build_dataset_indices(train_data)
+    source_episode_by_id, by_trajectory = build_dataset_indices(train_data)
     gt_trajectories = load_ground_truth_trajectories(Path(args.gt_json))
-    groups, group_stats = select_trajectory_groups(
-        train_data=train_data,
-        gt_trajectories=gt_trajectories,
-        max_gt_actions=int(args.max_gt_actions),
-        target_episodes=int(args.target_episodes),
+
+    # Resume: detect already-processed trajectories from existing artifacts and
+    # pre-load their payloads. target_episodes / max_trajectories are treated as
+    # TOTAL budgets; the already-processed count is subtracted to get the
+    # remaining budget for this run. Skipped entirely when --overwrite is set.
+    subgoals_by_trajectory: Dict[int, dict] = {}
+    done_trajectory_ids: set = set()
+    done_episode_count = 0
+    if not args.overwrite:
+        for payload_path in sorted(out_root.glob("traj*/subgoals_openai.json")):
+            try:
+                payload = load_json(payload_path)
+            except Exception:
+                continue
+            trajectory_id = int(payload.get("trajectory_id", -1))
+            if trajectory_id >= 0:
+                subgoals_by_trajectory[trajectory_id] = payload
+        done_trajectory_ids = set(subgoals_by_trajectory.keys())
+        done_episode_count = sum(
+            len(by_trajectory[int(t)]) for t in done_trajectory_ids if int(t) in by_trajectory
+        )
+        if done_trajectory_ids:
+            print(
+                f"Resume: {len(done_trajectory_ids)} trajectories / "
+                f"{done_episode_count} episodes already processed"
+            )
+
+    if int(args.target_episodes) > 0 and not args.overwrite:
+        remaining_target = max(0, int(args.target_episodes) - int(done_episode_count))
+    else:
+        remaining_target = int(args.target_episodes)
+    if int(args.max_trajectories) >= 0 and not args.overwrite:
+        remaining_max_traj = max(0, int(args.max_trajectories) - len(done_trajectory_ids))
+    else:
+        remaining_max_traj = int(args.max_trajectories)
+    print(
+        f"Budget: target_episodes {args.target_episodes} -> {remaining_target} remaining; "
+        f"max_trajectories {args.max_trajectories} -> {remaining_max_traj} remaining"
     )
+
+    if (
+        not args.overwrite
+        and int(args.target_episodes) > 0
+        and int(done_episode_count) >= int(args.target_episodes)
+    ):
+        groups, group_stats = [], {
+            "selection_mode": "target_already_met",
+            "eligible_trajectories": 0,
+            "eligible_episodes": 0,
+            "selected_trajectories": 0,
+            "selected_episodes": 0,
+            "skipped_groups_with_missing_gt": 0,
+            "skipped_groups_with_too_long_episode": 0,
+            "skipped_groups_with_too_short_episode": 0,
+            "skipped_partial_groups": 0,
+            "skipped_excluded_trajectories": len(done_trajectory_ids),
+        }
+    else:
+        groups, group_stats = select_trajectory_groups(
+            train_data=train_data,
+            gt_trajectories=gt_trajectories,
+            max_gt_actions=int(args.max_gt_actions),
+            target_episodes=remaining_target,
+            min_gt_actions=int(args.min_gt_actions),
+            exclude_trajectory_ids=done_trajectory_ids,
+        )
     selected_episode_ids = {
         int(episode_id)
         for _trajectory_id, episode_ids, _representative_id in groups
@@ -107,6 +185,9 @@ def build_dataset_online(args: argparse.Namespace) -> None:
         ndtw_measure = cfg.habitat.task.measurements.ndtw
         ndtw_measure.SPLIT = str(args.split)
         ndtw_measure.GT_PATH = str(Path(args.gt_json).resolve())
+        # Only draw the replayed GT-action trajectory on the top-down map;
+        # drop the pre-baked geodesic shortest path ("reference path").
+        cfg.habitat.task.measurements.top_down_map.draw_shortest_path = False
 
     env = habitat.Env(config=cfg)
     env_episode_by_id = {int(ep.episode_id): ep for ep in env.episodes}
@@ -117,12 +198,11 @@ def build_dataset_online(args: argparse.Namespace) -> None:
     client = OpenAI(**build_openai_client_kwargs(args))
     max_steps = int(cfg.habitat.environment.max_episode_steps)
 
-    subgoals_by_trajectory: Dict[int, dict] = {}
     failures: List[dict] = []
 
     try:
         for group_idx, (trajectory_id, episode_ids, representative_id) in enumerate(groups):
-            if int(args.max_trajectories) >= 0 and group_idx >= int(args.max_trajectories):
+            if remaining_max_traj >= 0 and group_idx >= remaining_max_traj:
                 break
 
             source_episode = source_episode_by_id[int(representative_id)]
@@ -177,6 +257,7 @@ def build_dataset_online(args: argparse.Namespace) -> None:
                     valid_steps=valid_steps,
                     final_step=final_step,
                     min_step_gap=int(args.min_step_gap),
+                    frame_steps=[int(step.step) for step in sampled_steps],
                 )
                 enriched = enrich_subgoals_from_memory(subgoals=sanitized, steps=steps)
 
@@ -224,6 +305,22 @@ def build_dataset_online(args: argparse.Namespace) -> None:
                     selected_episode_ids=episode_ids,
                     representative_id=representative_id,
                 )
+                if not args.no_video or not args.no_topdown:
+                    metrics = env.get_metrics()
+                    td_key = (
+                        "top_down_map_vlnce"
+                        if "top_down_map_vlnce" in metrics
+                        else "top_down_map"
+                    )
+                    topdown_metric = metrics.get(td_key)
+                    if topdown_metric is None:
+                        print(
+                            f"  !! top_down_map metric unavailable; "
+                            f"skipping topdown for {artifact_name}"
+                        )
+                else:
+                    topdown_metric = None
+
                 if not args.no_video:
                     write_subgoal_video_from_memory(
                         output_path=artifact_dir / "subgoals_openai.mp4",
@@ -231,6 +328,20 @@ def build_dataset_online(args: argparse.Namespace) -> None:
                         subgoals=enriched,
                         fps=int(args.video_fps),
                         highlight_frames=int(args.video_highlight_frames),
+                        topdown_metric=topdown_metric,
+                        sim=env.sim,
+                        instruction=instruction,
+                        subgoal_radius=float(args.subgoal_radius),
+                    )
+
+                if topdown_metric is not None:
+                    write_topdown_image_from_memory(
+                        output_path=artifact_dir / "topdown_subgoals.png",
+                        topdown_metric=topdown_metric,
+                        subgoals=enriched,
+                        sim=env.sim,
+                        radius=float(args.subgoal_radius),
+                        max_size=int(args.topdown_max_size),
                     )
 
                 append_jsonl(
@@ -269,15 +380,12 @@ def build_dataset_online(args: argparse.Namespace) -> None:
     skipped_selected_without_payload = 0
     for episode in original_episodes:
         episode_id = int(episode["episode_id"])
-        if episode_id not in selected_episode_ids:
-            if args.include_unselected:
-                output_episodes.append(episode)
-            continue
-
         trajectory_id = int(episode.get("trajectory_id", episode_id))
         payload = subgoals_by_trajectory.get(trajectory_id)
         if payload is None:
-            skipped_selected_without_payload += 1
+            # Newly selected in this run but no payload (e.g. processing failed).
+            if episode_id in selected_episode_ids:
+                skipped_selected_without_payload += 1
             if args.include_unselected:
                 output_episodes.append(episode)
             continue
@@ -299,15 +407,21 @@ def build_dataset_online(args: argparse.Namespace) -> None:
         "train_json": str(train_json_path),
         "gt_json": str(args.gt_json),
         "out_dir": str(args.out_dir),
+        "dataset_type": dataset_type,
         "target_episodes": int(args.target_episodes),
         "include_unselected": bool(args.include_unselected),
-        "selected_episodes": len(selected_episode_ids),
+        "selected_episodes": len(selected_episode_ids) + int(done_episode_count),
         "modified_episodes": int(modified),
         "representative_episodes": len(subgoals_by_trajectory),
         "max_gt_actions": int(args.max_gt_actions),
+        "min_gt_actions": int(args.min_gt_actions),
         "subgoal_radius": float(args.subgoal_radius),
         "model": str(args.model),
         "reasoning_effort": str(args.reasoning_effort),
+        "resumed_trajectories": len(done_trajectory_ids),
+        "resumed_episodes": int(done_episode_count),
+        "remaining_target_episodes": int(remaining_target),
+        "remaining_max_trajectories": int(remaining_max_traj),
         "failures": failures,
         **group_stats,
     }
@@ -327,15 +441,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_reachable.json.gz")
     parser.add_argument("--gt_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_gt_reachable.json.gz")
     parser.add_argument("--scenes_dir", type=str, default="VLN-CE/scene_dataset")
-    parser.add_argument("--out_dir", type=str, default="VLN-CE/datasets/rxr/train/train_guide_subgoals_reachable")
+    parser.add_argument("--out_dir", type=str, default="VLN-CE/datasets/rxr/train_subgoal")
     parser.add_argument(
         "--output_json",
         type=str,
-        default="VLN-CE/datasets/rxr/train/train_guide_subgoals_reachable.json.gz",
+        default="VLN-CE/datasets/rxr/train_subgoal/train_guide_subgoals_reachable.json.gz",
     )
+    parser.add_argument("--max_trajectories", type=int, default=1)
     parser.add_argument("--target_episodes", type=int, default=1)
-    parser.add_argument("--max_gt_actions", type=int, default=80)
-    parser.add_argument("--subgoal_radius", type=float, default=3.0)
+    parser.add_argument("--max_gt_actions", type=int, default=200)
+    parser.add_argument("--min_gt_actions", type=int, default=150)
+    parser.add_argument("--subgoal_radius", type=float, default=2.0)
     parser.add_argument(
         "--include_unselected",
         action="store_true",
@@ -345,7 +461,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--continue_on_error", action="store_true")
     parser.add_argument("--dry_run_selection", action="store_true", help="Preview selected trajectory groups only.")
-    parser.add_argument("--max_trajectories", type=int, default=-1)
 
     parser.add_argument("--model", type=str, default="gpt-5.4")
     parser.add_argument(
@@ -354,14 +469,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="medium",
         choices=["none", "low", "medium", "high", "xhigh"],
     )
-    parser.add_argument("--max_output_tokens", type=int, default=4096)
-    parser.add_argument("--max_frames", type=int, default=100)
+    parser.add_argument("--max_output_tokens", type=int, default=1024)
+    parser.add_argument("--max_frames", type=int, default=64)
     parser.add_argument("--frame_stride", type=int, default=2)
     parser.add_argument("--min_step_gap", type=int, default=8)
-    parser.add_argument("--image_format", type=str, default="png", choices=["jpeg", "png"])
+    parser.add_argument("--image_format", type=str, default="jpeg", choices=["jpeg", "png"])
     parser.add_argument("--jpeg_quality", type=int, default=70)
-    parser.add_argument("--base_url", type=str, default="")
-    parser.add_argument("--api_key", type=str, default="")
+    parser.add_argument("--base_url", type=str, default="https://gmncode.com/v1")
+    parser.add_argument("--api_key", type=str, default="sk-94348489ab3d5c069f1928c8dcf34bfdaa5495268200e103378ba97b193a7906")
     parser.add_argument(
         "--user-agent",
         dest="user_agent",
@@ -373,12 +488,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_video", action="store_true")
     parser.add_argument("--video_fps", type=int, default=6)
     parser.add_argument("--video_highlight_frames", type=int, default=3)
+    parser.add_argument("--no_topdown", action="store_true", help="Skip the final top-down map image.")
+    parser.add_argument(
+        "--topdown_max_size",
+        type=int,
+        default=2000,
+        help="Long-edge pixel cap for the top-down image; 0 disables resizing.",
+    )
     return parser
 
 
 def main() -> None:
     build_dataset_online(build_arg_parser().parse_args())
 
-
+ 
 if __name__ == "__main__":
     main()

@@ -2,7 +2,7 @@ import gzip
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .common import instruction_text, to_float_list
 
@@ -75,25 +75,37 @@ def select_trajectory_groups(
     gt_trajectories: Dict[int, GroundTruthTrajectory],
     max_gt_actions: int,
     target_episodes: int,
+    min_gt_actions: int = -1,
+    exclude_trajectory_ids: Optional[set] = None,
 ) -> Tuple[List[Tuple[int, List[int], int]], Dict[str, int]]:
     by_id, by_trajectory = build_dataset_indices(train_data)
+    excluded = {int(t) for t in (exclude_trajectory_ids or set())}
     eligible: List[Tuple[int, List[int], int]] = []
     skipped_missing_gt = 0
     skipped_too_long = 0
+    skipped_too_short = 0
     skipped_partial_group = 0
+    skipped_excluded = 0
 
     for trajectory_id in sorted(by_trajectory):
+        if int(trajectory_id) in excluded:
+            skipped_excluded += 1
+            continue
         episode_ids = by_trajectory[trajectory_id]
         usable_ids: List[int] = []
         group_missing = False
         group_too_long = False
+        group_too_short = False
         for episode_id in episode_ids:
             gt = gt_trajectories.get(int(episode_id))
             if gt is None:
                 group_missing = True
                 continue
-            if int(max_gt_actions) >= 0 and len(gt.actions) > int(max_gt_actions):
+            if int(max_gt_actions) >= 0 and len(gt.actions) >= int(max_gt_actions):
                 group_too_long = True
+                continue
+            if int(min_gt_actions) >= 0 and len(gt.actions) < int(min_gt_actions):
+                group_too_short = True
                 continue
             usable_ids.append(int(episode_id))
 
@@ -101,6 +113,8 @@ def select_trajectory_groups(
             skipped_missing_gt += 1
         if group_too_long:
             skipped_too_long += 1
+        if group_too_short:
+            skipped_too_short += 1
         if len(usable_ids) != len(episode_ids):
             skipped_partial_group += 1
             continue
@@ -123,7 +137,9 @@ def select_trajectory_groups(
         "selected_episodes": selected_episode_count,
         "skipped_groups_with_missing_gt": skipped_missing_gt,
         "skipped_groups_with_too_long_episode": skipped_too_long,
+        "skipped_groups_with_too_short_episode": skipped_too_short,
         "skipped_partial_groups": skipped_partial_group,
+        "skipped_excluded_trajectories": skipped_excluded,
     }
     return selected, stats
 
