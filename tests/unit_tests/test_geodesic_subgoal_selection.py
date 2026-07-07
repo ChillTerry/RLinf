@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from subgoal_pipeline import build_dataset_geodesic
 from subgoal_pipeline.replay import MemoryStep
@@ -89,3 +90,26 @@ def test_inf_geodesic_falls_back_to_euclidean(capsys):
     assert selected == []
     out = capsys.readouterr().out
     assert "geodesic_distance not finite" in out
+
+
+def test_subgoal_distance_is_required():
+    parser = build_dataset_geodesic.build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+
+
+def test_gpt_only_args_are_absent():
+    parser = build_dataset_geodesic.build_arg_parser()
+    dests = {action.dest for action in parser._actions}
+    for gpt_arg in [
+        "model", "reasoning_effort", "max_output_tokens", "max_frames",
+        "frame_stride", "min_step_gap", "image_format", "jpeg_quality",
+        "base_url", "api_key", "user_agent", "usage_log_name",
+    ]:
+        assert gpt_arg not in dests, f"GPT-only arg --{gpt_arg} should not exist"
+
+
+def test_subgoal_distance_parsed():
+    parser = build_dataset_geodesic.build_arg_parser()
+    args = parser.parse_args(["--subgoal_distance", "3.5"])
+    assert args.subgoal_distance == 3.5
