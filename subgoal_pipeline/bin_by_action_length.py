@@ -5,12 +5,28 @@ Reads GT action lengths from a ``*_gt_reachable.json.gz`` mapping
 ``*_reachable.json.gz`` habitat episode file into per-bin shards of a
 fixed step interval. Bins are half-open ``[lo, hi)``; an episode with
 action length ``L`` falls into bin ``lo = (L // bin_size) * bin_size``.
+
+With ``--range LO-HI`` the script instead selects only episodes whose
+action length falls in the half-open ``[LO, HI)`` interval and writes
+them to a single file (no per-bin splitting).
 """
 
 import argparse
+import re
 from pathlib import Path
 
 from .common import load_json, write_json
+
+
+def parse_range(spec: str) -> tuple[int, int]:
+    """Parse a ``LO-HI`` range spec into a half-open ``[lo, hi)`` pair."""
+    m = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", spec)
+    if not m:
+        raise ValueError(f"--range expects 'LO-HI' (e.g. '50-100'), got {spec!r}.")
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if hi <= lo:
+        raise ValueError(f"--range upper bound must exceed lower bound, got [{lo},{hi}).")
+    return lo, hi
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +53,21 @@ def parse_args() -> argparse.Namespace:
         "--bin-size",
         type=int,
         default=50,
-        help="Step interval per bin (default: 50).",
+        help="Step interval per bin (default: 50). Ignored when --range is set.",
+    )
+    parser.add_argument(
+        "--range",
+        type=str,
+        default=None,
+        help="Select episodes with action length in half-open [LO,HI) (e.g. '50-100') "
+        "and write them to a single file instead of binning.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output path for the --range selection. Defaults to "
+        "<out-dir>/<stem>_<lo>-<hi>.json.gz.",
     )
     return parser.parse_args()
 
@@ -65,6 +95,10 @@ def bin_by_action_length(args: argparse.Namespace) -> None:
         if stem.endswith(suffix):
             stem = stem[: -len(suffix)]
             break
+
+    if args.range is not None:
+        _write_range(args, length_map, episodes, stem)
+        return
 
     bins: dict[int, list] = {}
     missing = 0
@@ -95,6 +129,38 @@ def bin_by_action_length(args: argparse.Namespace) -> None:
         f"bin_size={args.bin_size}"
     )
     assert total + missing == len(episodes), "bin count invariant violated"
+
+
+def _write_range(
+    args: argparse.Namespace,
+    length_map: dict[str, int],
+    episodes: list,
+    stem: str,
+) -> None:
+    lo, hi = parse_range(args.range)
+    selected = []
+    missing = 0
+    for ep in episodes:
+        eid = str(ep["episode_id"])
+        length = length_map.get(eid)
+        if length is None:
+            missing += 1
+            continue
+        if lo <= length < hi:
+            selected.append(ep)
+
+    out_path = args.output
+    if out_path is None:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = args.out_dir / f"{stem}_{lo}-{hi}.json.gz"
+
+    write_json(out_path, {"episodes": selected}, pretty=False)
+    print(f"{out_path}: [{lo},{hi}) {len(selected)} episodes")
+    print("-" * 40)
+    print(
+        f"selected={len(selected)} missing_gt={missing} total={len(episodes)} "
+        f"range=[{lo},{hi})"
+    )
 
 
 def main() -> None:
