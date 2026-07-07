@@ -59,6 +59,27 @@ python3 -m subgoal_pipeline.build_dataset \
   --overwrite
 ```
 
+## Geodesic variant (no GPT)
+
+`build_dataset_geodesic.py` selects sub-goals deterministically every `--subgoal_distance`
+meters of `sim.geodesic_distance` along the replayed GT trajectory, drops a trailing
+sub-goal that is closer than `D` to the final goal, and keeps the original episode final
+goal. No OpenAI call, no frame sampling, no token usage. Spacing is regular by
+construction, so `shift_subgoals.py` / `regularize_spacing.py` are not needed.
+
+```bash
+python3 -m subgoal_pipeline.build_dataset_geodesic \
+  --config rlinf/envs/habitat/extensions/config/vlnce_rxr_uninavid.yaml \
+  --split train \
+  --train_json VLN-CE/datasets/rxr/train/train_guide_reachable.json.gz \
+  --gt_json VLN-CE/datasets/rxr/train/train_guide_gt_reachable.json.gz \
+  --scenes_dir VLN-CE/scene_dataset \
+  --target_episodes 2000 --max_gt_actions 200 --min_gt_actions 150 \
+  --out_dir results/rxr_subgoal_geodesic_train2000 \
+  --output_json VLN-CE/datasets/rxr/train/train_guide_subgoals_geodesic.json.gz \
+  --subgoal_distance 3.0 --overwrite
+```
+
 Shift non-final sub-goals by two replay steps:
 
 ```bash
@@ -91,6 +112,7 @@ python3 -m subgoal_pipeline.analyze_dataset \
 ## Files
 
 - `build_dataset.py`: main online GPT pipeline.
+- `build_dataset_geodesic.py`: GPT-free geodesic-distance sub-goal pipeline.
 - `shift_subgoals.py`: move non-final sub-goals forward on the GT replay trajectory.
 - `regularize_spacing.py`: remove close sub-goals and insert GT-trajectory midpoints.
 - `analyze_dataset.py`: distance CSVs, summaries, and histograms.
