@@ -80,6 +80,25 @@ python3 -m subgoal_pipeline.build_dataset_geodesic \
   --subgoal_distance 3.0 --overwrite
 ```
 
+For multi-process parallel rendering across GPUs, add `--num_processes` and `--gpus`:
+scenes are round-robin distributed by count across the listed GPUs, each worker pinned
+to one GPU via `CUDA_VISIBLE_DEVICES` and loading one scene at a time
+(`content_scenes=[scene]`, no cross-scene reconfigure). `--num_processes` must be >= the
+GPU count.
+
+```bash
+python3 -m subgoal_pipeline.build_dataset_geodesic \
+  --config rlinf/envs/habitat/extensions/config/vlnce_rxr_uninavid.yaml \
+  --split train \
+  --train_json VLN-CE/datasets/rxr/train/train_guide_reachable.json.gz \
+  --gt_json VLN-CE/datasets/rxr/train/train_guide_gt_reachable.json.gz \
+  --scenes_dir VLN-CE/scene_dataset \
+  --target_episodes 2000 --max_gt_actions 200 --min_gt_actions 150 \
+  --out_dir results/rxr_subgoal_geodesic_train2000 \
+  --output_json VLN-CE/datasets/rxr/train/train_guide_subgoals_geodesic.json.gz \
+  --subgoal_distance 3.0 --num_processes 8 --gpus 0,1,2,3 --overwrite
+```
+
 Shift non-final sub-goals by two replay steps:
 
 ```bash
