@@ -151,6 +151,10 @@ def bucket_groups_by_scene(
     return buckets
 
 
+def content_scene_key(scene_id: str) -> str:
+    return Path(str(scene_id)).stem
+
+
 def assign_scenes_to_gpus(scene_list: list[str], gpu_ids: list[int]) -> dict[int, list[str]]:
     if not gpu_ids:
         raise RuntimeError("gpu_ids must be non-empty.")
@@ -204,6 +208,12 @@ def aggregate_summaries(summaries: list[dict]) -> dict:
         "skipped": skipped,
         "failed": failed,
     }
+
+
+def clear_stale_failure_log(out_root: Path, overwrite: bool) -> None:
+    failures_path = Path(out_root) / "failures.jsonl"
+    if overwrite and failures_path.exists():
+        failures_path.unlink()
 
 
 def process_group(
@@ -390,7 +400,7 @@ def _build_scene_env_config(
         cfg.habitat.dataset.split = str(split)
         cfg.habitat.dataset.data_path = habitat_data_path
         cfg.habitat.dataset.scenes_dir = str(scenes_dir)
-        cfg.habitat.dataset.content_scenes = [str(scene_id)]
+        cfg.habitat.dataset.content_scenes = [content_scene_key(scene_id)]
         ndtw_measure = cfg.habitat.task.measurements.ndtw
         ndtw_measure.SPLIT = str(split)
         ndtw_measure.GT_PATH = str(Path(gt_json).resolve())
@@ -552,6 +562,7 @@ def _dispatch_workers(
 def build_dataset_geodesic(args: argparse.Namespace) -> None:
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
+    clear_stale_failure_log(out_root, overwrite=bool(args.overwrite))
     output_json = Path(args.output_json)
     if output_json.exists() and not args.overwrite and not args.dry_run_selection:
         print(f"Output exists; supplementing in place: {output_json}")
@@ -795,36 +806,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=str, default="rlinf/envs/habitat/extensions/config/vlnce_rxr_uninavid.yaml")
     parser.add_argument("--split", type=str, default="train")
-    parser.add_argument("--train_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_reachable.json.gz")
-    parser.add_argument("--gt_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_gt_reachable.json.gz")
+    parser.add_argument("--train_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_reachable_english.json.gz")
+    parser.add_argument("--gt_json", type=str, default="VLN-CE/datasets/rxr/train/train_guide_gt_reachable_english.json.gz")
     parser.add_argument("--scenes_dir", type=str, default="VLN-CE/scene_dataset")
-    parser.add_argument("--out_dir", type=str, default="VLN-CE/datasets/rxr/train_subgoal_geodesic")
+    parser.add_argument("--out_dir", type=str, default="results/rxr/train_guide_reachable_english_subgoals_geodesic")
     parser.add_argument(
         "--output_json",
         type=str,
-        default="VLN-CE/datasets/rxr/train_subgoal_geodesic/train_guide_subgoals_geodesic.json.gz",
+        default="results/rxr/train_guide_reachable_english_subgoals_geodesic/train_guide_reachable_english_subgoals_geodesic.json.gz",
     )
-    parser.add_argument("--max_trajectories", type=int, default=1)
-    parser.add_argument("--target_episodes", type=int, default=1)
-    parser.add_argument("--max_gt_actions", type=int, default=200)
-    parser.add_argument("--min_gt_actions", type=int, default=150)
+    parser.add_argument("--max_trajectories", type=int, default=-1)
+    parser.add_argument("--target_episodes", type=int, default=-1)
+    parser.add_argument("--max_gt_actions", type=int, default=-1)
+    parser.add_argument("--min_gt_actions", type=int, default=-1)
     parser.add_argument("--subgoal_radius", type=float, default=2.0)
     parser.add_argument(
         "--subgoal_distance",
         type=float,
-        required=True,
+        default=4.0,
         help="Geodesic distance interval D (meters) between consecutive sub-goals.",
     )
     parser.add_argument(
         "--num_processes",
         type=int,
-        default=1,
+        default=64,
         help="Total worker process count for parallel rendering (default 1 = single process).",
     )
     parser.add_argument(
         "--gpus",
         type=str,
-        default="0",
+        default="0,1,2,3",
         help="Comma-separated GPU ids, e.g. '0,1,2,3'. Scenes are round-robin distributed by count.",
     )
     parser.add_argument("--include_unselected", action="store_true")

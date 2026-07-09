@@ -36,6 +36,12 @@ def test_bucket_groups_by_scene():
     assert [g[0] for g in buckets["sceneB"]] == [20]
 
 
+def test_content_scene_key_uses_habitat_scene_basename():
+    assert bdg.content_scene_key("mp3d/uNb9QFRL6hY/uNb9QFRL6hY.glb") == "uNb9QFRL6hY"
+    assert bdg.content_scene_key("VLN-CE/scene_dataset/mp3d/r1Q1Z4BcV1o/r1Q1Z4BcV1o.glb") == "r1Q1Z4BcV1o"
+    assert bdg.content_scene_key("plain_scene") == "plain_scene"
+
+
 def test_assign_scenes_to_gpus_round_robin():
     scenes = ["s0", "s1", "s2", "s3", "s4"]
     gpus = [0, 1, 2]
@@ -86,6 +92,19 @@ def test_aggregate_summaries():
     assert agg["processed"] == 5
     assert agg["skipped"] == 1
     assert len(agg["failed"]) == 4
+
+
+def test_clear_stale_failure_log_only_when_overwriting(tmp_path):
+    failures_path = tmp_path / "failures.jsonl"
+    failures_path.write_text('{"error":"old"}\n', encoding="utf-8")
+
+    bdg.clear_stale_failure_log(tmp_path, overwrite=False)
+
+    assert failures_path.exists()
+
+    bdg.clear_stale_failure_log(tmp_path, overwrite=True)
+
+    assert not failures_path.exists()
 
 
 def test_multiprocess_arg_defaults():
