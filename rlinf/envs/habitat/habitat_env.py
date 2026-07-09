@@ -247,14 +247,15 @@ class HabitatEnv(gym.Env):
                     ),
                     subgoal_switch_distance=float(self.cfg.subgoal_switch_distance),
                     subgoal_success_distance=float(self.cfg.subgoal_success_distance),
-                    stop_success_reward_coef=float(self.cfg.stop_success_reward_coef),
                     final_success_distance=float(self.cfg.final_success_distance),
+                    stop_success_reward_coef=float(self.cfg.stop_success_reward_coef),
                     premature_stop_coeff=float(self.cfg.premature_stop_coeff),
                     failure_stop_coeff=float(self.cfg.failure_stop_coeff),
                     stall_patience=int(self.cfg.stall_patience),
                     stall_penalty_coeff=float(self.cfg.stall_penalty_coeff),
                     stall_recovery_patience=int(self.cfg.stall_recovery_patience),
                     stall_observation_patience=int(self.cfg.stall_observation_patience),
+                    step_cost_coeff=float(getattr(self.cfg, "step_cost_coeff", 0.0)),
                 ),
             )
 
@@ -376,6 +377,7 @@ class HabitatEnv(gym.Env):
             infos["episode"],
             first_done_reward_mask,
             is_stop=is_stop,
+            truncations=truncations,
             valid_reward_mask=valid_reward_mask,
             infos=infos,
         )
@@ -610,12 +612,14 @@ class HabitatEnv(gym.Env):
         episode,
         first_done_reward_mask,
         is_stop=None,
+        truncations=None,
         valid_reward_mask=None,
         infos=None,
     ):
         if self.reward_mode == "subgoal_progress":
             return self._calc_subgoal_progress_reward(
                 is_stop=is_stop,
+                truncations=truncations,
                 valid_reward_mask=valid_reward_mask,
                 infos=infos,
             )
@@ -653,7 +657,13 @@ class HabitatEnv(gym.Env):
         )
         return reward
 
-    def _calc_subgoal_progress_reward(self, is_stop, valid_reward_mask, infos):
+    def _calc_subgoal_progress_reward(
+        self,
+        is_stop,
+        truncations,
+        valid_reward_mask,
+        infos,
+    ):
         if self.subgoal_reward is None:
             raise RuntimeError("subgoal_progress reward mode requires subgoal_reward.")
         if is_stop is None:
@@ -667,6 +677,7 @@ class HabitatEnv(gym.Env):
         reward, components = self.subgoal_reward.compute_step(
             distances_to_goals=metadata["distances_to_goals"],
             is_stop=is_stop,
+            is_truncated=truncations,
             valid_mask=valid_reward_mask,
         )
         if infos is not None:

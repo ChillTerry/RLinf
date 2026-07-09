@@ -208,6 +208,18 @@ def test_habitat_grpo_uninavid_uses_subgoal_progress_reward_config():
     )
 
 
+def test_habitat_r2r_ppo_uninavid_wires_step_cost_coeff_to_env_configs():
+    cfg = OmegaConf.load("examples/embodiment/config/habitat_r2r_ppo_uninavid.yaml")
+    raw_cfg = OmegaConf.to_container(cfg, resolve=False)
+
+    assert raw_cfg["algorithm"]["step_cost_coeff"] == 0.01
+    assert (
+        raw_cfg["env"]["train"]["step_cost_coeff"]
+        == "${algorithm.step_cost_coeff}"
+    )
+    assert raw_cfg["env"]["eval"]["step_cost_coeff"] == "${algorithm.step_cost_coeff}"
+
+
 def test_habitat_eval_uninavid_uses_weighted_reward_config():
     cfg = OmegaConf.load("examples/embodiment/config/habitat_r2r_eval_uninavid.yaml")
     raw_cfg = OmegaConf.to_container(cfg, resolve=False)
@@ -915,6 +927,50 @@ def test_habitat_subgoal_reward_dispatch_uses_dense_reward_and_attaches_metrics(
     assert reward.tolist() == [0.125]
     assert infos["episode"]["r_progress"].tolist() == [0.125]
     assert infos["episode"]["active_subgoal_index"].tolist() == [0.0]
+
+
+def test_habitat_subgoal_reward_penalizes_truncation_without_stop():
+    env = object.__new__(HabitatEnv)
+    env.num_envs = 1
+    env.reward_mode = "subgoal_progress"
+    env.episode_info = {}
+    env.subgoal_reward = SubgoalRewardTracker(
+        num_envs=1,
+        config=SubgoalRewardConfig(
+            progress_reward_coef=1.0,
+            subgoal_success_reward_coef=6.0,
+            subgoal_switch_distance=1.0,
+            subgoal_success_distance=0.5,
+            stop_success_reward_coef=10.0,
+            final_success_distance=3.0,
+            premature_stop_coeff=4.0,
+            failure_stop_coeff=5.0,
+            stall_patience=3,
+            stall_penalty_coeff=1.0,
+            stall_recovery_patience=2,
+            stall_observation_patience=2,
+        ),
+    )
+    env.subgoal_reward.reset([0], [[2.0]])
+    env.env = SimpleNamespace(
+        get_current_episode_goal_distances=lambda id=None: {
+            "distances_to_goals": [[3.5]]
+        }
+    )
+    infos = {"episode": {}}
+
+    reward = env._calc_step_reward(
+        episode={},
+        first_done_reward_mask=np.array([False]),
+        is_stop=np.array([False]),
+        truncations=np.array([True]),
+        valid_reward_mask=np.array([True]),
+        infos=infos,
+    )
+
+    assert reward.tolist() == [-5.75]
+    assert infos["episode"]["r_stop"].tolist() == [-5.0]
+    assert infos["episode"]["stop_action_ratio"].tolist() == [0.0]
 
 
 def test_habitat_subgoal_reward_metrics_preserve_cached_first_done_values():

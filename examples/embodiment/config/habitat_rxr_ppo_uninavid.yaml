@@ -75,6 +75,7 @@ algorithm:
   stop_success_reward_coef: 10
   premature_stop_coeff: 0
   failure_stop_coeff: 0
+  step_cost_coeff: 0.0
   stall_penalty_coeff: 0.0
   stall_patience: 9
   stall_recovery_patience: 3
@@ -124,6 +125,7 @@ env:
     final_success_distance: ${algorithm.final_success_distance}
     premature_stop_coeff: ${algorithm.premature_stop_coeff}
     failure_stop_coeff: ${algorithm.failure_stop_coeff}
+    step_cost_coeff: ${algorithm.step_cost_coeff}
     stall_patience: ${algorithm.stall_patience}
     stall_penalty_coeff: ${algorithm.stall_penalty_coeff}
     stall_recovery_patience: ${algorithm.stall_recovery_patience}
@@ -160,6 +162,7 @@ env:
     final_success_distance: ${algorithm.final_success_distance}
     premature_stop_coeff: ${algorithm.premature_stop_coeff}
     failure_stop_coeff: ${algorithm.failure_stop_coeff}
+    step_cost_coeff: ${algorithm.step_cost_coeff}
     stall_patience: ${algorithm.stall_patience}
     stall_penalty_coeff: ${algorithm.stall_penalty_coeff}
     stall_recovery_patience: ${algorithm.stall_recovery_patience}

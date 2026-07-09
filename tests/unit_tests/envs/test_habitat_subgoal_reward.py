@@ -33,6 +33,7 @@ def _tracker(num_envs=1, **kwargs):
         final_success_distance=kwargs.get("final_success_distance", 3.0),
         premature_stop_coeff=kwargs.get("premature_stop_coeff", 4.0),
         failure_stop_coeff=kwargs.get("failure_stop_coeff", 5.0),
+        step_cost_coeff=kwargs.get("step_cost_coeff", 0.0),
         stall_patience=kwargs.get("stall_patience", 3),
         stall_penalty_coeff=kwargs.get("stall_penalty_coeff", 1.0),
         stall_recovery_patience=kwargs.get("stall_recovery_patience", 2),
@@ -406,6 +407,21 @@ def test_finalgoal_progress_continues_after_all_subgoals_finish():
     assert math.isclose(second_reward[0], 0.125, rel_tol=1e-6)
 
 
+def test_step_cost_coeff_breaks_ties_without_dominating_progress():
+    tracker = _tracker(progress_reward_coef=1.0, step_cost_coeff=0.01)
+    tracker.reset([0], [[4.0]])
+
+    reward, components = tracker.compute_step(
+        distances_to_goals=[[3.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert math.isclose(components["r_step_cost"][0], -0.01, rel_tol=1e-6)
+    assert math.isclose(components["r_progress"][0], 0.25, rel_tol=1e-6)
+    assert math.isclose(reward[0], 0.24, rel_tol=1e-6)
+
+
 def test_final_stop_failure_is_penalized_when_finalgoal_is_too_far():
     tracker = _tracker(
         failure_stop_coeff=5.0,
@@ -424,6 +440,27 @@ def test_final_stop_failure_is_penalized_when_finalgoal_is_too_far():
     assert components["r_stop"][0] == -5.0
     assert components["final_goal_success_ratio"][0] == 0.0
     assert components["premature_stop_ratio"][0] == 0.0
+    assert math.isclose(reward[0], -5.75, rel_tol=1e-6)
+
+
+def test_truncation_failure_is_penalized_without_stop():
+    tracker = _tracker(
+        failure_stop_coeff=5.0,
+        final_success_distance=3.0,
+        stop_success_reward_coef=10.0,
+    )
+    tracker.reset([0], [[2.0]])
+
+    reward, components = tracker.compute_step(
+        distances_to_goals=[[3.5]],
+        is_stop=np.array([False]),
+        is_truncated=np.array([True]),
+        valid_mask=np.array([True]),
+    )
+
+    assert components["r_stop"][0] == -5.0
+    assert components["final_goal_success_ratio"][0] == 0.0
+    assert components["stop_action_ratio"][0] == 0.0
     assert math.isclose(reward[0], -5.75, rel_tol=1e-6)
 
 
