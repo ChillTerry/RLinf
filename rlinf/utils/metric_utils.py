@@ -122,11 +122,68 @@ def compute_evaluate_metrics(eval_metrics_list):
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:
     rollout_metrics = {}
+    loss_mask = data_buffer.get("loss_mask", None)
+
+    def _metric_device():
+        return Worker.torch_platform.current_device()
+
+    def _values_with_mask(values: torch.Tensor) -> torch.Tensor:
+        values = values.float()
+        if loss_mask is None:
+            return values.reshape(-1)
+
+        mask = loss_mask.bool()
+        while mask.dim() < values.dim():
+            mask = mask.unsqueeze(-1)
+        while mask.dim() > values.dim() and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+
+        if mask.shape != values.shape:
+            if (
+                mask.dim() == values.dim()
+                and values.shape[-1] == 1
+                and mask.shape[:-1] == values.shape[:-1]
+            ):
+                mask = mask.any(dim=-1, keepdim=True)
+            else:
+                mask = mask.expand_as(values)
+
+        return values[mask]
+
+    def _distributed_mean(values: torch.Tensor) -> torch.Tensor:
+        device = _metric_device()
+        if values.numel() > 0:
+            local_sum = values.sum().to(device)
+            local_count = torch.tensor(
+                float(values.numel()), device=device, dtype=torch.float32
+            )
+        else:
+            local_sum = torch.tensor(0.0, device=device, dtype=torch.float32)
+            local_count = torch.tensor(0.0, device=device, dtype=torch.float32)
+        reduce_tensor = torch.stack([local_sum, local_count])
+        torch.distributed.all_reduce(reduce_tensor, op=torch.distributed.ReduceOp.SUM)
+        if reduce_tensor[1] == 0:
+            return torch.tensor(0.0, device=device, dtype=torch.float32)
+        return reduce_tensor[0] / reduce_tensor[1]
+
+    def _distributed_min_max(values: torch.Tensor) -> tuple[float, float]:
+        device = _metric_device()
+        if values.numel() > 0:
+            local_min = values.min().to(device)
+            local_max = values.max().to(device)
+            reduce_tensor = torch.stack([-local_min, local_max])
+        else:
+            reduce_tensor = torch.tensor(
+                [float("-inf"), float("-inf")], device=device, dtype=torch.float32
+            )
+        torch.distributed.all_reduce(reduce_tensor, op=torch.distributed.ReduceOp.MAX)
+        if torch.isneginf(reduce_tensor[1]):
+            return 0.0, 0.0
+        return (-reduce_tensor[0]).item(), reduce_tensor[1].item()
 
     if "rewards" in data_buffer:
-        rewards = data_buffer["rewards"].clone()
-        mean_rewards = torch.mean(rewards).to(Worker.torch_platform.current_device())
-        torch.distributed.all_reduce(mean_rewards, op=torch.distributed.ReduceOp.AVG)
+        rewards = _values_with_mask(data_buffer["rewards"])
+        mean_rewards = _distributed_mean(rewards)
 
         rewards_metrics = {
             "rewards": mean_rewards.item(),
@@ -134,48 +191,26 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         rollout_metrics.update(rewards_metrics)
 
     if "advantages" in data_buffer:
-        advantages = data_buffer["advantages"]
-        mean_adv = torch.mean(advantages).to(Worker.torch_platform.current_device())
-        torch.distributed.all_reduce(mean_adv, op=torch.distributed.ReduceOp.AVG)
-        max_adv = torch.max(advantages).detach().item()
-        min_adv = torch.min(advantages).detach().item()
-        reduce_adv_tensor = torch.as_tensor(
-            [-min_adv, max_adv],
-            device=Worker.torch_platform.current_device(),
-            dtype=torch.float32,
-        )
-        torch.distributed.all_reduce(
-            reduce_adv_tensor, op=torch.distributed.ReduceOp.MAX
-        )
-        min_adv, max_adv = reduce_adv_tensor.tolist()
+        advantages = _values_with_mask(data_buffer["advantages"])
+        mean_adv = _distributed_mean(advantages)
+        min_adv, max_adv = _distributed_min_max(advantages)
 
         advantages_metrics = {
             "advantages_mean": mean_adv.item(),
             "advantages_max": max_adv,
-            "advantages_min": -min_adv,
+            "advantages_min": min_adv,
         }
         rollout_metrics.update(advantages_metrics)
 
     if data_buffer.get("returns", None) is not None:
-        returns = data_buffer["returns"]
-        mean_ret = torch.mean(returns).to(Worker.torch_platform.current_device())
-        torch.distributed.all_reduce(mean_ret, op=torch.distributed.ReduceOp.AVG)
-        max_ret = torch.max(returns).detach().item()
-        min_ret = torch.min(returns).detach().item()
-        reduce_ret_tensor = torch.as_tensor(
-            [-min_ret, max_ret],
-            device=Worker.torch_platform.current_device(),
-            dtype=torch.float32,
-        )
-        torch.distributed.all_reduce(
-            reduce_ret_tensor, op=torch.distributed.ReduceOp.MAX
-        )
-        min_ret, max_ret = reduce_ret_tensor.tolist()
+        returns = _values_with_mask(data_buffer["returns"])
+        mean_ret = _distributed_mean(returns)
+        min_ret, max_ret = _distributed_min_max(returns)
 
         returns_metrics = {
             "returns_mean": mean_ret.item(),
             "returns_max": max_ret,
-            "returns_min": -min_ret,
+            "returns_min": min_ret,
         }
         rollout_metrics.update(returns_metrics)
 

@@ -198,9 +198,7 @@ def compute_ppo_actor_loss(
     Returns:
         Tuple[torch.Tensor, Dict]: (actor_loss, metrics_dict)
     """
-    if fast_path_zero_loss_mask and (
-        loss_mask is not None and loss_mask[0].sum() == 0.0
-    ):
+    if fast_path_zero_loss_mask and (loss_mask is not None and loss_mask.sum() == 0.0):
         return torch.tensor(0.0, device=logprobs.device), {
             "actor/token_num": torch.tensor(0.0, device=logprobs.device),
             "actor/policy_loss": torch.tensor(0.0, device=logprobs.device),
@@ -357,31 +355,48 @@ def compute_ppo_critic_loss(
     value_loss = torch.max(value_loss_original, value_loss_clipped)
     value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
-    value_clip_indicator = (value_pred_clipped - prev_values).abs() > value_clip
-    value_clip_ratio = value_clip_indicator.float().mean()
+    value_delta_abs = (values.float() - prev_values.float()).abs()
+    value_clip_indicator = value_delta_abs > float(value_clip)
+    if loss_mask is not None:
+        valid_value_delta_abs = value_delta_abs[loss_mask]
+        valid_value_clip_indicator = value_clip_indicator[loss_mask]
+    else:
+        valid_value_delta_abs = value_delta_abs.reshape(-1)
+        valid_value_clip_indicator = value_clip_indicator.reshape(-1)
+
+    if valid_value_clip_indicator.numel() > 0:
+        value_clip_ratio = valid_value_clip_indicator.float().mean()
+        value_delta_abs_mean = valid_value_delta_abs.mean()
+        value_delta_abs_p95 = torch.quantile(valid_value_delta_abs, 0.95)
+    else:
+        value_clip_ratio = torch.tensor(0.0, device=values.device)
+        value_delta_abs_mean = torch.tensor(0.0, device=values.device)
+        value_delta_abs_p95 = torch.tensor(0.0, device=values.device)
 
     # explained variance
     if loss_mask is not None:
-        masked_returns = returns[loss_mask]
-        masked_values = values[loss_mask]
+        masked_returns = returns[loss_mask].float()
+        masked_values = values[loss_mask].float()
     else:
-        masked_returns = returns
-        masked_values = values
+        masked_returns = returns.reshape(-1).float()
+        masked_values = values.reshape(-1).float()
 
-    var_returns = torch.var(masked_returns)
-    if torch.isnan(var_returns) or var_returns == 0:
+    if masked_returns.numel() < 2:
         explained_variance = torch.tensor(float("nan"), device=returns.device)
     else:
-        var_diff = torch.var(masked_returns - masked_values)
-        if torch.isnan(var_diff):
+        var_returns = torch.var(masked_returns, unbiased=False)
+        if torch.isnan(var_returns) or var_returns <= 1e-8:
             explained_variance = torch.tensor(float("nan"), device=returns.device)
         else:
+            var_diff = torch.var(masked_returns - masked_values, unbiased=False)
             explained_variance = 1 - var_diff / var_returns
 
     # Compile metrics for logging
     metrics_data = {
         "critic/value_loss": value_loss.detach(),
         "critic/value_clip_ratio": value_clip_ratio.detach(),
+        "critic/value_delta_abs_mean": value_delta_abs_mean.detach(),
+        "critic/value_delta_abs_p95": value_delta_abs_p95.detach(),
         "critic/explained_variance": explained_variance.detach(),
     }
     return value_loss, metrics_data
