@@ -35,13 +35,13 @@ def parse_args() -> argparse.Namespace:
         "--gt-path",
         type=Path,
         help="Path to *_gt_reachable.json.gz (episode_id -> {actions: [...]}).",
-        default="VLN-CE/datasets/rxr/train/train_guide_gt_reachable_english.json.gz",
+        default="VLN-CE/datasets/r2r/train/train_gt.json.gz",
     )
     parser.add_argument(
         "--dataset-path",
         type=Path,
         help="Path to *_reachable.json.gz ({episodes: [...]}).",
-        default="VLN-CE/datasets/rxr/train/train_guide_reachable_english.json.gz",
+        default="VLN-CE/datasets/r2r/train/train.json.gz",
     )
     parser.add_argument(
         "--out-dir",

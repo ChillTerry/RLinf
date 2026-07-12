@@ -220,6 +220,24 @@ def test_habitat_r2r_ppo_uninavid_wires_step_cost_coeff_to_env_configs():
     assert raw_cfg["env"]["eval"]["step_cost_coeff"] == "${algorithm.step_cost_coeff}"
 
 
+def test_habitat_subgoal_progress_configs_declare_step_cost_coeff():
+    expected_values = {
+        "examples/embodiment/config/habitat_r2r_ppo_uninavid.yaml": 0.01,
+        "examples/embodiment/config/habitat_r2r_grpo_uninavid.yaml": 0.0,
+        "examples/embodiment/config/habitat_rxr_ppo_uninavid.yaml": 0.0,
+        "examples/embodiment/config/habitat_rxr_grpo_uninavid.yaml": 0.0,
+    }
+
+    for config_path, expected_value in expected_values.items():
+        cfg = OmegaConf.load(config_path)
+        raw_cfg = OmegaConf.to_container(cfg, resolve=False)
+
+        assert raw_cfg["algorithm"]["reward_mode"] == "subgoal_progress"
+        assert raw_cfg["algorithm"]["step_cost_coeff"] == expected_value
+        assert raw_cfg["env"]["train"]["step_cost_coeff"] == "${algorithm.step_cost_coeff}"
+        assert raw_cfg["env"]["eval"]["step_cost_coeff"] == "${algorithm.step_cost_coeff}"
+
+
 def test_habitat_eval_uninavid_uses_weighted_reward_config():
     cfg = OmegaConf.load("examples/embodiment/config/habitat_r2r_eval_uninavid.yaml")
     raw_cfg = OmegaConf.to_container(cfg, resolve=False)

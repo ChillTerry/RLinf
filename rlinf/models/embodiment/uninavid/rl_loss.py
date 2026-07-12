@@ -101,6 +101,7 @@ def compute_uninavid_actor_critic_loss(
     prev_values: torch.Tensor,
     value_clip: float,
     huber_delta: float,
+    value_loss_coeff: float = 1.0,
     loss_mask_sum: Optional[torch.Tensor] = None,
     max_episode_steps: Optional[int] = None,
     **kwargs,
@@ -123,7 +124,9 @@ def compute_uninavid_actor_critic_loss(
     metrics = {}
     metrics.update(actor_metrics)
     metrics.update(critic_metrics)
-    return actor_loss + critic_loss, metrics
+    scaled_critic_loss = float(value_loss_coeff) * critic_loss
+    metrics["critic/value_loss_scaled"] = scaled_critic_loss.detach()
+    return actor_loss + scaled_critic_loss, metrics
 
 
 def _zero_actor_diagnostics() -> dict[str, float]:

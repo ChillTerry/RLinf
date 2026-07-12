@@ -1609,6 +1609,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 critic_loss_mask=chunk_loss_mask,
                                 loss_mask_sum=loss_mask_sum,
                                 max_episode_steps=chunk_horizon,
+                                value_loss_coeff=self.cfg.algorithm.get(
+                                    "value_loss_coeff", 1.0
+                                ),
                                 loss_agg_func=loss_agg_func,
                                 clip_ratio_c=self.cfg.algorithm.get(
                                     "clip_ratio_c", 3.0
@@ -1732,6 +1735,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     if self.enable_sft_co_train:
                         self._train_sft_epoch(metrics_data, loss)
 
+                    metrics_data["actor/total_loss"] = loss.detach().item()
                     loss /= self.gradient_accumulation
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
@@ -1760,7 +1764,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         )
                         metrics_data.update(ref_drift_metrics)
 
-                    metrics_data["actor/total_loss"] = loss.detach().item()
                     append_to_dict(metrics, metrics_data)
 
                 self.torch_platform.empty_cache()
