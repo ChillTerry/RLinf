@@ -1225,7 +1225,9 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         if not return_hidden_state:
             return response_logits
         if outputs.hidden_states is None:
-            raise RuntimeError("UniNaVid value head requires output_hidden_states=True.")
+            raise RuntimeError(
+                "UniNaVid value head requires output_hidden_states=True."
+            )
         final_hidden = outputs.hidden_states[-1]
         return response_logits, final_hidden, prompt_len
 
@@ -1258,6 +1260,8 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         if not hasattr(self, "value_head"):
             raise RuntimeError("UniNaVid value computation requires value_head.")
         value_feature = final_hidden[:, prompt_len - 1, :]
+        if self._cfg_get(self.cfg, "detach_critic_input", default=False):
+            value_feature = value_feature.detach()
         return self.value_head(value_feature).float()
 
     def _get_hidden_size_for_value_head(self) -> int:

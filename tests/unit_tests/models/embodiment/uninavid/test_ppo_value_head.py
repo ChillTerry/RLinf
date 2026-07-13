@@ -79,3 +79,23 @@ def test_pre_response_value_preserves_hidden_dtype_for_wrapped_value_head():
 
     assert values.shape == (1, 1)
     assert values.dtype == torch.float32
+
+
+def test_pre_response_value_detaches_critic_input_when_enabled():
+    model = UniNaVidForActionPrediction(
+        tokenizer=None,
+        model=nn.Identity(),
+        image_processor=None,
+        cfg=OmegaConf.create({"detach_critic_input": True}),
+    )
+    model.value_head = nn.Linear(3, 1, bias=False)
+    final_hidden = torch.ones(1, 2, 3, requires_grad=True)
+
+    values = model._compute_value_from_pre_response_hidden(
+        final_hidden=final_hidden,
+        prompt_len=1,
+    )
+    values.sum().backward()
+
+    assert final_hidden.grad is None
+    assert model.value_head.weight.grad is not None

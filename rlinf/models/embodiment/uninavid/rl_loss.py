@@ -22,27 +22,20 @@ from rlinf.algorithms.losses import compute_ppo_actor_loss, compute_ppo_critic_l
 from rlinf.scheduler import Worker
 
 
-def prepare_uninavid_token_level_loss_inputs(
+def _build_uninavid_action_token_mask(
     *,
     logprobs: torch.Tensor,
-    old_logprobs: torch.Tensor,
-    advantages: torch.Tensor,
     response_mask: torch.Tensor,
     action_token_mask: Optional[torch.Tensor] = None,
     sample_loss_mask: Optional[torch.Tensor] = None,
-    entropy: Optional[torch.Tensor] = None,
-) -> dict[str, torch.Tensor]:
+) -> torch.Tensor:
     if logprobs.dim() != 3 or logprobs.shape[-1] != 1:
         raise ValueError("UniNaVid logprobs must have shape [batch, response_len, 1].")
-    if old_logprobs.shape != logprobs.shape:
-        raise ValueError("UniNaVid old_logprobs must match logprobs shape.")
     if response_mask.shape != logprobs.shape[:-1]:
         raise ValueError(
             "UniNaVid response_mask must have shape [batch, response_len]."
         )
 
-    logprobs = logprobs.float()
-    old_logprobs = old_logprobs.float()
     mask = response_mask.to(torch.bool).unsqueeze(-1)
     if action_token_mask is not None:
         if action_token_mask.shape != response_mask.shape:
@@ -62,6 +55,52 @@ def prepare_uninavid_token_level_loss_inputs(
                 "UniNaVid sample_loss_mask must be broadcastable to response_mask."
             )
         mask = mask & sample_loss_mask
+    return mask
+
+
+def aggregate_uninavid_action_logprobs(
+    *,
+    logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    action_token_mask: Optional[torch.Tensor] = None,
+    sample_loss_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Aggregate action-token log probabilities into joint action chunks."""
+    token_mask = _build_uninavid_action_token_mask(
+        logprobs=logprobs,
+        response_mask=response_mask,
+        action_token_mask=action_token_mask,
+        sample_loss_mask=sample_loss_mask,
+    )
+    chunk_logprobs = torch.where(token_mask, logprobs.float(), 0.0).sum(
+        dim=1,
+        keepdim=True,
+    )
+    chunk_loss_mask = token_mask.any(dim=1, keepdim=True)
+    return chunk_logprobs, chunk_loss_mask
+
+
+def prepare_uninavid_token_level_loss_inputs(
+    *,
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    action_token_mask: Optional[torch.Tensor] = None,
+    sample_loss_mask: Optional[torch.Tensor] = None,
+    entropy: Optional[torch.Tensor] = None,
+) -> dict[str, torch.Tensor]:
+    if old_logprobs.shape != logprobs.shape:
+        raise ValueError("UniNaVid old_logprobs must match logprobs shape.")
+
+    logprobs = logprobs.float()
+    old_logprobs = old_logprobs.float()
+    mask = _build_uninavid_action_token_mask(
+        logprobs=logprobs,
+        response_mask=response_mask,
+        action_token_mask=action_token_mask,
+        sample_loss_mask=sample_loss_mask,
+    )
 
     if advantages.dim() == 1:
         advantages = advantages.view(-1, 1, 1)
@@ -89,6 +128,65 @@ def prepare_uninavid_token_level_loss_inputs(
         if entropy.shape != logprobs.shape:
             raise ValueError("UniNaVid entropy must match logprobs shape.")
         prepared["entropy"] = entropy
+    return prepared
+
+
+def prepare_uninavid_chunk_level_loss_inputs(
+    *,
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    action_token_mask: Optional[torch.Tensor] = None,
+    sample_loss_mask: Optional[torch.Tensor] = None,
+    entropy: Optional[torch.Tensor] = None,
+) -> dict[str, torch.Tensor]:
+    """Prepare PPO inputs for a joint action represented by multiple tokens."""
+    if old_logprobs.shape != logprobs.shape:
+        raise ValueError("UniNaVid old_logprobs must match logprobs shape.")
+
+    chunk_logprobs, chunk_loss_mask = aggregate_uninavid_action_logprobs(
+        logprobs=logprobs,
+        response_mask=response_mask,
+        action_token_mask=action_token_mask,
+        sample_loss_mask=sample_loss_mask,
+    )
+    old_chunk_logprobs, old_chunk_loss_mask = aggregate_uninavid_action_logprobs(
+        logprobs=old_logprobs,
+        response_mask=response_mask,
+        action_token_mask=action_token_mask,
+        sample_loss_mask=sample_loss_mask,
+    )
+    if not torch.equal(chunk_loss_mask, old_chunk_loss_mask):
+        raise RuntimeError("UniNaVid new and old chunk loss masks must match.")
+
+    if advantages.dim() == 1:
+        advantages = advantages.view(-1, 1, 1)
+    elif advantages.dim() == 2:
+        advantages = advantages.unsqueeze(-1)
+    elif advantages.dim() != 3:
+        raise ValueError("UniNaVid advantages must be rank 1, 2, or 3.")
+    if advantages.shape != chunk_logprobs.shape:
+        raise ValueError(
+            "UniNaVid chunk-level advantages must have shape [batch, 1, 1]."
+        )
+
+    prepared = {
+        "logprobs": chunk_logprobs,
+        "old_logprobs": old_chunk_logprobs,
+        "advantages": advantages.float(),
+        "loss_mask": chunk_loss_mask,
+    }
+    if entropy is not None:
+        if entropy.shape != logprobs.shape:
+            raise ValueError("UniNaVid entropy must match logprobs shape.")
+        chunk_entropy, _ = aggregate_uninavid_action_logprobs(
+            logprobs=entropy,
+            response_mask=response_mask,
+            action_token_mask=action_token_mask,
+            sample_loss_mask=sample_loss_mask,
+        )
+        prepared["entropy"] = chunk_entropy
     return prepared
 
 

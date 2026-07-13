@@ -17,13 +17,16 @@ import math
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.algorithms.losses import compute_ppo_actor_loss
 from rlinf.models.embodiment.uninavid.rl_loss import (
+    aggregate_uninavid_action_logprobs,
     compute_uninavid_actor_diagnostic_stats,
     compute_uninavid_actor_diagnostics,
     compute_uninavid_reference_drift_diagnostics,
     finalize_uninavid_actor_diagnostics,
     gather_uninavid_log_ratio_abs_values,
     merge_uninavid_actor_diagnostic_stats,
+    prepare_uninavid_chunk_level_loss_inputs,
     prepare_uninavid_token_level_loss_inputs,
 )
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
@@ -40,6 +43,82 @@ def test_prepare_loss_inputs_restricts_mask_to_action_tokens():
     )
 
     assert prepared["loss_mask"].tolist() == [[[True], [False], [False], [False]]]
+
+
+def test_chunk_loss_inputs_sum_action_token_logprobs_and_mask_invalid_samples():
+    prepared = prepare_uninavid_chunk_level_loss_inputs(
+        logprobs=torch.tensor(
+            [
+                [[0.1], [0.2], [0.3], [0.4]],
+                [[1.0], [2.0], [3.0], [4.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        old_logprobs=torch.zeros((2, 4, 1), dtype=torch.float32),
+        advantages=torch.tensor([[[1.0]], [[2.0]]]),
+        response_mask=torch.tensor(
+            [[True, True, True, False], [True, True, True, True]]
+        ),
+        action_token_mask=torch.tensor(
+            [[True, False, True, True], [True, True, True, True]]
+        ),
+        sample_loss_mask=torch.tensor([[[True]], [[False]]]),
+    )
+
+    torch.testing.assert_close(
+        prepared["logprobs"],
+        torch.tensor([[[0.4]], [[0.0]]]),
+    )
+    assert prepared["old_logprobs"].shape == (2, 1, 1)
+    assert prepared["advantages"].shape == (2, 1, 1)
+    assert prepared["loss_mask"].tolist() == [[[True]], [[False]]]
+
+
+def test_chunk_joint_ratio_triggers_ppo_clip_when_each_token_ratio_does_not():
+    token_log_ratio = torch.full(
+        (1, 4, 1),
+        0.08,
+        dtype=torch.float32,
+    )
+    prepared = prepare_uninavid_chunk_level_loss_inputs(
+        logprobs=token_log_ratio,
+        old_logprobs=torch.zeros_like(token_log_ratio),
+        advantages=torch.ones((1, 1, 1), dtype=torch.float32),
+        response_mask=torch.ones((1, 4), dtype=torch.bool),
+        action_token_mask=torch.ones((1, 4), dtype=torch.bool),
+        sample_loss_mask=torch.ones((1, 1, 1), dtype=torch.bool),
+    )
+
+    _, metrics = compute_ppo_actor_loss(
+        **prepared,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=3.0,
+    )
+
+    torch.testing.assert_close(prepared["logprobs"], torch.tensor([[[0.32]]]))
+    torch.testing.assert_close(metrics["actor/clip_fraction"], torch.tensor(1.0))
+
+
+def test_chunk_logprob_aggregation_backpropagates_only_through_action_tokens():
+    logprobs = torch.tensor(
+        [[[0.1], [0.2], [0.3]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    chunk_logprobs, chunk_mask = aggregate_uninavid_action_logprobs(
+        logprobs=logprobs,
+        response_mask=torch.tensor([[True, True, True]]),
+        action_token_mask=torch.tensor([[True, False, True]]),
+    )
+
+    chunk_logprobs.sum().backward()
+
+    assert chunk_mask.tolist() == [[[True]]]
+    torch.testing.assert_close(
+        logprobs.grad,
+        torch.tensor([[[1.0], [0.0], [1.0]]]),
+    )
 
 
 def test_actor_diagnostics_use_only_masked_token_positions():

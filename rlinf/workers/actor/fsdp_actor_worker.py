@@ -1568,14 +1568,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         from rlinf.algorithms.registry import get_policy_loss
                         from rlinf.algorithms.utils import postprocess_loss_metric
                         from rlinf.models.embodiment.uninavid.rl_loss import (
+                            aggregate_uninavid_action_logprobs,
                             compute_uninavid_actor_critic_loss,
                             compute_uninavid_actor_diagnostic_stats,
                             compute_uninavid_reference_drift_diagnostics,
+                            prepare_uninavid_chunk_level_loss_inputs,
                             prepare_uninavid_token_level_loss_inputs,
                         )
 
                         chunk_loss_mask = loss_mask
-                        prepared_loss_inputs = prepare_uninavid_token_level_loss_inputs(
+                        uninavid_logprob_type = self.cfg.algorithm.logprob_type
+                        if uninavid_logprob_type == "chunk_level":
+                            prepare_loss_inputs = (
+                                prepare_uninavid_chunk_level_loss_inputs
+                            )
+                        elif uninavid_logprob_type == "token_level":
+                            prepare_loss_inputs = (
+                                prepare_uninavid_token_level_loss_inputs
+                            )
+                        else:
+                            raise ValueError(
+                                "UniNaVid PPO supports logprob_type values "
+                                f"'chunk_level' and 'token_level', got "
+                                f"{uninavid_logprob_type!r}."
+                            )
+                        prepared_loss_inputs = prepare_loss_inputs(
                             logprobs=output_dict["logprobs"],
                             old_logprobs=prev_logprobs,
                             advantages=advantages,
@@ -1627,9 +1644,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 fast_path_zero_loss_mask=False,
                                 critic_warmup=critic_warmup,
                                 value_clip=self.cfg.algorithm.get("value_clip", None),
-                                huber_delta=self.cfg.algorithm.get(
-                                    "huber_delta", None
-                                ),
+                                huber_delta=self.cfg.algorithm.get("huber_delta", None),
                             )
                         else:
                             loss_fn = get_policy_loss(self.cfg.algorithm.loss_type)
@@ -1678,9 +1693,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             ref_drift_inputs = {
                                 "forward_inputs": forward_inputs,
                                 "logprobs": prepared_loss_inputs["logprobs"].detach(),
-                                "loss_mask": prepared_loss_inputs[
-                                    "loss_mask"
-                                ].detach(),
+                                "loss_mask": prepared_loss_inputs["loss_mask"].detach(),
+                                "logprob_type": uninavid_logprob_type,
+                                "response_mask": batch["forward_inputs"][
+                                    "response_mask"
+                                ],
+                                "action_token_mask": batch["forward_inputs"][
+                                    "action_token_mask"
+                                ],
+                                "sample_loss_mask": chunk_loss_mask,
                             }
                         uninavid_actor_diagnostic_stats.append(diagnostic_stats)
                         if log_ratio_abs_values.numel() > 0:
@@ -1757,10 +1778,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                     compute_values=False,
                                     use_cache=False,
                                 )
-                        ref_drift_metrics = compute_uninavid_reference_drift_diagnostics(
-                            logprobs=ref_drift_inputs["logprobs"],
-                            ref_logprobs=ref_output_dict["logprobs"].float(),
-                            loss_mask=ref_drift_inputs["loss_mask"],
+                        ref_logprobs = ref_output_dict["logprobs"].float()
+                        if ref_drift_inputs["logprob_type"] == "chunk_level":
+                            ref_logprobs, _ = aggregate_uninavid_action_logprobs(
+                                logprobs=ref_logprobs,
+                                response_mask=ref_drift_inputs["response_mask"],
+                                action_token_mask=ref_drift_inputs["action_token_mask"],
+                                sample_loss_mask=ref_drift_inputs["sample_loss_mask"],
+                            )
+                        ref_drift_metrics = (
+                            compute_uninavid_reference_drift_diagnostics(
+                                logprobs=ref_drift_inputs["logprobs"],
+                                ref_logprobs=ref_logprobs,
+                                loss_mask=ref_drift_inputs["loss_mask"],
+                            )
                         )
                         metrics_data.update(ref_drift_metrics)
 
