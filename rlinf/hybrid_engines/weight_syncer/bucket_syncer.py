@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Iterator
+
 import torch
 from torch.distributed.tensor import DTensor
 
@@ -25,6 +27,63 @@ from .base import (
     normalize_device,
     normalize_dtype,
 )
+
+
+def iter_named_tensor_buckets(
+    items: Iterable[tuple[str, torch.Tensor | DTensor]],
+    version: int | torch.Tensor,
+    *,
+    bucket_size: int,
+    bucket_device: str | torch.device,
+    dtype_resolver: Callable[[str, torch.dtype], torch.dtype] | None = None,
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Yield transport buckets for an already-selected tensor sequence."""
+    metadata_keys = {
+        BucketWeightSyncer._TOTAL_BUCKETS_KEY,
+        BucketWeightSyncer._SYNCER_VERSION_KEY,
+    }
+    bucket_device = normalize_device(bucket_device)
+    bucket_plan: list[list[tuple[str, torch.Tensor | DTensor, torch.dtype]]] = []
+    pending: list[tuple[str, torch.Tensor | DTensor, torch.dtype]] = []
+    pending_bytes = 0
+    for key, value in items:
+        if key in metadata_keys:
+            raise ValueError(f"Bucket payload key conflicts with metadata key: {key}")
+        transport_dtype = (
+            dtype_resolver(key, value.dtype)
+            if dtype_resolver is not None
+            else value.dtype
+        )
+        pending.append((key, value, transport_dtype))
+        pending_bytes += (
+            value.numel() * torch.empty((), dtype=transport_dtype).element_size()
+        )
+        if pending_bytes >= bucket_size:
+            bucket_plan.append(pending)
+            pending = []
+            pending_bytes = 0
+    if pending:
+        bucket_plan.append(pending)
+    if not bucket_plan:
+        raise ValueError("No parameters to sync")
+
+    bucket: dict[str, torch.Tensor] = {
+        BucketWeightSyncer._TOTAL_BUCKETS_KEY: torch.tensor(
+            len(bucket_plan), dtype=torch.int32, device=bucket_device
+        ),
+        BucketWeightSyncer._SYNCER_VERSION_KEY: torch.as_tensor(
+            version, dtype=torch.int64, device=bucket_device
+        ),
+    }
+    for bucket_items in bucket_plan:
+        for key, value, transport_dtype in bucket_items:
+            bucket[key] = materialize_tensor(value).to(
+                device=bucket_device,
+                dtype=transport_dtype,
+                non_blocking=False,
+            )
+        yield bucket
+        bucket = {}
 
 
 class BucketWeightSyncer(WeightSyncer):

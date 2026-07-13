@@ -156,12 +156,12 @@ async def _init_patch_syncers(
 ) -> None:
     await asyncio.gather(
         sender_syncer.init_sender(
-            _clone_state_dict(sender_model),
+            sender_model.state_dict(),
             transport.sender_send,
             transport.sender_recv,
         ),
         receiver_syncer.init_receiver(
-            _clone_state_dict(receiver_model),
+            receiver_model.state_dict(),
             transport.receiver_recv,
             transport.receiver_send,
         ),
@@ -274,6 +274,101 @@ def test_patch_weight_syncer_roundtrip_delta_enabled():
     applied_version = asyncio.run(_run())
 
     assert applied_version == 11
+    _assert_state_dict_equal(
+        _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
+    )
+
+
+def test_patch_weight_syncer_init_sync_bootstraps_full_state_dict():
+    device = _get_cuda_device()
+    sender_model = _make_bucket_dtype_model(device)
+    receiver_model = copy.deepcopy(sender_model)
+    transport = _InMemoryDuplexTransport()
+
+    with torch.no_grad():
+        receiver_model.fp32_param[0, 0] = -17.5
+        receiver_model.bf16_param[1, 1] += torch.tensor(
+            9.0, dtype=torch.bfloat16, device=device
+        )
+        receiver_model.int64_buf[0] = -(2**41 + 3)
+        receiver_model.bool_buf.logical_not_()
+
+    sender_syncer = PatchWeightSyncer(
+        snapshot_device="cpu",
+        transport_device="cpu",
+        init_sync_enabled=True,
+        init_sync_bucket_size=32,
+    )
+    receiver_syncer = PatchWeightSyncer(
+        snapshot_device="cpu",
+        transport_device="cpu",
+        init_sync_enabled=True,
+        init_sync_bucket_size=32,
+    )
+
+    async def _run() -> int:
+        await _init_patch_syncers(
+            sender_syncer,
+            receiver_syncer,
+            sender_model,
+            receiver_model,
+            transport,
+        )
+        await sender_syncer.sync(
+            sender_model.state_dict(), transport.sender_send, version=7
+        )
+        return await receiver_syncer.apply(receiver_model, transport.receiver_recv)
+
+    applied_version = asyncio.run(_run())
+
+    assert applied_version == 7
+    _assert_state_dict_equal(
+        _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
+    )
+
+
+def test_patch_weight_syncer_init_sync_transfers_full_state_dict_on_cpu():
+    sender_model = _make_bucket_dtype_model()
+    receiver_model = copy.deepcopy(sender_model)
+    transport = _InMemoryDuplexTransport()
+
+    with torch.no_grad():
+        receiver_model.fp32_param[0, 0] = -17.5
+        receiver_model.bf16_param[1, 1] += torch.tensor(9.0, dtype=torch.bfloat16)
+        receiver_model.int64_buf[0] = -(2**41 + 3)
+        receiver_model.bool_buf.logical_not_()
+
+    sender_syncer = PatchWeightSyncer(
+        snapshot_device="cpu",
+        transport_device="cpu",
+        init_sync_enabled=True,
+        init_sync_bucket_size=32,
+    )
+    receiver_syncer = PatchWeightSyncer(
+        snapshot_device="cpu",
+        transport_device="cpu",
+        init_sync_enabled=True,
+        init_sync_bucket_size=32,
+    )
+    receiver_dtypes = {
+        key: value.dtype for key, value in receiver_model.state_dict().items()
+    }
+
+    async def _run() -> None:
+        await asyncio.gather(
+            sender_syncer._sync_init_weights(
+                sender_model.state_dict(),
+                receiver_dtypes,
+                transport.sender_send,
+            ),
+            receiver_syncer._apply_init_weights(
+                receiver_model.state_dict(),
+                transport.receiver_recv,
+            ),
+        )
+
+    asyncio.run(_run())
+
     _assert_state_dict_equal(
         _clone_state_dict(sender_model), _clone_state_dict(receiver_model)
     )
@@ -933,11 +1028,19 @@ def test_weight_syncer_factory_builds_patch_and_bucket():
                 "transport_device": "cpu",
                 "delta_encoding": True,
                 "compression": "none",
+                "init_sync": {
+                    "enabled": True,
+                    "prefixes": ["value_head"],
+                    "bucket_size": 4096,
+                },
             },
         }
     )
     patch_syncer = WeightSyncer.create(patch_cfg)
     assert isinstance(patch_syncer, PatchWeightSyncer)
+    assert patch_syncer.init_sync_enabled is True
+    assert patch_syncer.init_sync_prefixes == ["value_head"]
+    assert patch_syncer.init_sync_bucket_size == 4096
 
     bucket_cfg = OmegaConf.create(
         {
