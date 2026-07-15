@@ -650,7 +650,9 @@ class HabitatEnv(gym.Env):
             distance_to_goal / success_distance,
             torch.ones_like(distance_to_goal),
         )
-        success_reward = success * float(self.cfg.success_reward_coef) * success_scale
+        success_reward = (
+            success * float(self.cfg.success_reward_coef) * (1 + success_scale)
+        )
         ndtw_reward = ndtw * float(self.cfg.ndtw_reward_coef)
         reward[first_done_reward_mask] = (
             success_reward[first_done_reward_mask] + ndtw_reward[first_done_reward_mask]

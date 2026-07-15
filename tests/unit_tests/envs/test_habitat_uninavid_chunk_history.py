@@ -787,7 +787,23 @@ def test_habitat_reward_uses_weighted_success_ndtw_only_for_first_normal_termina
         first_done_reward_mask=np.array([True, True, False, False]),
     )
 
-    assert reward.tolist() == [6.0, 4.0, 0.0, 0.0]
+    assert reward.tolist() == [16.0, 4.0, 0.0, 0.0]
+
+
+def test_habitat_failed_stop_receives_positive_ndtw_reward():
+    env = _make_reward_test_env(num_envs=1)
+    episode = {
+        "success": torch.tensor([0.0]),
+        "distance_to_goal": torch.tensor([4.0]),
+        "ndtw": torch.tensor([0.8]),
+    }
+
+    reward = env._calc_step_reward(
+        episode,
+        first_done_reward_mask=np.array([True]),
+    )
+
+    assert reward.tolist() == [4.0]
 
 
 def test_habitat_reward_is_zero_for_non_terminal_steps():
@@ -1119,4 +1135,4 @@ def test_habitat_weighted_reward_dispatch_remains_default():
         first_done_reward_mask=np.array([True]),
     )
 
-    assert reward.tolist() == [6.0]
+    assert reward.tolist() == [16.0]
