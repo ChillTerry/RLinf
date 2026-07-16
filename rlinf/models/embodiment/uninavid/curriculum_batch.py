@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
-from collections import Counter
+import math
+import random
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -37,6 +39,27 @@ class ProcessedEpochBatch:
                 f"valid_chunk_mask must have shape {expected_shape}, got "
                 f"{tuple(self.valid_chunk_mask.shape)}."
             )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CurriculumGlobalBatchPlan:
+    sample_slots: tuple[int | None, ...]
+    rank_slots: tuple[tuple[int | None, ...], ...]
+    bucket_mass: dict[str, float]
+    bucket_mass_error: dict[str, float]
+
+
+@dataclass(frozen=True, kw_only=True)
+class CurriculumTrainingPlan:
+    global_batches: tuple[CurriculumGlobalBatchPlan, ...]
+    global_batch_size: int
+    world_size: int
+    real_chunk_count: int
+    alignment_padding_count: int
+
+    @property
+    def num_updates(self) -> int:
+        return len(self.global_batches)
 
 
 def compute_valid_action_slots(dones: torch.Tensor) -> torch.Tensor:
@@ -174,6 +197,199 @@ def compact_curriculum_epochs(
         bucket_trajectory_counts,
     )
     return compacted
+
+
+def _build_bucket_queues(
+    *,
+    bucket_ids: Sequence[str],
+    trajectory_ids: Sequence[str],
+    seed: int,
+) -> dict[str, deque[int]]:
+    bucket_trajectories: dict[str, dict[str, deque[int]]] = {}
+    for index, (bucket_id, trajectory_id) in enumerate(zip(bucket_ids, trajectory_ids)):
+        bucket_trajectories.setdefault(bucket_id, {}).setdefault(
+            trajectory_id, deque()
+        ).append(index)
+
+    rng = random.Random(seed)
+    queues = {}
+    for bucket_id, trajectories in bucket_trajectories.items():
+        trajectory_order = list(trajectories)
+        rng.shuffle(trajectory_order)
+        queue = deque()
+        while trajectory_order:
+            next_order = []
+            for trajectory_id in trajectory_order:
+                trajectory_queue = trajectories[trajectory_id]
+                queue.append(trajectory_queue.popleft())
+                if trajectory_queue:
+                    next_order.append(trajectory_id)
+            trajectory_order = next_order
+        queues[bucket_id] = queue
+    return queues
+
+
+def plan_curriculum_global_batches(
+    compacted: Mapping[str, Any],
+    *,
+    global_batch_size: int,
+    world_size: int,
+    micro_batch_size: int,
+    seed: int,
+    update_epoch: int = 0,
+) -> CurriculumTrainingPlan:
+    """Plan fixed-mass global batches and equal rank slots without resampling."""
+    if global_batch_size <= 0 or world_size <= 0 or micro_batch_size <= 0:
+        raise ValueError("Batch sizes and world_size must be positive.")
+    if global_batch_size % world_size != 0:
+        raise ValueError("global_batch_size must be divisible by world_size.")
+    slots_per_rank = global_batch_size // world_size
+    if slots_per_rank % micro_batch_size != 0:
+        raise ValueError(
+            "global_batch_size / world_size must be divisible by micro_batch_size."
+        )
+
+    bucket_ids = tuple(compacted["bucket_ids"])
+    trajectory_ids = tuple(compacted["trajectory_ids"])
+    weights = compacted["chunk_weights"].to(dtype=torch.float64)
+    chunk_count = len(bucket_ids)
+    if chunk_count == 0 or len(trajectory_ids) != chunk_count:
+        raise ValueError("Compacted curriculum metadata is empty or misaligned.")
+    if weights.shape != (chunk_count,):
+        raise ValueError("chunk_weights must contain one value per real chunk.")
+
+    num_updates = int(math.ceil(chunk_count / global_batch_size))
+    active_buckets = tuple(dict.fromkeys(bucket_ids))
+    valid_counts = Counter(bucket_ids)
+    for bucket_id in active_buckets:
+        if valid_counts[bucket_id] < num_updates:
+            raise ValueError(
+                f"Bucket {bucket_id} has {valid_counts[bucket_id]} valid chunks, "
+                f"but {num_updates} global batches require at least "
+                f"{num_updates}."
+            )
+
+    alpha = {
+        bucket_id: float(
+            weights[
+                torch.tensor(
+                    [value == bucket_id for value in bucket_ids], dtype=torch.bool
+                )
+            ].sum()
+        )
+        for bucket_id in active_buckets
+    }
+    if abs(sum(alpha.values()) - 1.0) > 1e-8:
+        raise ValueError("Compacted curriculum chunk weights must sum to 1.")
+    queues = _build_bucket_queues(
+        bucket_ids=bucket_ids,
+        trajectory_ids=trajectory_ids,
+        seed=int(seed) + int(update_epoch),
+    )
+
+    plans = []
+    remainder = chunk_count % num_updates
+    for batch_index in range(num_updates):
+        real_quota = chunk_count // num_updates + (batch_index < remainder)
+        if real_quota < len(active_buckets):
+            raise RuntimeError(
+                "Global batch real-sample quota cannot include every active bucket."
+            )
+        selected = []
+        mass = dict.fromkeys(active_buckets, 0.0)
+        for bucket_id in active_buckets:
+            sample_index = queues[bucket_id].popleft()
+            selected.append(sample_index)
+            mass[bucket_id] += float(weights[sample_index])
+
+        future_batches = num_updates - batch_index - 1
+        while len(selected) < real_quota:
+            eligible = [
+                bucket_id
+                for bucket_id in active_buckets
+                if len(queues[bucket_id]) > future_batches
+            ]
+            if not eligible:
+                raise RuntimeError(
+                    "Curriculum planner exhausted unreserved bucket samples."
+                )
+            bucket_id = max(
+                eligible,
+                key=lambda value: (alpha[value] / num_updates - mass[value], value),
+            )
+            sample_index = queues[bucket_id].popleft()
+            selected.append(sample_index)
+            mass[bucket_id] += float(weights[sample_index])
+
+        slots: tuple[int | None, ...] = tuple(
+            selected + [None] * (global_batch_size - len(selected))
+        )
+        rank_slots = tuple(
+            tuple(slots[start : start + slots_per_rank])
+            for start in range(0, global_batch_size, slots_per_rank)
+        )
+        mass_error = {
+            bucket_id: abs(num_updates * mass[bucket_id] - alpha[bucket_id])
+            for bucket_id in active_buckets
+        }
+        plans.append(
+            CurriculumGlobalBatchPlan(
+                sample_slots=slots,
+                rank_slots=rank_slots,
+                bucket_mass=mass,
+                bucket_mass_error=mass_error,
+            )
+        )
+
+    if any(queue for queue in queues.values()):
+        raise RuntimeError("Curriculum planner did not consume every real chunk.")
+    consumed = [
+        index for plan in plans for index in plan.sample_slots if index is not None
+    ]
+    if sorted(consumed) != list(range(chunk_count)):
+        raise RuntimeError("Every real chunk must be consumed exactly once.")
+    padding_count = num_updates * global_batch_size - chunk_count
+    return CurriculumTrainingPlan(
+        global_batches=tuple(plans),
+        global_batch_size=global_batch_size,
+        world_size=world_size,
+        real_chunk_count=chunk_count,
+        alignment_padding_count=padding_count,
+    )
+
+
+def materialize_curriculum_rank_batch(
+    compacted: Mapping[str, Any],
+    *,
+    training_plan: CurriculumTrainingPlan,
+    update_index: int,
+    rank: int,
+) -> dict[str, Any]:
+    if not 0 <= update_index < training_plan.num_updates:
+        raise IndexError("Invalid curriculum update_index.")
+    if not 0 <= rank < training_plan.world_size:
+        raise IndexError("Invalid actor rank.")
+    slots = training_plan.global_batches[update_index].rank_slots[rank]
+    real_indices = [index if index is not None else 0 for index in slots]
+    padding_mask = torch.tensor([index is None for index in slots], dtype=torch.bool)
+
+    def materialize(value):
+        if isinstance(value, torch.Tensor):
+            result = value[real_indices].clone()
+            result[padding_mask] = 0
+            return result
+        if isinstance(value, Mapping):
+            return {key: materialize(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return tuple(
+                "__padding__" if index is None else value[index] for index in slots
+            )
+        raise TypeError(f"Unsupported planned batch field type: {type(value)!r}.")
+
+    batch = {key: materialize(value) for key, value in compacted.items()}
+    batch["alignment_padding_mask"] = padding_mask
+    batch["train_chunk_weights"] = batch["chunk_weights"] * training_plan.num_updates
+    return batch
 
 
 def _validate_weight_invariants(
