@@ -809,6 +809,11 @@ def validate_habitat_uninavid_curriculum_cfg(cfg, model_type) -> None:
         raise ValueError(
             "action_length_bucketing is supported only for Habitat + UniNaVid."
         )
+    with open_dict(cfg.env.train):
+        cfg.env.train.num_action_chunks = int(cfg.actor.model.num_action_chunks)
+        cfg.env.train.bucket_schedule_seed = int(
+            cfg.env.train.get("bucket_schedule_seed", cfg.actor.seed)
+        )
     if int(cfg.env.train.action_length_bin_size) <= 0:
         raise ValueError("action_length_bin_size must be positive.")
     if int(cfg.env.train.max_gt_action_length) <= 0:

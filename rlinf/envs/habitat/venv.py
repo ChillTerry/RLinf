@@ -18,8 +18,10 @@ from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
 
 import gym
+import habitat
 import numpy as np
 from habitat.core.env import RLEnv
+from habitat_baselines.config.default import get_config
 
 from rlinf.envs.venv import (
     BaseVectorEnv,
@@ -113,6 +115,21 @@ class HabitatRLEnv(RLEnv):
     def get_info(self, observations):
         info = self.habitat_env.get_metrics()
         return info
+
+
+def _make_habitat_env(params):
+    config = get_config(params["config_path"], overrides=params["overrides"])
+    dataset = habitat.datasets.make_dataset(
+        config.habitat.dataset.type,
+        config=config.habitat.dataset,
+    )
+    episodes_by_id = {str(episode.episode_id): episode for episode in dataset.episodes}
+    dataset.episodes = [
+        episodes_by_id[str(episode_id)] for episode_id in params["episode_ids"]
+    ]
+    env = HabitatRLEnv(config=config, dataset=dataset)
+    env.seed(params["seed"])
+    return env
 
 
 def _worker(
@@ -210,10 +227,7 @@ def _worker(
                     p.send({})
             elif cmd == "reconfigure":
                 env.close()
-                config = data.pop("config")
-                seed = data.pop("seed")
-                env = HabitatRLEnv(config=config)
-                env.seed(seed)
+                env = _make_habitat_env(data)
                 p.send(None)
             else:
                 p.close()

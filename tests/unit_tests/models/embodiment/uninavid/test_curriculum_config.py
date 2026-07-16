@@ -23,7 +23,14 @@ def _config(train_overrides=None):
     }
     train.update(train_overrides or {})
     return OmegaConf.create(
-        {"env": {"train": train}, "algorithm": {"rollout_epoch": 2}}
+        {
+            "env": {"train": train},
+            "algorithm": {"rollout_epoch": 2},
+            "actor": {
+                "seed": 42,
+                "model": {"num_action_chunks": 4},
+            },
+        }
     )
 
 

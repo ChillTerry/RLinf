@@ -37,6 +37,16 @@ class EpisodeRecord:
     weight: int
 
 
+@dataclass(frozen=True)
+class ActionLengthBucket:
+    bucket_id: str
+    lower_bound: int
+    upper_bound: int
+    episode_ids: tuple[str, ...]
+    horizon_steps: int
+    n_chunk_steps: int
+
+
 def load_scene_vram_profile(profile_path: str | Path | None = None) -> dict[str, int]:
     if profile_path is None:
         profile_path = (
@@ -69,6 +79,8 @@ def filter_episodes_by_gt_action_length(
     *,
     max_action_length: int,
 ):
+    if max_action_length < 0:
+        raise ValueError("max_action_length must be non-negative.")
     kept_episodes = []
     dropped_episode_ids = []
     for episode in episodes:
@@ -85,6 +97,113 @@ def filter_episodes_by_gt_action_length(
             dropped_episode_ids.append(episode_id)
 
     return kept_episodes, dropped_episode_ids
+
+
+def ceil_to_multiple(value: float, multiple: int) -> int:
+    if value <= 0:
+        raise ValueError("value must be positive.")
+    if multiple <= 0:
+        raise ValueError("multiple must be positive.")
+    return int(math.ceil(value / multiple) * multiple)
+
+
+def build_action_length_buckets(
+    episodes,
+    gt_data: dict,
+    *,
+    bin_size: int,
+    max_action_length: int,
+    max_steps_ratio: float,
+    num_action_chunks: int,
+    minimum_bucket_size: int,
+) -> list[ActionLengthBucket]:
+    """Build deterministic contiguous buckets and merge undersized neighbors."""
+    if bin_size <= 0:
+        raise ValueError("bin_size must be positive.")
+    if max_action_length <= 0:
+        raise ValueError("max_action_length must be positive.")
+    if max_steps_ratio <= 0:
+        raise ValueError("max_steps_ratio must be positive.")
+    if minimum_bucket_size <= 0:
+        raise ValueError("minimum_bucket_size must be positive.")
+
+    bucket_count = int(math.ceil(max_action_length / bin_size))
+    raw_buckets = [
+        {
+            "lower_bound": index * bin_size,
+            "upper_bound": min((index + 1) * bin_size, max_action_length),
+            "episode_ids": [],
+        }
+        for index in range(bucket_count)
+    ]
+    for episode in episodes:
+        episode_id = get_episode_id(episode)
+        if episode_id not in gt_data:
+            raise KeyError(f"Missing GT for episode_id={episode_id}")
+        actions = gt_data[episode_id].get("actions")
+        if actions is None:
+            raise KeyError(f"Missing GT actions for episode_id={episode_id}")
+        action_length = len(actions)
+        if action_length > max_action_length:
+            continue
+        bucket_index = min(action_length // bin_size, bucket_count - 1)
+        raw_buckets[bucket_index]["episode_ids"].append(episode_id)
+
+    raw_buckets = [bucket for bucket in raw_buckets if bucket["episode_ids"]]
+    if not raw_buckets:
+        raise ValueError("No Habitat episodes remain for action-length buckets.")
+
+    while len(raw_buckets) > 1:
+        small_index = next(
+            (
+                index
+                for index, bucket in enumerate(raw_buckets)
+                if len(bucket["episode_ids"]) < minimum_bucket_size
+            ),
+            None,
+        )
+        if small_index is None:
+            break
+        neighbor_index = 1 if small_index == 0 else small_index - 1
+        left_index, right_index = sorted((small_index, neighbor_index))
+        left = raw_buckets[left_index]
+        right = raw_buckets[right_index]
+        merged = {
+            "lower_bound": left["lower_bound"],
+            "upper_bound": right["upper_bound"],
+            "episode_ids": left["episode_ids"] + right["episode_ids"],
+        }
+        raw_buckets[left_index : right_index + 1] = [merged]
+
+    undersized = [
+        bucket
+        for bucket in raw_buckets
+        if len(bucket["episode_ids"]) < minimum_bucket_size
+    ]
+    if undersized:
+        raise ValueError(
+            "Action-length buckets cannot satisfy minimum_bucket_size="
+            f"{minimum_bucket_size}; remaining episode count="
+            f"{len(undersized[0]['episode_ids'])}."
+        )
+
+    buckets = []
+    for index, bucket in enumerate(raw_buckets):
+        horizon_steps = ceil_to_multiple(
+            bucket["upper_bound"] * max_steps_ratio,
+            num_action_chunks,
+        )
+        buckets.append(
+            ActionLengthBucket(
+                bucket_id=f"B{index}",
+                lower_bound=int(bucket["lower_bound"]),
+                upper_bound=int(bucket["upper_bound"]),
+                episode_ids=tuple(bucket["episode_ids"]),
+                horizon_steps=horizon_steps,
+                n_chunk_steps=horizon_steps // num_action_chunks,
+            )
+        )
+    return buckets
 
 
 def vram_balance_episode_sequences(
@@ -273,9 +392,7 @@ def assign_random_episode_sequences(
         )
 
     slot_count = len(episode_ids) // total_streams
-    sequences = [
-        [[] for _ in range(num_group)] for _ in range(total_num_processes)
-    ]
+    sequences = [[[] for _ in range(num_group)] for _ in range(total_num_processes)]
 
     cursor = 0
     for process_idx in range(total_num_processes):

@@ -33,7 +33,9 @@ from hydra.core.global_hydra import GlobalHydra
 
 from rlinf.envs.habitat.extensions import measures, rxr_dataset, video  # noqa: F401
 from rlinf.envs.habitat.extensions.allocator import (
+    build_action_length_buckets,
     filter_episodes_by_gt_action_length,
+    get_episode_id,
     random_episode_sequences,
 )
 from rlinf.envs.habitat.extensions.subgoal import (
@@ -82,6 +84,7 @@ def build_habitat_global_plan(
             ep for ep in habitat_dataset.episodes if ep.scene_id in sampled_scene_id_set
         ]
 
+    gt_data = None
     max_gt_action_length = getattr(cfg, "max_gt_action_length", None)
     if max_gt_action_length is not None:
         gt_path = getattr(cfg, "gt_path", None)
@@ -102,8 +105,7 @@ def build_habitat_global_plan(
             )
         if dropped_episode_ids:
             logger.info(
-                "Dropped %s Habitat episodes with GT action length > %s; "
-                "first ids: %s",
+                "Dropped %s Habitat episodes with GT action length > %s; first ids: %s",
                 len(dropped_episode_ids),
                 int(max_gt_action_length),
                 dropped_episode_ids[:50],
@@ -111,7 +113,7 @@ def build_habitat_global_plan(
 
     episode_sequences = random_episode_sequences(
         habitat_dataset.episodes,
-        seed = cfg.seed,
+        seed=cfg.seed,
         auto_reset=cfg.auto_reset,
         total_num_processes=total_num_processes,
         num_group=num_group,
@@ -120,12 +122,54 @@ def build_habitat_global_plan(
         max_episode_steps=max_episode_steps,
     )
 
-    return {
+    plan = {
         "config_path": config_path,
         "overrides": overrides,
         "sampled_scene_ids": sampled_scene_ids,
         "episode_sequences": episode_sequences,
     }
+    if bool(getattr(cfg, "action_length_bucketing", False)):
+        if gt_data is None:
+            raise ValueError("Habitat action-length bucketing requires GT data.")
+        buckets = build_action_length_buckets(
+            habitat_dataset.episodes,
+            gt_data,
+            bin_size=int(cfg.action_length_bin_size),
+            max_action_length=int(cfg.max_gt_action_length),
+            max_steps_ratio=float(cfg.max_steps_ratio),
+            num_action_chunks=int(cfg.num_action_chunks),
+            minimum_bucket_size=total_num_processes * num_group,
+        )
+        bucket_plans = {}
+        episode_by_id = {
+            get_episode_id(episode): episode for episode in habitat_dataset.episodes
+        }
+        for bucket_index, bucket in enumerate(buckets):
+            bucket_episodes = [
+                episode_by_id[episode_id] for episode_id in bucket.episode_ids
+            ]
+            bucket_plans[bucket.bucket_id] = {
+                "bucket_id": bucket.bucket_id,
+                "lower_bound": bucket.lower_bound,
+                "upper_bound": bucket.upper_bound,
+                "horizon_steps": bucket.horizon_steps,
+                "n_chunk_steps": bucket.n_chunk_steps,
+                "episode_sequences": random_episode_sequences(
+                    bucket_episodes,
+                    seed=int(cfg.bucket_schedule_seed) + bucket_index,
+                    auto_reset=False,
+                    total_num_processes=total_num_processes,
+                    num_group=num_group,
+                    total_num_envs=cfg.total_num_envs,
+                    max_steps_per_rollout_epoch=bucket.horizon_steps,
+                    max_episode_steps=bucket.horizon_steps,
+                ),
+            }
+        plan["bucket_plans"] = bucket_plans
+        plan["bucket_ids"] = list(bucket_plans)
+        first_bucket = bucket_plans[plan["bucket_ids"][0]]
+        plan["episode_sequences"] = first_bucket["episode_sequences"]
+    return plan
 
 
 def build_habitat_overrides(cfg, *, max_episode_steps: int) -> list[str]:
@@ -222,6 +266,7 @@ class HabitatEnv(gym.Env):
         self.ignore_terminations = cfg.ignore_terminations
         self.first_done_cached_mask = np.zeros(self.num_envs, dtype=bool)
         self.episode_info = None
+        self._active_bucket_id = None
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -266,6 +311,29 @@ class HabitatEnv(gym.Env):
             3: "turn_right",
             4: "no_op",
         }
+
+    def activate_bucket(self, bucket_id: str, horizon_steps: int) -> None:
+        if not bool(getattr(self.cfg, "action_length_bucketing", False)):
+            raise RuntimeError("Habitat action-length bucketing is not enabled.")
+        global_plan = getattr(self.cfg, "global_plan", None)
+        if global_plan is None or "bucket_plans" not in global_plan:
+            raise RuntimeError("Habitat bucket plan is unavailable.")
+        if bucket_id not in global_plan["bucket_plans"]:
+            raise KeyError(f"Unknown Habitat action-length bucket: {bucket_id}")
+        bucket_plan = global_plan["bucket_plans"][bucket_id]
+        if int(bucket_plan["horizon_steps"]) != int(horizon_steps):
+            raise ValueError(
+                f"Bucket {bucket_id} horizon mismatch: expected "
+                f"{bucket_plan['horizon_steps']}, got {horizon_steps}."
+            )
+        self._active_bucket_id = bucket_id
+        self.max_episode_steps = int(horizon_steps)
+        self.env.reconfigure_env_fns(
+            self._get_env_fn_params(bucket_id=bucket_id, horizon_steps=horizon_steps)
+        )
+        self._elapsed_steps.fill(0)
+        self.first_done_cached_mask.fill(False)
+        self.current_raw_obs = None
 
     @property
     def elapsed_steps(self):
@@ -509,8 +577,8 @@ class HabitatEnv(gym.Env):
         token_list = []
         episode_ids = self.env.get_current_episode_metadata()["episode_id"]
         video_cfg = self.cfg.video_cfg
-        should_render_video = (
-            info_lists is not None and video.cfg_get(video_cfg, "save_video", False)
+        should_render_video = info_lists is not None and video.cfg_get(
+            video_cfg, "save_video", False
         )
 
         for i in range(len(obs_list)):
@@ -826,7 +894,7 @@ class HabitatEnv(gym.Env):
 
         return env_fns
 
-    def _get_env_fn_params(self):
+    def _get_env_fn_params(self, bucket_id=None, horizon_steps=None):
         env_fn_params = []
         global_plan = getattr(self.cfg, "global_plan", None)
         if global_plan is None:
@@ -838,8 +906,17 @@ class HabitatEnv(gym.Env):
             )
 
         config_path = global_plan["config_path"]
-        overrides = global_plan["overrides"]
-        process_group_episode_ids = global_plan["episode_sequences"][self.seed_offset]
+        overrides = list(global_plan["overrides"])
+        episode_sequences = global_plan["episode_sequences"]
+        if bucket_id is not None:
+            episode_sequences = global_plan["bucket_plans"][bucket_id][
+                "episode_sequences"
+            ]
+        if horizon_steps is not None:
+            prefix = "habitat.environment.max_episode_steps="
+            overrides = [value for value in overrides if not value.startswith(prefix)]
+            overrides.append(f"{prefix}{int(horizon_steps)}")
+        process_group_episode_ids = episode_sequences[self.seed_offset]
 
         for env_id in range(self.num_envs):
             group_id = env_id // self.group_size
