@@ -9,6 +9,7 @@ from rlinf.models.embodiment.uninavid.curriculum_batch import (
     compute_truncation_aware_gae,
     compute_valid_action_slots,
     materialize_curriculum_rank_batch,
+    normalize_weighted_advantages,
     plan_curriculum_global_batches,
 )
 
@@ -282,3 +283,18 @@ def test_bucket_queue_round_robins_trajectories_before_exhausting_one():
         ["A", "B", "A", "B", "A", "B"],
         ["B", "A", "B", "A", "B", "A"],
     )
+
+
+def test_weighted_advantage_normalization_uses_fixed_trajectory_mass():
+    advantages = torch.tensor([[1.0], [3.0], [10.0], [10.0], [10.0]])
+    weights = torch.tensor([0.25, 0.25, 1 / 6, 1 / 6, 1 / 6])
+
+    normalized = normalize_weighted_advantages(
+        advantages,
+        chunk_weights=weights,
+    )
+
+    weighted_mean = (weights * normalized.flatten()).sum()
+    weighted_variance = (weights * normalized.flatten().square()).sum()
+    torch.testing.assert_close(weighted_mean, torch.tensor(0.0), atol=1e-6, rtol=0)
+    torch.testing.assert_close(weighted_variance, torch.tensor(1.0), atol=1e-6, rtol=0)

@@ -1,7 +1,9 @@
 import torch
 
 from rlinf.models.embodiment.uninavid.rl_loss import (
+    aggregate_uninavid_weighted_ppo_losses,
     compute_uninavid_actor_critic_loss,
+    compute_uninavid_per_chunk_ppo_losses,
     prepare_uninavid_token_level_loss_inputs,
 )
 from rlinf.utils.utils import masked_mean
@@ -63,3 +65,62 @@ def test_uninavid_token_loss_masks_action_tokens_after_executed_prefix():
     assert prepared["loss_mask"].squeeze(-1).tolist() == [
         [False, True, False, True, True, False]
     ]
+
+
+def _weighted_loss(logprobs, values, weights, advantages, returns):
+    per_chunk = compute_uninavid_per_chunk_ppo_losses(
+        logprobs=logprobs,
+        old_logprobs=torch.zeros_like(logprobs),
+        advantages=advantages.expand_as(logprobs),
+        actor_loss_mask=torch.ones_like(logprobs, dtype=torch.bool),
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        clip_ratio_c=3.0,
+        values=values,
+        returns=returns,
+        prev_values=torch.zeros_like(values),
+        critic_loss_mask=torch.ones_like(values, dtype=torch.bool),
+        value_clip=0.2,
+        huber_delta=10.0,
+        entropy=torch.full_like(logprobs, 0.25),
+    )
+    return aggregate_uninavid_weighted_ppo_losses(
+        per_chunk,
+        train_chunk_weights=weights,
+        value_loss_coeff=0.5,
+        entropy_bonus=0.01,
+    )[0]
+
+
+def test_weighted_microbatch_sums_match_full_global_batch_loss_and_gradients():
+    full_logprobs = torch.tensor([[[0.1], [0.2]], [[-0.1], [0.3]]], requires_grad=True)
+    full_values = torch.tensor([[0.2], [0.4]], requires_grad=True)
+    weights = torch.tensor([0.6, 0.4])
+    advantages = torch.tensor([[[1.0]], [[-0.5]]])
+    returns = torch.tensor([[1.0], [0.0]])
+    full_loss = _weighted_loss(
+        full_logprobs,
+        full_values,
+        weights,
+        advantages,
+        returns,
+    )
+    full_loss.backward()
+
+    split_logprobs = full_logprobs.detach().clone().requires_grad_(True)
+    split_values = full_values.detach().clone().requires_grad_(True)
+    split_loss = sum(
+        _weighted_loss(
+            split_logprobs[index : index + 1],
+            split_values[index : index + 1],
+            weights[index : index + 1],
+            advantages[index : index + 1],
+            returns[index : index + 1],
+        )
+        for index in range(2)
+    )
+    split_loss.backward()
+
+    torch.testing.assert_close(split_loss, full_loss)
+    torch.testing.assert_close(split_logprobs.grad, full_logprobs.grad)
+    torch.testing.assert_close(split_values.grad, full_values.grad)

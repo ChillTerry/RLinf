@@ -100,6 +100,30 @@ def compute_truncation_aware_gae(
     return advantages, advantages + values[:-1]
 
 
+def normalize_weighted_advantages(
+    advantages: torch.Tensor,
+    *,
+    chunk_weights: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    epsilon: float = 1e-8,
+) -> torch.Tensor:
+    """Normalize compacted advantages without letting trajectory length set mass."""
+    if advantages.shape[0] != chunk_weights.shape[0]:
+        raise ValueError("advantages and chunk_weights batch dimensions must match.")
+    values = advantages.reshape(advantages.shape[0], -1).mean(dim=1)
+    weights = chunk_weights.to(device=values.device, dtype=values.dtype)
+    if valid_mask is not None:
+        sample_valid = valid_mask.reshape(valid_mask.shape[0], -1).any(dim=1)
+        weights = torch.where(sample_valid, weights, 0.0)
+    weight_sum = weights.sum()
+    if weight_sum <= 0:
+        raise ValueError("Weighted advantage normalization requires positive mass.")
+    normalized_weights = weights / weight_sum
+    mean = (normalized_weights * values).sum()
+    variance = (normalized_weights * (values - mean).square()).sum()
+    return (advantages - mean) / torch.sqrt(variance + epsilon)
+
+
 def compute_grpo_epoch_advantages(
     *,
     rewards: torch.Tensor,

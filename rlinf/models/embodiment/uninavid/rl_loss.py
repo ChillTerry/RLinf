@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 
 from rlinf.algorithms.losses import compute_ppo_actor_loss, compute_ppo_critic_loss
+from rlinf.algorithms.utils import huber_loss
 from rlinf.scheduler import Worker
 
 
@@ -266,6 +267,129 @@ def compute_uninavid_actor_critic_loss(
     scaled_critic_loss = float(value_loss_coeff) * critic_loss
     metrics["critic/value_loss_scaled"] = scaled_critic_loss.detach()
     return actor_loss + scaled_critic_loss, metrics
+
+
+def _per_chunk_masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if values.shape != mask.shape:
+        raise ValueError("Per-chunk values and mask must have identical shapes.")
+    flat_values = values.reshape(values.shape[0], -1)
+    flat_mask = mask.to(torch.bool).reshape(mask.shape[0], -1)
+    counts = flat_mask.sum(dim=1)
+    sums = torch.where(flat_mask, flat_values, 0.0).sum(dim=1)
+    return torch.where(counts > 0, sums / counts.clamp_min(1), 0.0)
+
+
+def compute_uninavid_per_chunk_ppo_losses(
+    *,
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    actor_loss_mask: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    clip_ratio_c: Optional[float] = None,
+    clip_log_ratio_min: Optional[float] = None,
+    clip_log_ratio_max: Optional[float] = None,
+    values: Optional[torch.Tensor] = None,
+    returns: Optional[torch.Tensor] = None,
+    prev_values: Optional[torch.Tensor] = None,
+    critic_loss_mask: Optional[torch.Tensor] = None,
+    value_clip: Optional[float] = None,
+    huber_delta: Optional[float] = None,
+    entropy: Optional[torch.Tensor] = None,
+) -> dict[str, torch.Tensor]:
+    """Return one actor/critic/entropy/KL value for every compacted chunk."""
+    if not (
+        logprobs.shape
+        == old_logprobs.shape
+        == advantages.shape
+        == actor_loss_mask.shape
+    ):
+        raise ValueError("Weighted UniNaVid actor inputs must have identical shapes.")
+    log_ratio = logprobs.float() - old_logprobs.float()
+    if clip_log_ratio_min is not None:
+        log_ratio = log_ratio.clamp(min=clip_log_ratio_min)
+    if clip_log_ratio_max is not None:
+        log_ratio = log_ratio.clamp(max=clip_log_ratio_max)
+    ratio = torch.exp(log_ratio)
+    clipped_ratio = ratio.clamp(1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    policy_loss = torch.maximum(
+        -advantages.float() * ratio, -advantages.float() * clipped_ratio
+    )
+    if clip_ratio_c is not None:
+        if clip_ratio_c <= 1.0:
+            raise ValueError("clip_ratio_c must be greater than 1.")
+        dual_clip = torch.sign(advantages) * clip_ratio_c * advantages
+        policy_loss = torch.minimum(policy_loss, dual_clip)
+
+    per_chunk = {
+        "actor_loss": _per_chunk_masked_mean(policy_loss, actor_loss_mask),
+        "approx_kl": _per_chunk_masked_mean(-log_ratio, actor_loss_mask),
+        "clip_fraction": _per_chunk_masked_mean(
+            (ratio != clipped_ratio).float(), actor_loss_mask
+        ),
+    }
+    if entropy is not None:
+        per_chunk["entropy"] = _per_chunk_masked_mean(entropy, actor_loss_mask)
+    else:
+        per_chunk["entropy"] = torch.zeros_like(per_chunk["actor_loss"])
+
+    critic_inputs = (values, returns, prev_values, critic_loss_mask)
+    if all(value is None for value in critic_inputs):
+        per_chunk["critic_loss"] = torch.zeros_like(per_chunk["actor_loss"])
+        return per_chunk
+    if any(value is None for value in critic_inputs):
+        raise ValueError("Weighted critic inputs must be provided together.")
+    if value_clip is None or huber_delta is None:
+        raise ValueError("Weighted critic loss requires value_clip and huber_delta.")
+    if not (
+        values.shape == returns.shape == prev_values.shape == critic_loss_mask.shape
+    ):
+        raise ValueError("Weighted UniNaVid critic inputs must have identical shapes.")
+    clipped_values = prev_values + (values - prev_values).clamp(-value_clip, value_clip)
+    value_loss = torch.maximum(
+        huber_loss(returns - values, huber_delta),
+        huber_loss(returns - clipped_values, huber_delta),
+    )
+    per_chunk["critic_loss"] = _per_chunk_masked_mean(value_loss, critic_loss_mask)
+    return per_chunk
+
+
+def aggregate_uninavid_weighted_ppo_losses(
+    per_chunk_losses: Mapping[str, torch.Tensor],
+    *,
+    train_chunk_weights: torch.Tensor,
+    value_loss_coeff: float = 1.0,
+    entropy_bonus: float = 0.0,
+    critic_warmup: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Aggregate fixed chunk weights; microbatch losses are intended to be summed."""
+    actor_loss = per_chunk_losses["actor_loss"]
+    weights = train_chunk_weights.to(device=actor_loss.device, dtype=actor_loss.dtype)
+    if weights.shape != actor_loss.shape:
+        raise ValueError("train_chunk_weights must have one value per chunk.")
+    weighted_actor = (weights * actor_loss).sum()
+    if critic_warmup:
+        weighted_actor = weighted_actor * 0.0
+    weighted_critic = (weights * per_chunk_losses["critic_loss"]).sum()
+    weighted_entropy = (weights * per_chunk_losses["entropy"]).sum()
+    total_loss = (
+        weighted_actor
+        + float(value_loss_coeff) * weighted_critic
+        - float(entropy_bonus) * weighted_entropy
+    )
+    metrics = {
+        "actor/policy_loss": weighted_actor.detach(),
+        "critic/value_loss": weighted_critic.detach(),
+        "actor/entropy_loss": weighted_entropy.detach(),
+        "actor/approx_kl": (weights * per_chunk_losses["approx_kl"]).sum().detach(),
+        "actor/clip_fraction": (weights * per_chunk_losses["clip_fraction"])
+        .sum()
+        .detach(),
+        "actor/total_loss": total_loss.detach(),
+        "curriculum/train_weight_mass": weights.sum().detach(),
+    }
+    return total_loss, metrics
 
 
 def _zero_actor_diagnostics() -> dict[str, float]:
