@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 
 from rlinf.data.embodied_io_struct import EpochTrajectoryBatch, RolloutEpochSpec
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -176,3 +177,15 @@ def test_actor_curriculum_advantage_compacts_without_fixed_t_reshape(monkeypatch
 
     assert actor.curriculum_compacted_batch["advantages"].shape[0] == 2
     assert metrics["curriculum/compaction_keep_ratio"] == 1.0
+
+
+def test_env_curriculum_rates_are_identical_global_rank_means():
+    success, timeout = EnvWorker._mean_curriculum_rates(
+        [
+            {"success": {"B0": 0.25, "B1": 0.5}, "timeout": {"B0": 0.5}},
+            {"success": {"B0": 0.75, "B1": 0.0}, "timeout": {"B0": 0.0}},
+        ]
+    )
+
+    assert success == {"B0": 0.5, "B1": 0.25}
+    assert timeout == {"B0": 0.25}

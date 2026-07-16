@@ -252,6 +252,22 @@ class EnvWorker(Worker):
         for env, env_state in zip(self.env_list, state["envs"]):
             env.load_curriculum_state(env_state)
 
+    @staticmethod
+    def _mean_curriculum_rates(
+        gathered_rates: list[dict[str, dict[str, float]]],
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        def mean_field(field: str) -> dict[str, float]:
+            values_by_bucket = defaultdict(list)
+            for rates in gathered_rates:
+                for bucket_id, value in rates[field].items():
+                    values_by_bucket[bucket_id].append(float(value))
+            return {
+                bucket_id: sum(values) / len(values)
+                for bucket_id, values in values_by_bucket.items()
+            }
+
+        return mean_field("success"), mean_field("timeout")
+
     def update_env_cfg(self):
         if not self.only_eval:
             # train env
@@ -1547,6 +1563,12 @@ class EnvWorker(Worker):
                 bucket_id: sum(values) / len(values)
                 for bucket_id, values in bucket_timeout.items()
             }
+            gathered_rates = [None] * self._world_size
+            torch.distributed.all_gather_object(
+                gathered_rates,
+                {"success": success_rates, "timeout": timeout_rates},
+            )
+            success_rates, timeout_rates = self._mean_curriculum_rates(gathered_rates)
             self._curriculum_scheduler.record_bucket_metrics(
                 success_rates=success_rates,
                 timeout_rates=timeout_rates,
