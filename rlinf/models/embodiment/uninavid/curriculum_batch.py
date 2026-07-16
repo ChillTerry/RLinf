@@ -71,6 +71,26 @@ def compute_valid_action_slots(dones: torch.Tensor) -> torch.Tensor:
     return ~prior_done
 
 
+def combine_parsed_and_executed_action_slots(
+    *,
+    action_token_slot_ids: torch.Tensor,
+    executed_action_slots: torch.Tensor,
+) -> torch.Tensor:
+    """Exclude synthetic action padding that has no generated action token."""
+    if action_token_slot_ids.shape[:-1] != executed_action_slots.shape[:-1]:
+        raise ValueError("Action-token and executed-slot batch dimensions must match.")
+    valid_token_slots = (action_token_slot_ids >= 0) & (
+        action_token_slot_ids < executed_action_slots.shape[-1]
+    )
+    parsed_slot_counts = torch.zeros_like(executed_action_slots, dtype=torch.long)
+    parsed_slot_counts.scatter_add_(
+        -1,
+        action_token_slot_ids.clamp(min=0, max=executed_action_slots.shape[-1] - 1),
+        valid_token_slots.to(torch.long),
+    )
+    return executed_action_slots.to(torch.bool) & (parsed_slot_counts > 0)
+
+
 def compute_truncation_aware_gae(
     *,
     rewards: torch.Tensor,

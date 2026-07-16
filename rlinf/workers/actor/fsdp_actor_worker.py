@@ -1493,6 +1493,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def _compute_curriculum_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         from rlinf.models.embodiment.uninavid.curriculum_batch import (
             ProcessedEpochBatch,
+            combine_parsed_and_executed_action_slots,
             compact_curriculum_epochs,
             compute_grpo_epoch_advantages,
             compute_truncation_aware_gae,
@@ -1522,6 +1523,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 raise KeyError(
                     "Curriculum rollout requires action-slot execution metadata."
                 )
+            valid_action_slots = combine_parsed_and_executed_action_slots(
+                action_token_slot_ids=action_token_slot_ids,
+                executed_action_slots=valid_action_slots,
+            )
             token_loss_mask = _build_uninavid_action_token_mask(
                 logprobs=epoch.prev_logprobs.flatten(0, 1),
                 response_mask=epoch.forward_inputs["response_mask"].flatten(0, 1),
@@ -1566,6 +1571,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "Habitat UniNaVid curriculum supports only GAE and GRPO."
                 )
 
+            forward_inputs = dict(epoch.forward_inputs)
+            forward_inputs["valid_action_slots"] = valid_action_slots
             fields = {
                 "actions": epoch.actions,
                 "prev_logprobs": epoch.prev_logprobs,
@@ -1573,7 +1580,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "versions": epoch.versions,
                 "loss_mask": token_loss_mask,
                 "critic_loss_mask": critic_loss_mask,
-                "forward_inputs": epoch.forward_inputs,
+                "forward_inputs": forward_inputs,
             }
             if epoch.prev_values is not None:
                 fields["prev_values"] = epoch.prev_values[:-1]

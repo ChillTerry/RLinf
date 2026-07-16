@@ -4,6 +4,7 @@ import torch
 from rlinf.data.embodied_io_struct import RolloutEpochSpec
 from rlinf.models.embodiment.uninavid.curriculum_batch import (
     ProcessedEpochBatch,
+    combine_parsed_and_executed_action_slots,
     compact_curriculum_epochs,
     compute_grpo_epoch_advantages,
     compute_truncation_aware_gae,
@@ -37,6 +38,17 @@ def test_valid_action_slots_keep_terminal_action_and_drop_suffix():
         [True, True, True, False],
         [True, True, True, True],
     ]
+
+
+def test_effective_action_slots_drop_synthetic_no_op_without_tokens():
+    effective = combine_parsed_and_executed_action_slots(
+        action_token_slot_ids=torch.tensor(
+            [[-1, 0, -1, 1, -1, -1]],
+        ),
+        executed_action_slots=torch.tensor([[True, True, True, True]]),
+    )
+
+    assert effective.tolist() == [[True, True, False, False]]
 
 
 def test_termination_gae_does_not_bootstrap_true_terminal():
