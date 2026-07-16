@@ -122,8 +122,23 @@ def build_action_token_mask(
     response_ids: list[int] | torch.Tensor,
     num_action_chunks: int,
 ) -> list[bool]:
+    return [
+        slot_id >= 0
+        for slot_id in build_action_token_slot_ids(
+            output_text,
+            response_ids,
+            num_action_chunks,
+        )
+    ]
+
+
+def build_action_token_slot_ids(
+    output_text: str,
+    response_ids: list[int] | torch.Tensor,
+    num_action_chunks: int,
+) -> list[int]:
     action_names = parse_uninavid_action_names(output_text, num_action_chunks)
-    mask = [False] * len(response_ids)
+    slot_ids = [-1] * len(response_ids)
     search_start = 0
     response_id_list = (
         response_ids.detach().cpu().tolist()
@@ -131,15 +146,15 @@ def build_action_token_mask(
         else list(response_ids)
     )
 
-    for action in action_names:
+    for action_slot, action in enumerate(action_names):
         token_ids = ACTION_TOKEN_IDS[action]
         for index in range(search_start, len(response_id_list)):
             if response_id_list[index] in token_ids:
-                mask[index] = True
+                slot_ids[index] = action_slot
                 search_start = index + 1
                 break
 
-    return mask
+    return slot_ids
 
 
 def count_parsed_action_chars(output_text: str, num_action_chunks: int) -> int:

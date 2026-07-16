@@ -28,6 +28,8 @@ def _build_uninavid_action_token_mask(
     response_mask: torch.Tensor,
     action_token_mask: Optional[torch.Tensor] = None,
     sample_loss_mask: Optional[torch.Tensor] = None,
+    action_token_slot_ids: Optional[torch.Tensor] = None,
+    valid_action_slots: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if logprobs.dim() != 3 or logprobs.shape[-1] != 1:
         raise ValueError("UniNaVid logprobs must have shape [batch, response_len, 1].")
@@ -43,6 +45,29 @@ def _build_uninavid_action_token_mask(
                 "UniNaVid action_token_mask must have shape [batch, response_len]."
             )
         mask = mask & action_token_mask.to(torch.bool).unsqueeze(-1)
+
+    if (action_token_slot_ids is None) != (valid_action_slots is None):
+        raise ValueError(
+            "action_token_slot_ids and valid_action_slots must be provided together."
+        )
+    if action_token_slot_ids is not None:
+        if action_token_slot_ids.shape != response_mask.shape:
+            raise ValueError(
+                "action_token_slot_ids must have shape [batch, response_len]."
+            )
+        if (
+            valid_action_slots.dim() != 2
+            or valid_action_slots.shape[0] != mask.shape[0]
+        ):
+            raise ValueError(
+                "valid_action_slots must have shape [batch, num_action_chunks]."
+            )
+        slot_ids = action_token_slot_ids.to(device=mask.device, dtype=torch.long)
+        slot_in_range = (slot_ids >= 0) & (slot_ids < valid_action_slots.shape[1])
+        gathered_slots = valid_action_slots.to(
+            device=mask.device, dtype=torch.bool
+        ).gather(1, slot_ids.clamp(min=0, max=valid_action_slots.shape[1] - 1))
+        mask = mask & (slot_in_range & gathered_slots).unsqueeze(-1)
 
     if sample_loss_mask is not None:
         sample_loss_mask = sample_loss_mask.to(torch.bool)
@@ -64,6 +89,8 @@ def aggregate_uninavid_action_logprobs(
     response_mask: torch.Tensor,
     action_token_mask: Optional[torch.Tensor] = None,
     sample_loss_mask: Optional[torch.Tensor] = None,
+    action_token_slot_ids: Optional[torch.Tensor] = None,
+    valid_action_slots: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Aggregate action-token log probabilities into joint action chunks."""
     token_mask = _build_uninavid_action_token_mask(
@@ -71,6 +98,8 @@ def aggregate_uninavid_action_logprobs(
         response_mask=response_mask,
         action_token_mask=action_token_mask,
         sample_loss_mask=sample_loss_mask,
+        action_token_slot_ids=action_token_slot_ids,
+        valid_action_slots=valid_action_slots,
     )
     chunk_logprobs = torch.where(token_mask, logprobs.float(), 0.0).sum(
         dim=1,
@@ -89,6 +118,8 @@ def prepare_uninavid_token_level_loss_inputs(
     action_token_mask: Optional[torch.Tensor] = None,
     sample_loss_mask: Optional[torch.Tensor] = None,
     entropy: Optional[torch.Tensor] = None,
+    action_token_slot_ids: Optional[torch.Tensor] = None,
+    valid_action_slots: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     if old_logprobs.shape != logprobs.shape:
         raise ValueError("UniNaVid old_logprobs must match logprobs shape.")
@@ -100,6 +131,8 @@ def prepare_uninavid_token_level_loss_inputs(
         response_mask=response_mask,
         action_token_mask=action_token_mask,
         sample_loss_mask=sample_loss_mask,
+        action_token_slot_ids=action_token_slot_ids,
+        valid_action_slots=valid_action_slots,
     )
 
     if advantages.dim() == 1:
@@ -140,6 +173,8 @@ def prepare_uninavid_chunk_level_loss_inputs(
     action_token_mask: Optional[torch.Tensor] = None,
     sample_loss_mask: Optional[torch.Tensor] = None,
     entropy: Optional[torch.Tensor] = None,
+    action_token_slot_ids: Optional[torch.Tensor] = None,
+    valid_action_slots: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare PPO inputs for a joint action represented by multiple tokens."""
     if old_logprobs.shape != logprobs.shape:
@@ -150,12 +185,16 @@ def prepare_uninavid_chunk_level_loss_inputs(
         response_mask=response_mask,
         action_token_mask=action_token_mask,
         sample_loss_mask=sample_loss_mask,
+        action_token_slot_ids=action_token_slot_ids,
+        valid_action_slots=valid_action_slots,
     )
     old_chunk_logprobs, old_chunk_loss_mask = aggregate_uninavid_action_logprobs(
         logprobs=old_logprobs,
         response_mask=response_mask,
         action_token_mask=action_token_mask,
         sample_loss_mask=sample_loss_mask,
+        action_token_slot_ids=action_token_slot_ids,
+        valid_action_slots=valid_action_slots,
     )
     if not torch.equal(chunk_loss_mask, old_chunk_loss_mask):
         raise RuntimeError("UniNaVid new and old chunk loss masks must match.")
@@ -185,6 +224,8 @@ def prepare_uninavid_chunk_level_loss_inputs(
             response_mask=response_mask,
             action_token_mask=action_token_mask,
             sample_loss_mask=sample_loss_mask,
+            action_token_slot_ids=action_token_slot_ids,
+            valid_action_slots=valid_action_slots,
         )
         prepared["entropy"] = chunk_entropy
     return prepared

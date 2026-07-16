@@ -18,7 +18,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from rlinf.models.embodiment.uninavid.nav_rollout import select_slot_rgb_frames
+from rlinf.models.embodiment.uninavid.nav_rollout import (
+    build_action_token_slot_ids,
+    select_slot_rgb_frames,
+)
 from rlinf.models.embodiment.uninavid.uninavid_action_model import (
     UniNaVidForActionPrediction,
 )
@@ -54,6 +57,16 @@ def test_select_slot_rgb_frames_requires_rgb_frame_history_lengths():
             {"rgb_frame_history": torch.zeros((1, 1, 1, 1, 1), dtype=torch.uint8)},
             0,
         )
+
+
+def test_action_token_slot_ids_stop_before_synthetic_suffix():
+    slot_ids = build_action_token_slot_ids(
+        "forward, left, stop, right",
+        [99, 6375, 98, 1563, 9847, 1492],
+        num_action_chunks=4,
+    )
+
+    assert slot_ids == [-1, 0, -1, 1, 2, -1]
 
 
 class _Tokenizer:
@@ -149,9 +162,11 @@ def test_uninavid_response_token_stats_logging_writes_jsonl(tmp_path, monkeypatc
         num_action_chunks=4,
     )
 
-    lines = (tmp_path / "response_stats_rank_6.jsonl").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    lines = (
+        (tmp_path / "response_stats_rank_6.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
     records = [json.loads(line) for line in lines]
 
     assert records[0] == {
@@ -360,6 +375,7 @@ def test_uninavid_train_rollout_uses_generation_scores_without_recompute(monkeyp
         "response_ids",
         "response_mask",
         "action_token_mask",
+        "action_token_slot_ids",
         "action",
         "parsed_action_char_count",
         "response_alpha_char_count",

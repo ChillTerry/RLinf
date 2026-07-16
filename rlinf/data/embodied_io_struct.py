@@ -115,6 +115,7 @@ class EnvOutput:
     terminations: Optional[torch.Tensor] = None  # [B]
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
+    valid_action_slots: Optional[torch.Tensor] = None  # [B, num_action_chunks]
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
@@ -139,6 +140,11 @@ class EnvOutput:
         )
         self.rewards = (
             self.rewards.cpu().contiguous() if self.rewards is not None else None
+        )
+        self.valid_action_slots = (
+            self.valid_action_slots.cpu().contiguous()
+            if self.valid_action_slots is not None
+            else None
         )
         self.intervene_actions = (
             self.intervene_actions.cpu().contiguous()
@@ -282,6 +288,7 @@ class EnvOutput:
         merged_terminations = _merge_optional_tensor_field("terminations")
         merged_truncations = _merge_optional_tensor_field("truncations")
         merged_rewards = _merge_optional_tensor_field("rewards")
+        merged_valid_action_slots = _merge_optional_tensor_field("valid_action_slots")
         merged_intervene_actions = _merge_optional_tensor_field(
             "intervene_actions",
             allow_partial_none=True,
@@ -300,6 +307,7 @@ class EnvOutput:
             terminations=merged_terminations,
             truncations=merged_truncations,
             rewards=merged_rewards,
+            valid_action_slots=merged_valid_action_slots,
             intervene_actions=merged_intervene_actions,
             intervene_flags=merged_intervene_flags,
         ).to_dict()
@@ -317,6 +325,7 @@ class EnvOutput:
         env_output_dict["terminations"] = self.terminations
         env_output_dict["truncations"] = self.truncations
         env_output_dict["rewards"] = self.rewards
+        env_output_dict["valid_action_slots"] = self.valid_action_slots
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
 

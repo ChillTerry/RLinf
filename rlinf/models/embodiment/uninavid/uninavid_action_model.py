@@ -41,6 +41,7 @@ from rlinf.models.embodiment.uninavid.model.uninavid_arch import (
 from rlinf.models.embodiment.uninavid.nav_rollout import (
     UniNaVidNavCache,
     build_action_token_mask,
+    build_action_token_slot_ids,
     build_navigation_prompt,
     count_parsed_action_chars,
     count_response_alpha_chars,
@@ -434,6 +435,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
         )
         action_chunks = []
         action_token_masks = []
+        action_token_slot_ids_list = []
         parsed_action_char_counts = []
         response_alpha_char_counts = []
         for output_text, response_id in zip(output_texts, response_ids):
@@ -453,12 +455,24 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                     device=response_ids.device,
                 )
             )
+            action_token_slot_ids_list.append(
+                torch.tensor(
+                    build_action_token_slot_ids(
+                        output_text,
+                        response_id,
+                        num_action_chunks,
+                    ),
+                    dtype=torch.long,
+                    device=response_ids.device,
+                )
+            )
             parsed_action_char_counts.append(
                 count_parsed_action_chars(output_text, num_action_chunks)
             )
             response_alpha_char_counts.append(count_response_alpha_chars(output_text))
         actions = torch.stack(action_chunks, dim=0)
         action_token_mask = torch.stack(action_token_masks, dim=0)
+        action_token_slot_ids = torch.stack(action_token_slot_ids_list, dim=0)
         max_new_tokens = generation_kwargs.get("max_new_tokens")
         if max_new_tokens is None:
             response_len = int(response_ids.shape[1])
@@ -521,9 +535,28 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 ],
                 dim=1,
             )
+            action_token_slot_ids = torch.cat(
+                [
+                    action_token_slot_ids,
+                    torch.full(
+                        (
+                            action_token_slot_ids.shape[0],
+                            response_len - action_token_slot_ids.shape[1],
+                        ),
+                        -1,
+                        dtype=torch.long,
+                        device=action_token_slot_ids.device,
+                    ),
+                ],
+                dim=1,
+            )
         if action_token_mask.shape[1] != response_len:
             raise ValueError(
                 "UniNaVid action token mask length must match response length."
+            )
+        if action_token_slot_ids.shape != action_token_mask.shape:
+            raise ValueError(
+                "UniNaVid action token slot ids must match response length."
             )
         if (
             overlong_train_metadata_mask is not None
@@ -536,6 +569,10 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             action_token_mask = action_token_mask.masked_fill(
                 overlong_train_metadata_mask[:, None],
                 False,
+            )
+            action_token_slot_ids = action_token_slot_ids.masked_fill(
+                overlong_train_metadata_mask[:, None],
+                -1,
             )
         prev_values = None
         if calculate_values:
@@ -570,6 +607,7 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 "response_ids": response_ids.detach(),
                 "response_mask": response_mask.detach(),
                 "action_token_mask": action_token_mask.detach(),
+                "action_token_slot_ids": action_token_slot_ids.detach(),
                 "action": actions.reshape(actions.shape[0], -1).detach(),
                 "parsed_action_char_count": torch.tensor(
                     parsed_action_char_counts,
@@ -735,6 +773,11 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             )
             records.append(
                 {
+                    "split": self._get_env_obs_list_value(
+                        env_obs,
+                        "split",
+                        slot_id,
+                    ),
                     "mode": mode,
                     "rank": rank,
                     "global_step": global_step,

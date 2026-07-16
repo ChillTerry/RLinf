@@ -2,6 +2,7 @@ import torch
 
 from rlinf.models.embodiment.uninavid.rl_loss import (
     compute_uninavid_actor_critic_loss,
+    prepare_uninavid_token_level_loss_inputs,
 )
 from rlinf.utils.utils import masked_mean
 
@@ -47,3 +48,18 @@ def test_uninavid_actor_critic_loss_uses_token_actor_mask_and_chunk_critic_mask(
     assert "actor/policy_loss" in metrics
     assert "critic/value_loss" in metrics
 
+
+def test_uninavid_token_loss_masks_action_tokens_after_executed_prefix():
+    prepared = prepare_uninavid_token_level_loss_inputs(
+        logprobs=torch.zeros(1, 6, 1),
+        old_logprobs=torch.zeros(1, 6, 1),
+        advantages=torch.ones(1, 1, 1),
+        response_mask=torch.ones(1, 6, dtype=torch.bool),
+        action_token_mask=torch.tensor([[False, True, False, True, True, True]]),
+        action_token_slot_ids=torch.tensor([[-1, 0, -1, 1, 2, 3]]),
+        valid_action_slots=torch.tensor([[True, True, True, False]]),
+    )
+
+    assert prepared["loss_mask"].squeeze(-1).tolist() == [
+        [False, True, False, True, True, False]
+    ]
