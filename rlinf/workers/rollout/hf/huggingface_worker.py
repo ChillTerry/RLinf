@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
+    RolloutEpochSpec,
     RolloutResult,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
@@ -85,6 +86,14 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
+        # Rollout owns the generation loop, which cannot be varied from the
+        # model class; isolate that shared behavior behind the full feature gate.
+        self.curriculum_enabled = bool(
+            not self.cfg.runner.only_eval
+            and self.cfg.env.train.get("env_type") == "habitat"
+            and self.cfg.actor.model.get("model_type") == "uninavid"
+            and self.cfg.env.train.get("action_length_bucketing", False)
+        )
 
         weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer", default=None)
         assert weight_syncer_cfg is not None, (
@@ -410,11 +419,23 @@ class MultiStepRolloutWorker(Worker):
         self.torch_platform.empty_cache()
 
     @Worker.timer("generate_one_epoch")
-    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
+    async def generate_one_epoch(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        *,
+        n_chunk_steps: int | None = None,
+        first_env_outputs: list[dict[str, Any]] | None = None,
+    ):
         self.update_dagger_beta()
-        for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
-                env_output = await self.recv_env_output(input_channel)
+        if n_chunk_steps is None:
+            n_chunk_steps = self.n_train_chunk_steps
+        for chunk_step in range(n_chunk_steps):
+            for stage_id in range(self.num_pipeline_stages):
+                if chunk_step == 0 and first_env_outputs is not None:
+                    env_output = first_env_outputs[stage_id]
+                else:
+                    env_output = await self.recv_env_output(input_channel)
                 actions, result = self.predict(env_output["obs"])
 
                 save_flags = None
@@ -471,7 +492,35 @@ class MultiStepRolloutWorker(Worker):
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            await self.generate_one_epoch(input_channel, output_channel)
+            if bool(getattr(self, "curriculum_enabled", False)):
+                first_env_outputs = [
+                    await self.recv_env_output(input_channel)
+                    for _ in range(self.num_pipeline_stages)
+                ]
+                epoch_specs = [
+                    env_output.get("epoch_spec") for env_output in first_env_outputs
+                ]
+                if any(not isinstance(spec, RolloutEpochSpec) for spec in epoch_specs):
+                    raise TypeError(
+                        "Curriculum rollout bootstrap must carry RolloutEpochSpec."
+                    )
+                if any(spec != epoch_specs[0] for spec in epoch_specs[1:]):
+                    raise ValueError(
+                        "All pipeline stages must use the same rollout epoch spec."
+                    )
+                epoch_spec = epoch_specs[0]
+                if epoch_spec.policy_version != int(self.version):
+                    raise ValueError(
+                        "Rollout epoch policy_version does not match applied weights."
+                    )
+                await self.generate_one_epoch(
+                    input_channel,
+                    output_channel,
+                    n_chunk_steps=epoch_spec.n_chunk_steps,
+                    first_env_outputs=first_env_outputs,
+                )
+            else:
+                await self.generate_one_epoch(input_channel, output_channel)
 
         if self.enable_offload:
             self.offload_model()
@@ -605,7 +654,21 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
-        return {"obs": merged_obs, "final_obs": merged_final_obs}
+        merged = {"obs": merged_obs, "final_obs": merged_final_obs}
+        epoch_specs = [
+            obs_batch.get("epoch_spec")
+            for obs_batch in obs_batches
+            if "epoch_spec" in obs_batch
+        ]
+        if epoch_specs:
+            if len(epoch_specs) != len(obs_batches) or any(
+                spec != epoch_specs[0] for spec in epoch_specs[1:]
+            ):
+                raise ValueError(
+                    "Merged env shards must carry one identical rollout epoch spec."
+                )
+            merged["epoch_spec"] = epoch_specs[0]
+        return merged
 
     def send_chunk_actions(
         self,

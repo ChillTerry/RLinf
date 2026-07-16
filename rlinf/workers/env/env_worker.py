@@ -25,6 +25,7 @@ from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
     EmbodiedRolloutResult,
     EnvOutput,
+    RolloutEpochSpec,
     RolloutResult,
     Trajectory,
 )
@@ -58,6 +59,17 @@ class EnvWorker(Worker):
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+        # Dynamic epoch transport crosses worker boundaries, so keep the shared
+        # worker branch isolated behind the explicit Habitat + UniNaVid gate.
+        self.curriculum_enabled = bool(
+            not self.cfg.runner.only_eval
+            and self.cfg.env.train.get("env_type") == "habitat"
+            and self.cfg.actor.model.get("model_type") == "uninavid"
+            and self.cfg.env.train.get("action_length_bucketing", False)
+        )
+        self._curriculum_scheduler = None
+        self._habitat_train_plan = None
+        self._curriculum_epoch_done = []
         self.eval_episode_action_metrics: dict[int, dict[str, torch.Tensor]] = {}
         self.rollout_epoch = self.cfg.algorithm.get("rollout_epoch", 1)
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -158,6 +170,87 @@ class EnvWorker(Worker):
 
         if not self.only_eval:
             self._init_env()
+            if self.curriculum_enabled:
+                self._init_curriculum_scheduler()
+
+    def _init_curriculum_scheduler(self) -> None:
+        from rlinf.envs.habitat.extensions.bucket_scheduler import (
+            BucketCurriculumScheduler,
+            CurriculumStage,
+        )
+
+        if self._habitat_train_plan is None:
+            raise RuntimeError("Habitat curriculum requires a global bucket plan.")
+        bucket_ids = tuple(self._habitat_train_plan["bucket_ids"])
+        if self.cfg.env.train.get("bucket_curriculum_enabled", False):
+            stages = tuple(
+                CurriculumStage.from_config(stage)
+                for stage in self.cfg.env.train.curriculum_stages
+            )
+        else:
+            stages = (
+                CurriculumStage(
+                    active_bucket_count=len(bucket_ids),
+                    weights=tuple([1.0 / len(bucket_ids)] * len(bucket_ids)),
+                ),
+            )
+        self._curriculum_scheduler = BucketCurriculumScheduler(
+            bucket_ids=bucket_ids,
+            stages=stages,
+            rollout_epoch=int(self.rollout_epoch),
+            curriculum_interval=int(self.cfg.env.train.get("curriculum_interval", 1)),
+            success_threshold=self.cfg.env.train.get(
+                "curriculum_success_threshold", None
+            ),
+            seed=int(self.cfg.env.train.bucket_schedule_seed),
+        )
+
+    def _build_curriculum_epoch_specs(self) -> list[RolloutEpochSpec]:
+        if self._curriculum_scheduler is None:
+            raise RuntimeError("Curriculum scheduler is not initialized.")
+        bucket_order = self._curriculum_scheduler.build_epoch_bucket_order()
+        weights = dict(
+            zip(
+                self._curriculum_scheduler.active_bucket_ids,
+                self._curriculum_scheduler.stage.weights,
+            )
+        )
+        specs = []
+        for epoch_index, bucket_id in enumerate(bucket_order):
+            bucket_plan = self._habitat_train_plan["bucket_plans"][bucket_id]
+            specs.append(
+                RolloutEpochSpec(
+                    epoch_index=epoch_index,
+                    bucket_id=bucket_id,
+                    horizon_steps=int(bucket_plan["horizon_steps"]),
+                    n_chunk_steps=int(bucket_plan["n_chunk_steps"]),
+                    curriculum_weight=float(weights[bucket_id]),
+                    policy_version=int(getattr(self, "global_step", 0)),
+                )
+            )
+        return specs
+
+    def set_global_step(self, global_step: int) -> None:
+        self.global_step = int(global_step)
+
+    def get_curriculum_state(self) -> dict | None:
+        if not self.curriculum_enabled:
+            return None
+        return {
+            "scheduler": self._curriculum_scheduler.state_dict(),
+            "envs": [env.get_curriculum_state() for env in self.env_list],
+        }
+
+    def load_curriculum_state(self, state: dict | list[dict]) -> None:
+        if not self.curriculum_enabled:
+            raise RuntimeError("Cannot load curriculum state when feature is disabled.")
+        if isinstance(state, list):
+            state = state[self._rank]
+        self._curriculum_scheduler.load_state_dict(state["scheduler"])
+        if len(state["envs"]) != len(self.env_list):
+            raise ValueError("Curriculum checkpoint env-stage count does not match.")
+        for env, env_state in zip(self.env_list, state["envs"]):
+            env.load_curriculum_state(env_state)
 
     def update_env_cfg(self):
         if not self.only_eval:
@@ -254,6 +347,8 @@ class EnvWorker(Worker):
             groups=[(self._group_name, list(range(self._world_size)))],
             src=(self._group_name, 0),
         )
+        if bool(env_cfg.get("action_length_bucketing", False)):
+            self._habitat_train_plan = habitat_plan
 
         override_cfg = OmegaConf.to_container(env_cfg, resolve=True)
         override_cfg["global_plan"] = habitat_plan
@@ -462,6 +557,18 @@ class EnvWorker(Worker):
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
+        valid_action_slots = None
+        if self.curriculum_enabled:
+            from rlinf.models.embodiment.uninavid.curriculum_batch import (
+                compute_valid_action_slots,
+            )
+
+            valid_action_slots = compute_valid_action_slots(chunk_dones)
+            previous_done = self._curriculum_epoch_done[stage_id]
+            valid_action_slots &= ~previous_done.unsqueeze(-1)
+            self._curriculum_epoch_done[stage_id] = previous_done | chunk_dones.any(
+                dim=-1
+            )
         final_obs = (
             self._build_chunk_final_obs(obs_list, infos_list)
             if self.use_external_reward_model
@@ -504,6 +611,7 @@ class EnvWorker(Worker):
             dones=chunk_dones,
             terminations=chunk_terminations,
             truncations=chunk_truncations,
+            valid_action_slots=valid_action_slots,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
         )
@@ -1085,22 +1193,32 @@ class EnvWorker(Worker):
         return env_outputs
 
     def _send_train_bootstrap(
-        self, rollout_channel: Channel, env_outputs: list[EnvOutput]
+        self,
+        rollout_channel: Channel,
+        env_outputs: list[EnvOutput],
+        epoch_spec: RolloutEpochSpec | None = None,
     ) -> None:
         for stage_id in range(self.stage_num):
             env_output: EnvOutput = env_outputs[stage_id]
             env_batch = env_output.to_dict()
+            payload = {
+                "obs": env_batch["obs"],
+                "final_obs": env_batch["final_obs"],
+            }
+            if epoch_spec is not None:
+                payload["epoch_spec"] = epoch_spec
             self.send_env_batch(
                 rollout_channel,
-                {
-                    "obs": env_batch["obs"],
-                    "final_obs": env_batch["final_obs"],
-                },
+                payload,
             )
 
-    def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
+    def _bootstrap_and_send_train(
+        self,
+        rollout_channel: Channel,
+        epoch_spec: RolloutEpochSpec | None = None,
+    ) -> list[EnvOutput]:
         env_outputs = self.bootstrap_step()
-        self._send_train_bootstrap(rollout_channel, env_outputs)
+        self._send_train_bootstrap(rollout_channel, env_outputs, epoch_spec)
         return env_outputs
 
     def prefetch_train_bootstrap(self, rollout_channel: Channel) -> None:
@@ -1131,9 +1249,8 @@ class EnvWorker(Worker):
 
     def _should_send_uninavid_habitat_grpo_env_info(self) -> bool:
         return (
-            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.UNINAVID
-            and SupportedEnvType(self.cfg.env.train.env_type)
-            == SupportedEnvType.HABITAT
+            self.cfg.actor.model.model_type == SupportedModel.UNINAVID.value
+            and self.cfg.env.train.env_type == SupportedEnvType.HABITAT.value
             and self.cfg.algorithm.adv_type == "grpo"
             and self.cfg.algorithm.get("filter_rewards", False)
         )
@@ -1180,6 +1297,21 @@ class EnvWorker(Worker):
         for trajectory in trajectories:
             channel.put(trajectory, async_op=True)
 
+    async def send_curriculum_rollout_trajectories(
+        self,
+        epoch_results: list[tuple[RolloutEpochSpec, EmbodiedRolloutResult]],
+        channel: Channel,
+    ) -> None:
+        split_epochs = []
+        for spec, result in epoch_results:
+            split_trajectories = result.to_splited_trajectories(self.actor_split_num)
+            split_epochs.append((spec, split_trajectories))
+        for split_index in range(self.actor_split_num):
+            payload = [
+                (spec, trajectories[split_index]) for spec, trajectories in split_epochs
+            ]
+            channel.put(payload, async_op=True)
+
     @Worker.timer("run_interact_once")
     async def _run_interact_once(
         self,
@@ -1190,22 +1322,67 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
-        self.rollout_results: list[EmbodiedRolloutResult] = [
-            EmbodiedRolloutResult(
-                max_episode_length=self.cfg.env.train.max_episode_steps,
-            )
-            for _ in range(self.stage_num)
-        ]
+        curriculum_enabled = bool(getattr(self, "curriculum_enabled", False))
+        epoch_specs = (
+            self._build_curriculum_epoch_specs()
+            if curriculum_enabled
+            else [None] * self.rollout_epoch
+        )
+        if curriculum_enabled:
+            curriculum_results = [
+                [
+                    EmbodiedRolloutResult(max_episode_length=spec.horizon_steps)
+                    for spec in epoch_specs
+                ]
+                for _ in range(self.stage_num)
+            ]
+            self.rollout_results = []
+        else:
+            self.rollout_results = [
+                EmbodiedRolloutResult(
+                    max_episode_length=self.cfg.env.train.max_episode_steps,
+                )
+                for _ in range(self.stage_num)
+            ]
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
+            epoch_spec = epoch_specs[epoch]
+            if curriculum_enabled:
+                for stage_id in range(self.stage_num):
+                    self.env_list[stage_id].activate_bucket(
+                        epoch_spec.bucket_id,
+                        epoch_spec.horizon_steps,
+                    )
+                active_results = [
+                    curriculum_results[stage_id][epoch]
+                    for stage_id in range(self.stage_num)
+                ]
+                self._curriculum_epoch_done = [
+                    torch.zeros(
+                        self.train_num_envs_per_stage,
+                        dtype=torch.bool,
+                    )
+                    for _ in range(self.stage_num)
+                ]
+                env_outputs = self._bootstrap_and_send_train(
+                    rollout_channel, epoch_spec
+                )
+                n_chunk_steps = epoch_spec.n_chunk_steps
+            else:
+                active_results = self.rollout_results
+                n_chunk_steps = self.n_train_chunk_steps
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
+                if curriculum_enabled:
+                    raise RuntimeError(
+                        "Curriculum rollout cannot consume a fixed-horizon prefetch."
+                    )
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
-            else:
+            elif not curriculum_enabled:
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
 
-            for chunk_step_idx in range(self.n_train_chunk_steps):
+            for chunk_step_idx in range(n_chunk_steps):
                 for stage_id in range(self.stage_num):
                     if cooperative_yield:
                         await asyncio.sleep(0)
@@ -1213,7 +1390,7 @@ class EnvWorker(Worker):
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
                     if env_output.intervene_actions is not None:
-                        self.rollout_results[stage_id].update_last_actions(
+                        active_results[stage_id].update_last_actions(
                             env_output.intervene_actions,
                             env_output.intervene_flags,
                         )
@@ -1255,15 +1432,19 @@ class EnvWorker(Worker):
                         terminations=env_output.terminations,
                         rewards=rewards,
                     )
-                    self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                    active_results[stage_id].append_step_result(chunk_step_result)
                     if rollout_result.save_flags is not None:
-                        self.rollout_results[stage_id].mark_last_step_with_flags(
+                        active_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
                         )
 
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
+                    if curriculum_enabled and active_results[stage_id].forward_inputs:
+                        active_results[stage_id].forward_inputs[-1][
+                            "valid_action_slots"
+                        ] = env_output.valid_action_slots
                     env_batch = env_output.to_dict()
                     self.send_env_batch(
                         rollout_channel,
@@ -1278,20 +1459,18 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
-                        self.rollout_results[stage_id].append_transitions(
-                            curr_obs, next_obs
-                        )
+                        active_results[stage_id].append_transitions(curr_obs, next_obs)
 
                     env_outputs[stage_id] = env_output
                     self._append_uninavid_habitat_grpo_env_info(
-                        self.rollout_results[stage_id], env_info, env_output.dones
+                        active_results[stage_id], env_info, env_output.dones
                     )
                     self.record_env_metrics(env_metrics, env_info, epoch)
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
-                    self.rollout_results[stage_id].update_last_actions(
+                    active_results[stage_id].update_last_actions(
                         env_output.intervene_actions,
                         env_output.intervene_flags,
                     )
@@ -1322,16 +1501,70 @@ class EnvWorker(Worker):
                     terminations=env_output.terminations,
                     rewards=rewards,
                 )
-                self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                active_results[stage_id].append_step_result(chunk_step_result)
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
 
         if actor_channel is not None:
             for stage_id in range(self.stage_num):
-                await self.send_rollout_trajectories(
-                    self.rollout_results[stage_id], actor_channel
+                if curriculum_enabled:
+                    await self.send_curriculum_rollout_trajectories(
+                        list(zip(epoch_specs, curriculum_results[stage_id])),
+                        actor_channel,
+                    )
+                else:
+                    await self.send_rollout_trajectories(
+                        self.rollout_results[stage_id], actor_channel
+                    )
+
+        if curriculum_enabled:
+            bucket_success = defaultdict(list)
+            success_values = env_metrics.get("success", [])
+            for epoch_index, spec in enumerate(epoch_specs):
+                if epoch_index < len(success_values):
+                    bucket_success[spec.bucket_id].append(
+                        float(success_values[epoch_index].float().mean())
+                    )
+            bucket_timeout = defaultdict(list)
+            for stage_results in curriculum_results:
+                for spec, result in zip(epoch_specs, stage_results):
+                    truncations = torch.stack(result.truncations, dim=0)
+                    bucket_timeout[spec.bucket_id].append(
+                        float(
+                            truncations.to(torch.bool)
+                            .reshape(truncations.shape[0], truncations.shape[1], -1)
+                            .any(dim=(0, 2))
+                            .float()
+                            .mean()
+                        )
+                    )
+            success_rates = {
+                bucket_id: sum(values) / len(values)
+                for bucket_id, values in bucket_success.items()
+            }
+            timeout_rates = {
+                bucket_id: sum(values) / len(values)
+                for bucket_id, values in bucket_timeout.items()
+            }
+            self._curriculum_scheduler.record_bucket_metrics(
+                success_rates=success_rates,
+                timeout_rates=timeout_rates,
+            )
+            quota_counts = defaultdict(int)
+            for spec in epoch_specs:
+                quota_counts[spec.bucket_id] += 1
+            env_metrics["curriculum/active_bucket_count"].append(
+                torch.tensor([len(self._curriculum_scheduler.active_bucket_ids)])
+            )
+            for bucket_id, quota in quota_counts.items():
+                env_metrics[f"curriculum/rollout_epoch_count/{bucket_id}"].append(
+                    torch.tensor([quota])
                 )
+                env_metrics[f"curriculum/timeout_ratio/{bucket_id}"].append(
+                    torch.tensor([timeout_rates[bucket_id]])
+                )
+            self._curriculum_scheduler.advance()
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()

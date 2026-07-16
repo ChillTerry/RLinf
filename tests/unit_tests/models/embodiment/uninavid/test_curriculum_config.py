@@ -25,10 +25,15 @@ def _config(train_overrides=None):
     return OmegaConf.create(
         {
             "env": {"train": train},
-            "algorithm": {"rollout_epoch": 2},
+            "algorithm": {"rollout_epoch": 2, "adv_type": "gae"},
             "actor": {
                 "seed": 42,
+                "training_backend": "fsdp",
                 "model": {"num_action_chunks": 4},
+            },
+            "runner": {
+                "weight_sync_interval": 1,
+                "overlap_env_bootstrap": False,
             },
         }
     )
@@ -76,3 +81,15 @@ def test_feature_rejects_non_habitat_or_non_uninavid():
         )
     with pytest.raises(ValueError, match=r"Habitat \+ UniNaVid"):
         validate_habitat_uninavid_curriculum_cfg(_config(), SupportedModel.OPENPI)
+
+
+def test_curriculum_rejects_async_weight_versions_and_fixed_horizon_prefetch():
+    cfg = _config()
+    cfg.runner.weight_sync_interval = 2
+    with pytest.raises(ValueError, match="weight_sync_interval=1"):
+        validate_habitat_uninavid_curriculum_cfg(cfg, SupportedModel.UNINAVID)
+
+    cfg = _config()
+    cfg.runner.overlap_env_bootstrap = True
+    with pytest.raises(ValueError, match="bootstrap prefetch"):
+        validate_habitat_uninavid_curriculum_cfg(cfg, SupportedModel.UNINAVID)

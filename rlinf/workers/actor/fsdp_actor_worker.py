@@ -32,7 +32,11 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
-from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
+from rlinf.data.embodied_io_struct import (
+    EpochTrajectoryBatch,
+    Trajectory,
+    convert_trajectories_to_batch,
+)
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.envs import SupportedEnvType
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
@@ -1013,6 +1017,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._uninavid_habitat_grpo_keep_group_mask = None
         self._uninavid_habitat_grpo_keep_group_ratio = None
         self.version = 0
+        # Actor DP redistribution must run where collectives and optimizer steps
+        # are owned; the full gate leaves every other embodied path unchanged.
+        self.curriculum_enabled = bool(
+            self.cfg.env.train.get("env_type") == "habitat"
+            and self.cfg.actor.model.get("model_type") == "uninavid"
+            and self.cfg.env.train.get("action_length_bucketing", False)
+        )
+        self.curriculum_epoch_batches: list[EpochTrajectoryBatch] = []
+        self.curriculum_compacted_batch = None
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1177,12 +1190,129 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         recv_list = []
         for _ in range(split_num):
-            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
-            recv_list.append(trajectory)
+            item = await input_channel.get(async_op=True).async_wait()
+            recv_list.append(item)
+
+        if bool(getattr(self, "curriculum_enabled", False)):
+            self._receive_curriculum_epoch_batches(recv_list)
+            return
 
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+
+    def _receive_curriculum_epoch_batches(self, recv_list: list) -> None:
+        grouped: dict[int, list[Trajectory]] = {}
+        specs = {}
+        for payload in recv_list:
+            if not isinstance(payload, list):
+                raise TypeError("Curriculum actor transport must be an epoch list.")
+            for spec, trajectory in payload:
+                if spec.epoch_index in specs and specs[spec.epoch_index] != spec:
+                    raise ValueError("Actor received inconsistent rollout epoch specs.")
+                specs[spec.epoch_index] = spec
+                grouped.setdefault(spec.epoch_index, []).append(trajectory)
+
+        local_epochs = []
+        for epoch_index in sorted(grouped):
+            spec = specs[epoch_index]
+            batch = convert_trajectories_to_batch(grouped[epoch_index])
+            batch_size = int(batch["prev_logprobs"].shape[1])
+            trajectory_ids = [
+                f"actor{self._rank}:epoch{epoch_index}:trajectory{index}"
+                for index in range(batch_size)
+            ]
+            local_epochs.append(
+                EpochTrajectoryBatch(
+                    spec=spec,
+                    trajectory_ids=trajectory_ids,
+                    actions=batch.get("actions"),
+                    rewards=batch.get("rewards"),
+                    terminations=batch.get("terminations"),
+                    truncations=batch.get("truncations"),
+                    dones=batch.get("dones"),
+                    prev_logprobs=batch.get("prev_logprobs"),
+                    prev_values=batch.get("prev_values"),
+                    versions=batch.get("versions"),
+                    forward_inputs=batch.get("forward_inputs", {}),
+                    env_info=batch.get("env_info", {}),
+                )
+            )
+        if len(local_epochs) != int(self.cfg.algorithm.rollout_epoch):
+            raise ValueError("Actor did not receive every curriculum rollout epoch.")
+
+        gathered_epochs = [None] * self._world_size
+        torch.distributed.all_gather_object(gathered_epochs, local_epochs)
+        self.curriculum_epoch_batches = self._merge_curriculum_actor_epochs(
+            gathered_epochs
+        )
+
+    @staticmethod
+    def _merge_curriculum_actor_epochs(
+        gathered_epochs: list[list[EpochTrajectoryBatch]],
+    ) -> list[EpochTrajectoryBatch]:
+        def merge_tensors(values):
+            present = [value for value in values if value is not None]
+            if not present:
+                return None
+            if len(present) != len(values):
+                raise ValueError("Curriculum epoch fields differ across actor ranks.")
+            return torch.cat(present, dim=1)
+
+        def merge_dicts(values):
+            if not values or not values[0]:
+                return {}
+            if any(set(value) != set(values[0]) for value in values):
+                raise ValueError("Curriculum nested fields differ across actor ranks.")
+            return {
+                key: (
+                    merge_dicts([value[key] for value in values])
+                    if isinstance(values[0][key], dict)
+                    else merge_tensors([value[key] for value in values])
+                )
+                for key in values[0]
+            }
+
+        epoch_count = len(gathered_epochs[0])
+        if any(len(epochs) != epoch_count for epochs in gathered_epochs):
+            raise ValueError("Actor ranks received different curriculum epoch counts.")
+        merged = []
+        for epoch_index in range(epoch_count):
+            rank_epochs = [epochs[epoch_index] for epochs in gathered_epochs]
+            spec = rank_epochs[0].spec
+            if any(epoch.spec != spec for epoch in rank_epochs[1:]):
+                raise ValueError("Actor ranks received inconsistent epoch specs.")
+            merged.append(
+                EpochTrajectoryBatch(
+                    spec=spec,
+                    trajectory_ids=[
+                        trajectory_id
+                        for epoch in rank_epochs
+                        for trajectory_id in epoch.trajectory_ids
+                    ],
+                    actions=merge_tensors([epoch.actions for epoch in rank_epochs]),
+                    rewards=merge_tensors([epoch.rewards for epoch in rank_epochs]),
+                    terminations=merge_tensors(
+                        [epoch.terminations for epoch in rank_epochs]
+                    ),
+                    truncations=merge_tensors(
+                        [epoch.truncations for epoch in rank_epochs]
+                    ),
+                    dones=merge_tensors([epoch.dones for epoch in rank_epochs]),
+                    prev_logprobs=merge_tensors(
+                        [epoch.prev_logprobs for epoch in rank_epochs]
+                    ),
+                    prev_values=merge_tensors(
+                        [epoch.prev_values for epoch in rank_epochs]
+                    ),
+                    versions=merge_tensors([epoch.versions for epoch in rank_epochs]),
+                    forward_inputs=merge_dicts(
+                        [epoch.forward_inputs for epoch in rank_epochs]
+                    ),
+                    env_info=merge_dicts([epoch.env_info for epoch in rank_epochs]),
+                )
+            )
+        return merged
 
     def _process_received_rollout_batch(
         self, rollout_batch: dict[str, torch.Tensor]
@@ -1277,6 +1407,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Compute the advantages and returns.
         """
+        if bool(getattr(self, "curriculum_enabled", False)):
+            return self._compute_curriculum_advantages_and_returns()
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1357,6 +1489,166 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
             self.rollout_batch.pop("env_info", None)
         return rollout_metrics
+
+    def _compute_curriculum_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        from rlinf.models.embodiment.uninavid.curriculum_batch import (
+            ProcessedEpochBatch,
+            compact_curriculum_epochs,
+            compute_grpo_epoch_advantages,
+            compute_truncation_aware_gae,
+            normalize_weighted_advantages,
+        )
+        from rlinf.models.embodiment.uninavid.rl_loss import (
+            _build_uninavid_action_token_mask,
+        )
+
+        if not self.curriculum_epoch_batches:
+            raise RuntimeError("No curriculum epoch batches are available.")
+        processed_epochs = []
+        metrics = {}
+        policy_versions = set()
+        spec_policy_versions = {
+            epoch.spec.policy_version for epoch in self.curriculum_epoch_batches
+        }
+        if len(spec_policy_versions) != 1:
+            raise ValueError("Curriculum epoch specs must use one policy version.")
+        for epoch in self.curriculum_epoch_batches:
+            spec = epoch.spec
+            time_steps = spec.n_chunk_steps
+            batch_size = len(epoch.trajectory_ids)
+            valid_action_slots = epoch.forward_inputs.get("valid_action_slots")
+            action_token_slot_ids = epoch.forward_inputs.get("action_token_slot_ids")
+            if valid_action_slots is None or action_token_slot_ids is None:
+                raise KeyError(
+                    "Curriculum rollout requires action-slot execution metadata."
+                )
+            token_loss_mask = _build_uninavid_action_token_mask(
+                logprobs=epoch.prev_logprobs.flatten(0, 1),
+                response_mask=epoch.forward_inputs["response_mask"].flatten(0, 1),
+                action_token_mask=epoch.forward_inputs["action_token_mask"].flatten(
+                    0, 1
+                ),
+                action_token_slot_ids=action_token_slot_ids.flatten(0, 1),
+                valid_action_slots=valid_action_slots.flatten(0, 1),
+            ).reshape(time_steps, batch_size, -1)
+            valid_chunk_mask = token_loss_mask.any(dim=-1)
+            critic_loss_mask = valid_chunk_mask.unsqueeze(-1)
+
+            versions = epoch.versions[valid_chunk_mask]
+            policy_versions.update(float(value) for value in versions.unique())
+            if self.cfg.algorithm.adv_type == "gae":
+                rewards = torch.where(
+                    valid_action_slots,
+                    epoch.rewards,
+                    0.0,
+                ).sum(dim=-1, keepdim=True)
+                terminations = epoch.terminations.to(torch.bool).any(
+                    dim=-1, keepdim=True
+                )
+                dones = epoch.dones.to(torch.bool).any(dim=-1, keepdim=True)
+                advantages, returns = compute_truncation_aware_gae(
+                    rewards=rewards,
+                    values=epoch.prev_values,
+                    terminations=terminations,
+                    dones=dones,
+                    gamma=float(self.cfg.algorithm.gamma),
+                    gae_lambda=float(self.cfg.algorithm.gae_lambda),
+                )
+            elif self.cfg.algorithm.adv_type == "grpo":
+                advantages = compute_grpo_epoch_advantages(
+                    rewards=epoch.rewards,
+                    valid_chunk_mask=valid_chunk_mask,
+                    group_size=int(self.cfg.algorithm.group_size),
+                )
+                returns = None
+            else:
+                raise ValueError(
+                    "Habitat UniNaVid curriculum supports only GAE and GRPO."
+                )
+
+            fields = {
+                "actions": epoch.actions,
+                "prev_logprobs": epoch.prev_logprobs,
+                "advantages": advantages,
+                "versions": epoch.versions,
+                "loss_mask": token_loss_mask,
+                "critic_loss_mask": critic_loss_mask,
+                "forward_inputs": epoch.forward_inputs,
+            }
+            if epoch.prev_values is not None:
+                fields["prev_values"] = epoch.prev_values[:-1]
+            if returns is not None:
+                fields["returns"] = returns
+            if epoch.env_info:
+                fields["env_info"] = epoch.env_info
+            processed_epochs.append(
+                ProcessedEpochBatch(
+                    spec=spec,
+                    trajectory_ids=tuple(epoch.trajectory_ids),
+                    fields=fields,
+                    valid_chunk_mask=valid_chunk_mask,
+                )
+            )
+            metrics[f"curriculum/valid_chunk_count/{spec.bucket_id}"] = metrics.get(
+                f"curriculum/valid_chunk_count/{spec.bucket_id}", 0
+            ) + int(valid_chunk_mask.sum())
+            trajectory_timeout = (
+                epoch.truncations.to(torch.bool)
+                .reshape(epoch.truncations.shape[0], batch_size, -1)
+                .any(dim=(0, 2))
+            )
+            metrics[f"curriculum/timeout_ratio/{spec.bucket_id}"] = float(
+                trajectory_timeout.float().mean()
+            )
+
+        if len(policy_versions) != 1:
+            raise ValueError(
+                "All curriculum epochs must use one behavior policy version."
+            )
+        if int(next(iter(policy_versions))) != next(iter(spec_policy_versions)):
+            raise ValueError(
+                "Curriculum behavior-policy metadata does not match epoch specs."
+            )
+        compacted = compact_curriculum_epochs(processed_epochs)
+        if bool(self.cfg.algorithm.get("normalize_advantages", False)):
+            compacted["advantages"] = normalize_weighted_advantages(
+                compacted["advantages"],
+                chunk_weights=compacted["chunk_weights"],
+                valid_mask=compacted["critic_loss_mask"],
+            )
+        self.curriculum_compacted_batch = compacted
+        real_chunks = int(compacted["chunk_weights"].numel())
+        total_chunks = sum(
+            epoch.spec.n_chunk_steps * len(epoch.trajectory_ids)
+            for epoch in self.curriculum_epoch_batches
+        )
+        metrics["curriculum/active_bucket_count"] = len(set(compacted["bucket_ids"]))
+        metrics["curriculum/compaction_keep_ratio"] = real_chunks / total_chunks
+        for bucket_id in dict.fromkeys(compacted["bucket_ids"]):
+            bucket_mask = torch.tensor(
+                [value == bucket_id for value in compacted["bucket_ids"]],
+                dtype=torch.bool,
+            )
+            metrics[f"curriculum/realized_full_pass_weight/{bucket_id}"] = float(
+                compacted["chunk_weights"][bucket_mask].sum()
+            )
+            bucket_trajectory_ids = {
+                trajectory_id
+                for selected, trajectory_id in zip(
+                    bucket_mask.tolist(), compacted["trajectory_ids"]
+                )
+                if selected
+            }
+            metrics[f"curriculum/collected_trajectory_count/{bucket_id}"] = len(
+                bucket_trajectory_ids
+            )
+            metrics[f"curriculum/mean_valid_chunks/{bucket_id}"] = float(
+                bucket_mask.sum()
+            ) / len(bucket_trajectory_ids)
+            metrics[f"curriculum/target_weight/{bucket_id}"] = metrics[
+                f"curriculum/realized_full_pass_weight/{bucket_id}"
+            ]
+        return metrics
 
     def _build_sft_data_loader(self):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
@@ -1450,6 +1742,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Run the training process using the received rollout batch.
         """
+        if bool(getattr(self, "curriculum_enabled", False)):
+            return self._run_curriculum_training()
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
@@ -1845,6 +2139,186 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
         return mean_metric_dict
+
+    def _run_curriculum_training(self) -> dict[str, float]:
+        from rlinf.models.embodiment.uninavid.curriculum_batch import (
+            materialize_curriculum_rank_batch,
+            plan_curriculum_global_batches,
+        )
+        from rlinf.models.embodiment.uninavid.rl_loss import (
+            aggregate_uninavid_weighted_ppo_losses,
+            compute_uninavid_per_chunk_ppo_losses,
+            prepare_uninavid_chunk_level_loss_inputs,
+            prepare_uninavid_token_level_loss_inputs,
+        )
+
+        if self.curriculum_compacted_batch is None:
+            raise RuntimeError("Curriculum compacted batch is unavailable.")
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+        self.model.train()
+
+        slots_per_rank = int(self.cfg.actor.global_batch_size) // self._world_size
+        gradient_accumulation = slots_per_rank // int(self.cfg.actor.micro_batch_size)
+        metrics = {}
+        update_epoch_count = int(self.cfg.algorithm.get("update_epoch", 1))
+        for update_epoch in range(update_epoch_count):
+            training_plan = plan_curriculum_global_batches(
+                self.curriculum_compacted_batch,
+                global_batch_size=int(self.cfg.actor.global_batch_size),
+                world_size=self._world_size,
+                micro_batch_size=int(self.cfg.actor.micro_batch_size),
+                seed=int(self.cfg.actor.seed),
+                update_epoch=update_epoch,
+            )
+            append_to_dict(
+                metrics,
+                {
+                    "curriculum/alignment_padding_chunks": float(
+                        training_plan.alignment_padding_count
+                    ),
+                    "curriculum/optimizer_updates": float(training_plan.num_updates),
+                },
+            )
+            for update_index, global_plan in enumerate(training_plan.global_batches):
+                rank_batch = materialize_curriculum_rank_batch(
+                    self.curriculum_compacted_batch,
+                    training_plan=training_plan,
+                    update_index=update_index,
+                    rank=self._rank,
+                )
+                append_to_dict(
+                    metrics,
+                    {
+                        f"curriculum/actor_rank_real_chunk_count/{self._rank}": float(
+                            (~rank_batch["alignment_padding_mask"]).sum()
+                        ),
+                        **{
+                            f"curriculum/global_batch_mass_error_max/{bucket_id}": error
+                            for bucket_id, error in global_plan.bucket_mass_error.items()
+                        },
+                    },
+                )
+                rank_batch = {
+                    key: value
+                    for key, value in rank_batch.items()
+                    if key not in ("bucket_ids", "trajectory_ids")
+                }
+                micro_batches = split_dict_to_chunk(
+                    rank_batch,
+                    gradient_accumulation,
+                )
+                self.optimizer.zero_grad()
+                for micro_index, batch in enumerate(micro_batches):
+                    batch = put_tensor_device(
+                        batch,
+                        f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
+                    )
+                    backward_ctx = self.before_micro_batch(
+                        self.model,
+                        is_last_micro_batch=(micro_index + 1 == gradient_accumulation),
+                    )
+                    compute_values = self.cfg.algorithm.adv_type == "gae"
+                    with self.amp_context:
+                        output_dict = self.model(
+                            forward_inputs=batch["forward_inputs"],
+                            compute_logprobs=True,
+                            compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                            compute_values=compute_values,
+                            use_cache=False,
+                        )
+                        prepare_kwargs = {
+                            "logprobs": output_dict["logprobs"],
+                            "old_logprobs": batch["prev_logprobs"],
+                            "advantages": batch["advantages"],
+                            "response_mask": batch["forward_inputs"]["response_mask"],
+                            "action_token_mask": batch["forward_inputs"][
+                                "action_token_mask"
+                            ],
+                            "action_token_slot_ids": batch["forward_inputs"][
+                                "action_token_slot_ids"
+                            ],
+                            "valid_action_slots": batch["forward_inputs"][
+                                "valid_action_slots"
+                            ],
+                            "entropy": output_dict.get("entropy"),
+                        }
+                        if self.cfg.algorithm.logprob_type == "chunk_level":
+                            prepared = prepare_uninavid_chunk_level_loss_inputs(
+                                **prepare_kwargs
+                            )
+                        elif self.cfg.algorithm.logprob_type == "token_level":
+                            prepared = prepare_uninavid_token_level_loss_inputs(
+                                **prepare_kwargs
+                            )
+                        else:
+                            raise ValueError(
+                                "UniNaVid curriculum supports chunk_level or token_level logprobs."
+                            )
+                        critic_kwargs = {}
+                        if compute_values:
+                            critic_kwargs = {
+                                "values": output_dict["values"],
+                                "returns": batch["returns"],
+                                "prev_values": batch["prev_values"],
+                                "critic_loss_mask": batch["critic_loss_mask"],
+                                "value_clip": float(self.cfg.algorithm.value_clip),
+                                "huber_delta": float(self.cfg.algorithm.huber_delta),
+                            }
+                        per_chunk_losses = compute_uninavid_per_chunk_ppo_losses(
+                            logprobs=prepared["logprobs"],
+                            old_logprobs=prepared["old_logprobs"],
+                            advantages=prepared["advantages"],
+                            actor_loss_mask=prepared["loss_mask"],
+                            clip_ratio_low=float(self.cfg.algorithm.clip_ratio_low),
+                            clip_ratio_high=float(self.cfg.algorithm.clip_ratio_high),
+                            clip_ratio_c=self.cfg.algorithm.get("clip_ratio_c", None),
+                            clip_log_ratio_min=self.cfg.algorithm.get(
+                                "clip_log_ratio_min", None
+                            ),
+                            clip_log_ratio_max=self.cfg.algorithm.get(
+                                "clip_log_ratio_max", None
+                            ),
+                            entropy=prepared.get("entropy"),
+                            **critic_kwargs,
+                        )
+                        loss, metrics_data = aggregate_uninavid_weighted_ppo_losses(
+                            per_chunk_losses,
+                            train_chunk_weights=batch["train_chunk_weights"],
+                            value_loss_coeff=float(
+                                self.cfg.algorithm.get("value_loss_coeff", 1.0)
+                            ),
+                            entropy_bonus=float(self.cfg.algorithm.entropy_bonus),
+                            critic_warmup=(
+                                self.optimizer_steps < self.critic_warmup_steps
+                            ),
+                        )
+                    with backward_ctx:
+                        self.grad_scaler.scale(loss * self._world_size).backward()
+                    append_to_dict(metrics, metrics_data)
+
+                self.torch_platform.empty_cache()
+                grad_norm, lr_list = self.optimizer_step()
+                optimizer_metrics = {
+                    "actor/grad_norm": grad_norm,
+                    "actor/lr": lr_list[0],
+                }
+                if len(lr_list) > 1:
+                    optimizer_metrics["critic/lr"] = lr_list[1]
+                append_to_dict(metrics, optimizer_metrics)
+
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+        self.curriculum_compacted_batch = None
+        self.curriculum_epoch_batches = []
+        clear_memory()
+        mean_metrics = {key: np.mean(value) for key, value in metrics.items()}
+        return all_reduce_dict(
+            mean_metrics,
+            op=torch.distributed.ReduceOp.AVG,
+        )
 
     def set_global_step(self, global_step: int) -> None:
         """

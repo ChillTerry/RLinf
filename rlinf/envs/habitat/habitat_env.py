@@ -267,6 +267,7 @@ class HabitatEnv(gym.Env):
         self.first_done_cached_mask = np.zeros(self.num_envs, dtype=bool)
         self.episode_info = None
         self._active_bucket_id = None
+        self._bucket_cursors = {}
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -331,9 +332,31 @@ class HabitatEnv(gym.Env):
         self.env.reconfigure_env_fns(
             self._get_env_fn_params(bucket_id=bucket_id, horizon_steps=horizon_steps)
         )
+        cursor = self._bucket_cursors.setdefault(
+            bucket_id, [0 for _ in range(self.num_group)]
+        )
+        sequences = bucket_plan["episode_sequences"][self.seed_offset]
+        for group_id, episode_ids in enumerate(sequences):
+            cursor[group_id] = (cursor[group_id] + 1) % len(episode_ids)
         self._elapsed_steps.fill(0)
         self.first_done_cached_mask.fill(False)
         self.current_raw_obs = None
+
+    def get_curriculum_state(self) -> dict:
+        return {
+            "active_bucket_id": self._active_bucket_id,
+            "bucket_cursors": {
+                bucket_id: list(cursors)
+                for bucket_id, cursors in self._bucket_cursors.items()
+            },
+        }
+
+    def load_curriculum_state(self, state: dict) -> None:
+        self._active_bucket_id = state.get("active_bucket_id")
+        self._bucket_cursors = {
+            str(bucket_id): [int(cursor) for cursor in cursors]
+            for bucket_id, cursors in state["bucket_cursors"].items()
+        }
 
     @property
     def elapsed_steps(self):
@@ -918,9 +941,22 @@ class HabitatEnv(gym.Env):
             overrides.append(f"{prefix}{int(horizon_steps)}")
         process_group_episode_ids = episode_sequences[self.seed_offset]
 
+        rotated_group_episode_ids = []
+        if bucket_id is not None:
+            cursors = self._bucket_cursors.setdefault(
+                bucket_id, [0 for _ in range(self.num_group)]
+            )
+            for group_id, episode_ids in enumerate(process_group_episode_ids):
+                cursor = cursors[group_id] % len(episode_ids)
+                rotated_group_episode_ids.append(
+                    list(episode_ids[cursor:]) + list(episode_ids[:cursor])
+                )
+        else:
+            rotated_group_episode_ids = process_group_episode_ids
+
         for env_id in range(self.num_envs):
             group_id = env_id // self.group_size
-            assigned_ids = list(process_group_episode_ids[group_id])
+            assigned_ids = list(rotated_group_episode_ids[group_id])
 
             env_fn_params.append(
                 {

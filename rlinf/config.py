@@ -822,6 +822,16 @@ def validate_habitat_uninavid_curriculum_cfg(cfg, model_type) -> None:
         raise ValueError("max_steps_ratio must be positive.")
     if not cfg.env.train.get("gt_path", None):
         raise ValueError("Habitat action-length bucketing requires gt_path.")
+    if cfg.actor.training_backend != "fsdp":
+        raise ValueError("Habitat UniNaVid curriculum currently requires FSDP.")
+    if int(cfg.runner.get("weight_sync_interval", 1)) != 1:
+        raise ValueError("Habitat UniNaVid curriculum requires weight_sync_interval=1.")
+    if bool(cfg.runner.get("overlap_env_bootstrap", False)):
+        raise ValueError(
+            "Habitat UniNaVid curriculum does not support fixed-horizon bootstrap prefetch."
+        )
+    if cfg.algorithm.adv_type not in ("gae", "grpo"):
+        raise ValueError("Habitat UniNaVid curriculum supports only GAE and GRPO.")
     if bool(cfg.env.train.get("bucket_curriculum_enabled", False)):
         stages = tuple(
             CurriculumStage.from_config(stage)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import queue
@@ -73,6 +74,14 @@ class EmbodiedRunner:
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
+        )
+        # Runner coordination is limited to policy-version and checkpoint state;
+        # all shared behavior remains behind the explicit three-part gate.
+        self.curriculum_enabled = bool(
+            not self.cfg.runner.only_eval
+            and self.cfg.env.train.get("env_type") == "habitat"
+            and self.cfg.actor.model.get("model_type") == "uninavid"
+            and self.cfg.env.train.get("action_length_bucketing", False)
         )
         # Data channels
         self.env_channel = Channel.create("Env")
@@ -164,6 +173,15 @@ class EmbodiedRunner:
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
         self.global_step = int(resume_dir.split("global_step_")[-1])
+        if bool(getattr(self, "curriculum_enabled", False)):
+            curriculum_path = os.path.join(resume_dir, "curriculum_state.json")
+            if not os.path.exists(curriculum_path):
+                raise FileNotFoundError(
+                    "Curriculum resume requires curriculum_state.json."
+                )
+            with open(curriculum_path, encoding="utf-8") as file_obj:
+                curriculum_states = json.load(file_obj)
+            self.env.load_curriculum_state(curriculum_states).wait()
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
@@ -300,6 +318,8 @@ class EmbodiedRunner:
                 with self.timer("sync_weights"):
                     if _step % self.weight_sync_interval == 0:
                         self.update_rollout_weights()
+                    if bool(getattr(self, "curriculum_enabled", False)):
+                        self.env.set_global_step(self.global_step).wait()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(
                         input_channel=self.env_channel,
@@ -544,6 +564,11 @@ class EmbodiedRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        if bool(getattr(self, "curriculum_enabled", False)):
+            curriculum_states = self.env.get_curriculum_state().wait()
+            curriculum_path = os.path.join(base_output_dir, "curriculum_state.json")
+            with open(curriculum_path, "w", encoding="utf-8") as file_obj:
+                json.dump(curriculum_states, file_obj, indent=2)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1
