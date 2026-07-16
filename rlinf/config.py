@@ -790,12 +790,51 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def validate_habitat_uninavid_curriculum_cfg(cfg, model_type) -> None:
+    with open_dict(cfg.env.train):
+        cfg.env.train.action_length_bucketing = bool(
+            cfg.env.train.get("action_length_bucketing", False)
+        )
+
+    if not cfg.env.train.action_length_bucketing:
+        return
+
+    from rlinf.envs.habitat.extensions.bucket_scheduler import (
+        CurriculumStage,
+        validate_curriculum_stages,
+    )
+
+    env_type = SupportedEnvType(cfg.env.train.env_type)
+    if env_type != SupportedEnvType.HABITAT or model_type != SupportedModel.UNINAVID:
+        raise ValueError(
+            "action_length_bucketing is supported only for Habitat + UniNaVid."
+        )
+    if int(cfg.env.train.action_length_bin_size) <= 0:
+        raise ValueError("action_length_bin_size must be positive.")
+    if int(cfg.env.train.max_gt_action_length) <= 0:
+        raise ValueError("max_gt_action_length must be positive.")
+    if float(cfg.env.train.max_steps_ratio) <= 0.0:
+        raise ValueError("max_steps_ratio must be positive.")
+    if not cfg.env.train.get("gt_path", None):
+        raise ValueError("Habitat action-length bucketing requires gt_path.")
+    if bool(cfg.env.train.get("bucket_curriculum_enabled", False)):
+        stages = tuple(
+            CurriculumStage.from_config(stage)
+            for stage in cfg.env.train.curriculum_stages
+        )
+        validate_curriculum_stages(
+            stages, rollout_epoch=int(cfg.algorithm.rollout_epoch)
+        )
+
+
 def validate_embodied_cfg(cfg):
     model_type = SupportedModel(cfg.actor.model.model_type)
     assert model_type in EMBODIED_MODEL, (
         f"Model type: '{cfg.actor.model.model_type}' is not an embodied model. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
+
+    validate_habitat_uninavid_curriculum_cfg(cfg, model_type)
 
     with open_dict(cfg):
         cfg.runner.save_best_ckpt = cfg.runner.get("save_best_ckpt", False)

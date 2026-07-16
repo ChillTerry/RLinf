@@ -29,6 +29,67 @@ from rlinf.utils.nested_dict_process import (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class RolloutEpochSpec:
+    """Immutable rollout contract for one curriculum-selected Habitat bucket."""
+
+    epoch_index: int
+    bucket_id: str
+    horizon_steps: int
+    n_chunk_steps: int
+    curriculum_weight: float
+    policy_version: int
+
+    def __post_init__(self):
+        if self.epoch_index < 0:
+            raise ValueError("epoch_index must be non-negative.")
+        if not self.bucket_id:
+            raise ValueError("bucket_id must be non-empty.")
+        if self.horizon_steps <= 0 or self.n_chunk_steps <= 0:
+            raise ValueError("Rollout horizon and chunk count must be positive.")
+        if self.horizon_steps % self.n_chunk_steps != 0:
+            raise ValueError("horizon_steps must be divisible by n_chunk_steps.")
+        if not 0.0 < self.curriculum_weight <= 1.0:
+            raise ValueError("curriculum_weight must be in (0, 1].")
+        if self.policy_version < 0:
+            raise ValueError("policy_version must be non-negative.")
+
+
+@dataclass(kw_only=True)
+class EpochTrajectoryBatch:
+    """Trajectory tensors whose time dimension belongs to exactly one epoch."""
+
+    spec: RolloutEpochSpec
+    trajectory_ids: list[str]
+    actions: torch.Tensor | None = None
+    rewards: torch.Tensor | None = None
+    terminations: torch.Tensor | None = None
+    truncations: torch.Tensor | None = None
+    dones: torch.Tensor | None = None
+    prev_logprobs: torch.Tensor | None = None
+    prev_values: torch.Tensor | None = None
+    versions: torch.Tensor | None = None
+    forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    env_info: dict[str, torch.Tensor] = field(default_factory=dict)
+
+    def __post_init__(self):
+        tensors = (
+            self.actions,
+            self.rewards,
+            self.prev_logprobs,
+            self.versions,
+        )
+        batch_sizes = {int(value.shape[1]) for value in tensors if value is not None}
+        if len(batch_sizes) > 1:
+            raise ValueError("Epoch trajectory fields must share the same batch size.")
+        if batch_sizes and len(self.trajectory_ids) != next(iter(batch_sizes)):
+            raise ValueError("trajectory_ids must match the epoch batch dimension.")
+
+        time_sizes = {int(value.shape[0]) for value in tensors if value is not None}
+        if time_sizes and time_sizes != {self.spec.n_chunk_steps}:
+            raise ValueError("Epoch trajectory fields must match spec.n_chunk_steps.")
+
+
 def get_model_weights_id(versions: torch.Tensor) -> str:
     """
     Get the model weights id from the tensor.
