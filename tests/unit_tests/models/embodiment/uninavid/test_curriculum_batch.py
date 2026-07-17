@@ -150,6 +150,41 @@ def test_compact_removes_padding_and_preserves_nested_field_alignment_and_mass()
     torch.testing.assert_close(weights.sum(), torch.tensor(1.0, dtype=torch.float64))
 
 
+def test_quota_derived_alpha_is_preserved_across_repeated_bucket_epochs():
+    epochs = []
+    for epoch_index in range(3):
+        epochs.append(
+            ProcessedEpochBatch(
+                spec=_spec(epoch_index, "short", 2, 0.75),
+                trajectory_ids=(f"short-{epoch_index}",),
+                fields={"value": torch.ones(2, 1, 1)},
+                valid_chunk_mask=torch.ones(2, 1, dtype=torch.bool),
+            )
+        )
+    epochs.append(
+        ProcessedEpochBatch(
+            spec=_spec(3, "long", 3, 0.25),
+            trajectory_ids=("long-0",),
+            fields={"value": torch.ones(3, 1, 1)},
+            valid_chunk_mask=torch.ones(3, 1, dtype=torch.bool),
+        )
+    )
+
+    compact = compact_curriculum_epochs(epochs)
+    weights = compact["chunk_weights"]
+    short_mask = torch.tensor(
+        [bucket_id == "short" for bucket_id in compact["bucket_ids"]]
+    )
+
+    torch.testing.assert_close(
+        weights[short_mask].sum(), torch.tensor(0.75, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        weights[~short_mask].sum(), torch.tensor(0.25, dtype=torch.float64)
+    )
+    torch.testing.assert_close(weights.sum(), torch.tensor(1.0, dtype=torch.float64))
+
+
 def _planner_batch(bucket_ids, trajectory_ids, weights):
     count = len(bucket_ids)
     return {

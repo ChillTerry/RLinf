@@ -25,9 +25,7 @@ def _habitat_env(*, enabled=True):
             "bucket_plans": {
                 "B0": {
                     "horizon_steps": 84,
-                    "episode_sequences": [
-                        [["short-a", "short-a2"], ["short-b", "short-b2"]]
-                    ],
+                    "episode_ids": ["short-a", "short-a2", "short-b", "short-b2"],
                 }
             },
         },
@@ -43,20 +41,19 @@ def _habitat_env(*, enabled=True):
     env.current_raw_obs = [object(), object()]
     env.max_episode_steps = 128
     env._active_bucket_id = None
-    env._bucket_cursors = {}
     return env
 
 
 def test_activate_bucket_reconfigures_only_selected_episode_assignment():
     env = _habitat_env()
 
-    env.activate_bucket("B0", 84)
+    env.activate_bucket("B0", 84, ["short-a", "short-b"])
 
     assert env._active_bucket_id == "B0"
     assert env.max_episode_steps == 84
     assert [params["episode_ids"] for params in env.env.params] == [
-        ["short-a", "short-a2"],
-        ["short-b", "short-b2"],
+        ["short-a"],
+        ["short-b"],
     ]
     assert all(
         "habitat.environment.max_episode_steps=84" in params["overrides"]
@@ -66,18 +63,24 @@ def test_activate_bucket_reconfigures_only_selected_episode_assignment():
     assert not env.first_done_cached_mask.any()
     assert env.current_raw_obs is None
 
-    state = env.get_curriculum_state()
-    env.activate_bucket("B0", 84)
+    env.activate_bucket("B0", 84, ["short-a2", "short-b2"])
     assert [params["episode_ids"] for params in env.env.params] == [
-        ["short-a2", "short-a"],
-        ["short-b2", "short-b"],
+        ["short-a2"],
+        ["short-b2"],
     ]
-    env.load_curriculum_state(state)
-    assert env.get_curriculum_state() == state
 
 
 def test_activate_bucket_is_unavailable_when_feature_is_off():
     env = _habitat_env(enabled=False)
 
     with pytest.raises(RuntimeError, match="not enabled"):
-        env.activate_bucket("B0", 84)
+        env.activate_bucket("B0", 84, ["short-a", "short-b"])
+
+
+def test_activate_bucket_rejects_invalid_group_assignment():
+    env = _habitat_env()
+
+    with pytest.raises(ValueError, match="requires 2 group episode IDs"):
+        env.activate_bucket("B0", 84, ["short-a"])
+    with pytest.raises(ValueError, match="unknown episode IDs"):
+        env.activate_bucket("B0", 84, ["short-a", "unknown"])

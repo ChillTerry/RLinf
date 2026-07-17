@@ -176,45 +176,24 @@ class EnvWorker(Worker):
     def _init_curriculum_scheduler(self) -> None:
         from rlinf.envs.habitat.extensions.bucket_scheduler import (
             BucketCurriculumScheduler,
-            CurriculumStage,
         )
 
         if self._habitat_train_plan is None:
             raise RuntimeError("Habitat curriculum requires a global bucket plan.")
-        bucket_ids = tuple(self._habitat_train_plan["bucket_ids"])
-        if self.cfg.env.train.get("bucket_curriculum_enabled", False):
-            stages = tuple(
-                CurriculumStage.from_config(stage)
-                for stage in self.cfg.env.train.curriculum_stages
-            )
-        else:
-            stages = (
-                CurriculumStage(
-                    active_bucket_count=len(bucket_ids),
-                    weights=tuple([1.0 / len(bucket_ids)] * len(bucket_ids)),
-                ),
-            )
+        groups_per_stage = self.train_num_envs_per_stage // int(
+            self.cfg.env.train.group_size
+        )
         self._curriculum_scheduler = BucketCurriculumScheduler(
-            bucket_ids=bucket_ids,
-            stages=stages,
-            rollout_epoch=int(self.rollout_epoch),
-            curriculum_interval=int(self.cfg.env.train.get("curriculum_interval", 1)),
-            success_threshold=self.cfg.env.train.get(
-                "curriculum_success_threshold", None
-            ),
-            seed=int(self.cfg.env.train.bucket_schedule_seed),
+            plan=self._habitat_train_plan,
+            total_group_streams=self._world_size * self.stage_num * groups_per_stage,
         )
 
     def _build_curriculum_epoch_specs(self) -> list[RolloutEpochSpec]:
         if self._curriculum_scheduler is None:
             raise RuntimeError("Curriculum scheduler is not initialized.")
-        bucket_order = self._curriculum_scheduler.build_epoch_bucket_order()
-        weights = dict(
-            zip(
-                self._curriculum_scheduler.active_bucket_ids,
-                self._curriculum_scheduler.stage.weights,
-            )
-        )
+        global_step = int(getattr(self, "global_step", 0))
+        bucket_order = self._curriculum_scheduler.build_epoch_bucket_order(global_step)
+        weights = self._curriculum_scheduler.target_weights(global_step)
         specs = []
         for epoch_index, bucket_id in enumerate(bucket_order):
             bucket_plan = self._habitat_train_plan["bucket_plans"][bucket_id]
@@ -225,10 +204,26 @@ class EnvWorker(Worker):
                     horizon_steps=int(bucket_plan["horizon_steps"]),
                     n_chunk_steps=int(bucket_plan["n_chunk_steps"]),
                     curriculum_weight=float(weights[bucket_id]),
-                    policy_version=int(getattr(self, "global_step", 0)),
+                    policy_version=global_step,
                 )
             )
         return specs
+
+    def _allocate_curriculum_group_episode_ids(
+        self, bucket_id: str
+    ) -> list[tuple[str, ...]]:
+        assigned = self._curriculum_scheduler.allocate_episode_ids(bucket_id)
+        groups_per_stage = self.train_num_envs_per_stage // int(
+            self.cfg.env.train.group_size
+        )
+        stage_assignments = []
+        for stage_id in range(self.stage_num):
+            process_index = self._rank * self.stage_num + stage_id
+            start = process_index * groups_per_stage
+            stage_assignments.append(
+                tuple(assigned[start : start + groups_per_stage])
+            )
+        return stage_assignments
 
     def set_global_step(self, global_step: int) -> None:
         self.global_step = int(global_step)
@@ -236,21 +231,14 @@ class EnvWorker(Worker):
     def get_curriculum_state(self) -> dict | None:
         if not self.curriculum_enabled:
             return None
-        return {
-            "scheduler": self._curriculum_scheduler.state_dict(),
-            "envs": [env.get_curriculum_state() for env in self.env_list],
-        }
+        return self._curriculum_scheduler.state_dict()
 
     def load_curriculum_state(self, state: dict | list[dict]) -> None:
         if not self.curriculum_enabled:
             raise RuntimeError("Cannot load curriculum state when feature is disabled.")
         if isinstance(state, list):
             state = state[self._rank]
-        self._curriculum_scheduler.load_state_dict(state["scheduler"])
-        if len(state["envs"]) != len(self.env_list):
-            raise ValueError("Curriculum checkpoint env-stage count does not match.")
-        for env, env_state in zip(self.env_list, state["envs"]):
-            env.load_curriculum_state(env_state)
+        self._curriculum_scheduler.load_state_dict(state)
 
     @staticmethod
     def _mean_curriculum_rates(
@@ -1365,10 +1353,16 @@ class EnvWorker(Worker):
         for epoch in range(self.rollout_epoch):
             epoch_spec = epoch_specs[epoch]
             if curriculum_enabled:
+                stage_group_episode_ids = (
+                    self._allocate_curriculum_group_episode_ids(
+                        epoch_spec.bucket_id
+                    )
+                )
                 for stage_id in range(self.stage_num):
                     self.env_list[stage_id].activate_bucket(
                         epoch_spec.bucket_id,
                         epoch_spec.horizon_steps,
+                        stage_group_episode_ids[stage_id],
                     )
                 active_results = [
                     curriculum_results[stage_id][epoch]
@@ -1569,24 +1563,62 @@ class EnvWorker(Worker):
                 {"success": success_rates, "timeout": timeout_rates},
             )
             success_rates, timeout_rates = self._mean_curriculum_rates(gathered_rates)
-            self._curriculum_scheduler.record_bucket_metrics(
-                success_rates=success_rates,
-                timeout_rates=timeout_rates,
-            )
             quota_counts = defaultdict(int)
             for spec in epoch_specs:
                 quota_counts[spec.bucket_id] += 1
-            env_metrics["curriculum/active_bucket_count"].append(
-                torch.tensor([len(self._curriculum_scheduler.active_bucket_ids)])
+            global_step = int(getattr(self, "global_step", 0))
+            stage_index = self._curriculum_scheduler.stage_index(global_step)
+            stage = self._curriculum_scheduler.stage(global_step)
+            active_bucket_ids = self._curriculum_scheduler.active_bucket_ids(
+                global_step
             )
-            for bucket_id, quota in quota_counts.items():
+            target_weights = self._curriculum_scheduler.target_weights(global_step)
+            self.log_info(
+                f"Curriculum iteration global_step={global_step} uses "
+                f"stage={stage['stage_name']} quotas={stage['quotas']} "
+                f"cursors={self._curriculum_scheduler.bucket_cursors}."
+            )
+            env_metrics["curriculum/stage_index"].append(
+                torch.tensor([stage_index])
+            )
+            env_metrics[f"curriculum/stage_name/{stage['stage_name']}"].append(
+                torch.tensor([1.0])
+            )
+            env_metrics["curriculum/active_bucket_count"].append(
+                torch.tensor([len(active_bucket_ids)])
+            )
+            for bucket_id in self._curriculum_scheduler.bucket_ids:
+                bucket_plan = self._habitat_train_plan["bucket_plans"][bucket_id]
                 env_metrics[f"curriculum/rollout_epoch_count/{bucket_id}"].append(
-                    torch.tensor([quota])
+                    torch.tensor([quota_counts[bucket_id]])
                 )
-                env_metrics[f"curriculum/timeout_ratio/{bucket_id}"].append(
-                    torch.tensor([timeout_rates[bucket_id]])
+                env_metrics[f"curriculum/target_weight/{bucket_id}"].append(
+                    torch.tensor([target_weights[bucket_id]], dtype=torch.float32)
                 )
-            self._curriculum_scheduler.advance()
+                env_metrics[f"curriculum/episode_cursor/{bucket_id}"].append(
+                    torch.tensor(
+                        [self._curriculum_scheduler.bucket_cursors[bucket_id]]
+                    )
+                )
+                env_metrics[f"curriculum/episode_count/{bucket_id}"].append(
+                    torch.tensor([bucket_plan["episode_count"]])
+                )
+                if bucket_id in success_rates:
+                    env_metrics[f"curriculum/success_rate/{bucket_id}"].append(
+                        torch.tensor([success_rates[bucket_id]])
+                    )
+                if bucket_id in timeout_rates:
+                    env_metrics[f"curriculum/timeout_ratio/{bucket_id}"].append(
+                        torch.tensor([timeout_rates[bucket_id]])
+                    )
+            for metric_name in (
+                "dropped_below_global_min",
+                "dropped_above_global_max",
+                "dropped_in_bucket_gaps",
+            ):
+                env_metrics[f"curriculum/{metric_name}"].append(
+                    torch.tensor([self._habitat_train_plan[metric_name]])
+                )
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()

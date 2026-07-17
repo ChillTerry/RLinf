@@ -19,7 +19,6 @@ def test_habitat_r2r_ppo_uninavid_config_selects_gae_actor_critic():
     assert model_cfg.detach_critic_input is True
     assert cfg.critic.use_critic_model is False
     assert cfg.env.train.action_length_bucketing is False
-    assert len(cfg.env.train.curriculum_stages) == 2
 
 
 def test_habitat_rxr_ppo_uninavid_config_selects_gae_actor_critic():
@@ -35,5 +34,12 @@ def test_habitat_rxr_ppo_uninavid_config_selects_gae_actor_critic():
 def test_habitat_rxr_grpo_uninavid_config_exposes_opt_in_curriculum():
     cfg = _load_config("habitat_rxr_grpo_uninavid.yaml")
 
-    assert cfg.env.train.action_length_bucketing is False
-    assert len(cfg.env.train.curriculum_stages) == 4
+    assert cfg.env.train.action_length_bucketing is True
+    assert cfg.algorithm.rollout_epoch == 8
+    assert list(cfg.env.train.bucket_step_range_map) == [
+        "bucket_1",
+        "bucket_2",
+        "bucket_3",
+        "bucket_4",
+    ]
+    assert list(cfg.env.train.curriculum_stages_map.stages_1) == [5, 3, 0, 0]

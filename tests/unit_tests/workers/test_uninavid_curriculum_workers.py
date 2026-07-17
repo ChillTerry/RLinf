@@ -189,3 +189,23 @@ def test_env_curriculum_rates_are_identical_global_rank_means():
 
     assert success == {"B0": 0.5, "B1": 0.25}
     assert timeout == {"B0": 0.25}
+
+
+def test_env_worker_maps_global_stream_assignment_by_rank_stage_and_group():
+    worker = EnvWorker.__new__(EnvWorker)
+    worker._rank = 1
+    worker.stage_num = 2
+    worker.train_num_envs_per_stage = 4
+    worker.cfg = SimpleNamespace(
+        env=SimpleNamespace(train=SimpleNamespace(group_size=2))
+    )
+    worker._curriculum_scheduler = SimpleNamespace(
+        allocate_episode_ids=lambda _bucket_id: tuple(
+            f"episode-{index}" for index in range(8)
+        )
+    )
+
+    assert worker._allocate_curriculum_group_episode_ids("bucket") == [
+        ("episode-4", "episode-5"),
+        ("episode-6", "episode-7"),
+    ]

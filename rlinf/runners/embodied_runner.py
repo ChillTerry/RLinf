@@ -566,9 +566,17 @@ class EmbodiedRunner:
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
         if bool(getattr(self, "curriculum_enabled", False)):
             curriculum_states = self.env.get_curriculum_state().wait()
+            if not curriculum_states:
+                raise RuntimeError("Curriculum checkpoint state is empty.")
+            first_state = curriculum_states[0]
+            if any(state != first_state for state in curriculum_states[1:]):
+                raise RuntimeError(
+                    "Habitat UniNaVid curriculum cursors diverged across EnvWorker "
+                    "ranks."
+                )
             curriculum_path = os.path.join(base_output_dir, "curriculum_state.json")
             with open(curriculum_path, "w", encoding="utf-8") as file_obj:
-                json.dump(curriculum_states, file_obj, indent=2)
+                json.dump(first_state, file_obj, indent=2)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

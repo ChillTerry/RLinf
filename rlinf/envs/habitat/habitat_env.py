@@ -35,8 +35,11 @@ from rlinf.envs.habitat.extensions import measures, rxr_dataset, video  # noqa: 
 from rlinf.envs.habitat.extensions.allocator import (
     build_action_length_buckets,
     filter_episodes_by_gt_action_length,
-    get_episode_id,
     random_episode_sequences,
+)
+from rlinf.envs.habitat.extensions.bucket_scheduler import (
+    build_round_robin_bucket_order,
+    normalize_bucket_curriculum_plan,
 )
 from rlinf.envs.habitat.extensions.subgoal import (
     SubgoalRewardConfig,
@@ -58,6 +61,23 @@ def build_habitat_global_plan(
     total_num_processes: int,
     max_episode_steps: int,
 ) -> dict:
+    bucketing_enabled = bool(getattr(cfg, "action_length_bucketing", False))
+    normalized_curriculum_plan = None
+    compatibility_max_episode_steps = max_episode_steps
+    if bucketing_enabled:
+        normalized_curriculum_plan = normalize_bucket_curriculum_plan(
+            bucket_step_range_map=cfg.bucket_step_range_map,
+            bucket_max_steps=cfg.bucket_max_steps,
+            curriculum_stages_map=cfg.curriculum_stages_map,
+            rollout_epoch=int(cfg.rollout_epoch),
+            curriculum_interval=int(cfg.curriculum_interval),
+            effective_num_action_chunks=int(cfg.effective_num_action_chunks),
+            bucket_schedule_seed=int(cfg.bucket_schedule_seed),
+        )
+        compatibility_max_episode_steps = max(
+            int(value) for value in cfg.bucket_max_steps
+        )
+
     # Habitat uses hydra to load the config, but hydra may already be
     # initialized elsewhere in the process.
     hydra_initialized = GlobalHydra.instance().is_initialized()
@@ -65,7 +85,9 @@ def build_habitat_global_plan(
         GlobalHydra.instance().clear()
 
     config_path = cfg.init_params.config_path
-    overrides = build_habitat_overrides(cfg, max_episode_steps=max_episode_steps)
+    overrides = build_habitat_overrides(
+        cfg, max_episode_steps=compatibility_max_episode_steps
+    )
     habitat_config = get_config(config_path, overrides=overrides)
 
     habitat_dataset = habitat.datasets.make_dataset(
@@ -85,30 +107,41 @@ def build_habitat_global_plan(
         ]
 
     gt_data = None
+    filter_result = None
+    min_gt_action_length = getattr(cfg, "min_gt_action_length", None)
     max_gt_action_length = getattr(cfg, "max_gt_action_length", None)
-    if max_gt_action_length is not None:
+    if min_gt_action_length is not None or max_gt_action_length is not None:
+        if max_gt_action_length is None:
+            raise ValueError("min_gt_action_length requires max_gt_action_length.")
         gt_path = getattr(cfg, "gt_path", None)
         if gt_path is None:
-            raise ValueError("max_gt_action_length requires gt_path.")
+            raise ValueError("GT action-length filtering requires gt_path.")
         gt_data = load_habitat_gt_data(gt_path)
-        habitat_dataset.episodes, dropped_episode_ids = (
-            filter_episodes_by_gt_action_length(
-                habitat_dataset.episodes,
-                gt_data,
-                max_action_length=int(max_gt_action_length),
-            )
+        filter_result = filter_episodes_by_gt_action_length(
+            habitat_dataset.episodes,
+            gt_data,
+            min_action_length=int(min_gt_action_length or 0),
+            max_action_length=int(max_gt_action_length),
         )
+        habitat_dataset.episodes = list(filter_result.episodes)
         if not habitat_dataset.episodes:
             raise ValueError(
-                "No Habitat episodes remain after filtering GT action length "
-                f"> {int(max_gt_action_length)}."
+                "No Habitat episodes remain after filtering GT action length to "
+                f"[{int(min_gt_action_length or 0)}, {int(max_gt_action_length)}]."
             )
-        if dropped_episode_ids:
+        if filter_result.dropped_below_ids:
+            logger.info(
+                "Dropped %s Habitat episodes with GT action length < %s; first ids: %s",
+                len(filter_result.dropped_below_ids),
+                int(min_gt_action_length or 0),
+                filter_result.dropped_below_ids[:50],
+            )
+        if filter_result.dropped_above_ids:
             logger.info(
                 "Dropped %s Habitat episodes with GT action length > %s; first ids: %s",
-                len(dropped_episode_ids),
+                len(filter_result.dropped_above_ids),
                 int(max_gt_action_length),
-                dropped_episode_ids[:50],
+                filter_result.dropped_above_ids[:50],
             )
 
     episode_sequences = random_episode_sequences(
@@ -128,47 +161,77 @@ def build_habitat_global_plan(
         "sampled_scene_ids": sampled_scene_ids,
         "episode_sequences": episode_sequences,
     }
-    if bool(getattr(cfg, "action_length_bucketing", False)):
+    if bucketing_enabled:
         if gt_data is None:
             raise ValueError("Habitat action-length bucketing requires GT data.")
-        buckets = build_action_length_buckets(
+        active_bucket_ids = {
+            bucket_id
+            for stage in normalized_curriculum_plan["stages"]
+            for bucket_id, quota in zip(
+                normalized_curriculum_plan["bucket_ids"], stage["quotas"]
+            )
+            if int(quota) > 0
+        }
+        buckets, gap_episodes = build_action_length_buckets(
             habitat_dataset.episodes,
             gt_data,
-            bin_size=int(cfg.action_length_bin_size),
-            max_action_length=int(cfg.max_gt_action_length),
-            max_steps_ratio=float(cfg.max_steps_ratio),
-            num_action_chunks=int(cfg.num_action_chunks),
+            bucket_ids=normalized_curriculum_plan["bucket_ids"],
+            bucket_plans=normalized_curriculum_plan["bucket_plans"],
+            bucket_schedule_seed=int(cfg.bucket_schedule_seed),
             minimum_bucket_size=total_num_processes * num_group,
+            minimum_bucket_ids=tuple(active_bucket_ids),
         )
-        bucket_plans = {}
-        episode_by_id = {
-            get_episode_id(episode): episode for episode in habitat_dataset.episodes
-        }
-        for bucket_index, bucket in enumerate(buckets):
-            bucket_episodes = [
-                episode_by_id[episode_id] for episode_id in bucket.episode_ids
-            ]
-            bucket_plans[bucket.bucket_id] = {
-                "bucket_id": bucket.bucket_id,
-                "lower_bound": bucket.lower_bound,
-                "upper_bound": bucket.upper_bound,
-                "horizon_steps": bucket.horizon_steps,
-                "n_chunk_steps": bucket.n_chunk_steps,
-                "episode_sequences": random_episode_sequences(
-                    bucket_episodes,
-                    seed=int(cfg.bucket_schedule_seed) + bucket_index,
-                    auto_reset=False,
-                    total_num_processes=total_num_processes,
-                    num_group=num_group,
-                    total_num_envs=cfg.total_num_envs,
-                    max_steps_per_rollout_epoch=bucket.horizon_steps,
-                    max_episode_steps=bucket.horizon_steps,
-                ),
-            }
-        plan["bucket_plans"] = bucket_plans
-        plan["bucket_ids"] = list(bucket_plans)
-        first_bucket = bucket_plans[plan["bucket_ids"][0]]
-        plan["episode_sequences"] = first_bucket["episode_sequences"]
+        for bucket in buckets:
+            bucket_plan = normalized_curriculum_plan["bucket_plans"][bucket.bucket_id]
+            bucket_plan["episode_ids"] = list(bucket.episode_ids)
+            bucket_plan["episode_count"] = len(bucket.episode_ids)
+        normalized_curriculum_plan["dropped_below_global_min"] = len(
+            filter_result.dropped_below_ids
+        )
+        normalized_curriculum_plan["dropped_above_global_max"] = len(
+            filter_result.dropped_above_ids
+        )
+        normalized_curriculum_plan["dropped_in_bucket_gaps"] = len(gap_episodes)
+        normalized_curriculum_plan["gap_episode_samples"] = [
+            {"episode_id": episode_id, "action_length": action_length}
+            for episode_id, action_length in gap_episodes[:50]
+        ]
+        plan.update(normalized_curriculum_plan)
+
+        if gap_episodes:
+            logger.info(
+                "Dropped %s Habitat episodes in configured bucket gaps; first "
+                "(episode_id, action_length) values: %s",
+                len(gap_episodes),
+                gap_episodes[:50],
+            )
+        logger.info(
+            "Normalized Habitat UniNaVid bucket plan: %s",
+            [
+                {
+                    "bucket_id": bucket_id,
+                    "range": [
+                        plan["bucket_plans"][bucket_id]["lower_bound"],
+                        plan["bucket_plans"][bucket_id]["upper_bound"],
+                    ],
+                    "upper_inclusive": plan["bucket_plans"][bucket_id][
+                        "upper_inclusive"
+                    ],
+                    "episode_count": plan["bucket_plans"][bucket_id][
+                        "episode_count"
+                    ],
+                    "max_steps": plan["bucket_plans"][bucket_id]["horizon_steps"],
+                }
+                for bucket_id in plan["bucket_ids"]
+            ],
+        )
+        for stage in plan["stages"]:
+            logger.info(
+                "Habitat UniNaVid curriculum stage %s quotas=%s order=%s",
+                stage["stage_name"],
+                stage["quotas"],
+                build_round_robin_bucket_order(plan["bucket_ids"], stage["quotas"]),
+            )
     return plan
 
 
@@ -267,7 +330,6 @@ class HabitatEnv(gym.Env):
         self.first_done_cached_mask = np.zeros(self.num_envs, dtype=bool)
         self.episode_info = None
         self._active_bucket_id = None
-        self._bucket_cursors = {}
 
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
@@ -313,7 +375,12 @@ class HabitatEnv(gym.Env):
             4: "no_op",
         }
 
-    def activate_bucket(self, bucket_id: str, horizon_steps: int) -> None:
+    def activate_bucket(
+        self,
+        bucket_id: str,
+        horizon_steps: int,
+        group_episode_ids: list[str] | tuple[str, ...],
+    ) -> None:
         if not bool(getattr(self.cfg, "action_length_bucketing", False)):
             raise RuntimeError("Habitat action-length bucketing is not enabled.")
         global_plan = getattr(self.cfg, "global_plan", None)
@@ -327,36 +394,34 @@ class HabitatEnv(gym.Env):
                 f"Bucket {bucket_id} horizon mismatch: expected "
                 f"{bucket_plan['horizon_steps']}, got {horizon_steps}."
             )
+        if len(group_episode_ids) != self.num_group:
+            raise ValueError(
+                f"Bucket {bucket_id} activation requires {self.num_group} group "
+                f"episode IDs, got {len(group_episode_ids)}."
+            )
+        known_episode_ids = set(bucket_plan["episode_ids"])
+        unknown_episode_ids = [
+            str(episode_id)
+            for episode_id in group_episode_ids
+            if str(episode_id) not in known_episode_ids
+        ]
+        if unknown_episode_ids:
+            raise ValueError(
+                f"Bucket {bucket_id} activation contains unknown episode IDs: "
+                f"{unknown_episode_ids[:10]}."
+            )
         self._active_bucket_id = bucket_id
         self.max_episode_steps = int(horizon_steps)
         self.env.reconfigure_env_fns(
-            self._get_env_fn_params(bucket_id=bucket_id, horizon_steps=horizon_steps)
+            self._get_env_fn_params(
+                bucket_id=bucket_id,
+                horizon_steps=horizon_steps,
+                group_episode_ids=group_episode_ids,
+            )
         )
-        cursor = self._bucket_cursors.setdefault(
-            bucket_id, [0 for _ in range(self.num_group)]
-        )
-        sequences = bucket_plan["episode_sequences"][self.seed_offset]
-        for group_id, episode_ids in enumerate(sequences):
-            cursor[group_id] = (cursor[group_id] + 1) % len(episode_ids)
         self._elapsed_steps.fill(0)
         self.first_done_cached_mask.fill(False)
         self.current_raw_obs = None
-
-    def get_curriculum_state(self) -> dict:
-        return {
-            "active_bucket_id": self._active_bucket_id,
-            "bucket_cursors": {
-                bucket_id: list(cursors)
-                for bucket_id, cursors in self._bucket_cursors.items()
-            },
-        }
-
-    def load_curriculum_state(self, state: dict) -> None:
-        self._active_bucket_id = state.get("active_bucket_id")
-        self._bucket_cursors = {
-            str(bucket_id): [int(cursor) for cursor in cursors]
-            for bucket_id, cursors in state["bucket_cursors"].items()
-        }
 
     @property
     def elapsed_steps(self):
@@ -917,7 +982,12 @@ class HabitatEnv(gym.Env):
 
         return env_fns
 
-    def _get_env_fn_params(self, bucket_id=None, horizon_steps=None):
+    def _get_env_fn_params(
+        self,
+        bucket_id=None,
+        horizon_steps=None,
+        group_episode_ids=None,
+    ):
         env_fn_params = []
         global_plan = getattr(self.cfg, "global_plan", None)
         if global_plan is None:
@@ -931,32 +1001,20 @@ class HabitatEnv(gym.Env):
         config_path = global_plan["config_path"]
         overrides = list(global_plan["overrides"])
         episode_sequences = global_plan["episode_sequences"]
-        if bucket_id is not None:
-            episode_sequences = global_plan["bucket_plans"][bucket_id][
-                "episode_sequences"
-            ]
         if horizon_steps is not None:
             prefix = "habitat.environment.max_episode_steps="
             overrides = [value for value in overrides if not value.startswith(prefix)]
             overrides.append(f"{prefix}{int(horizon_steps)}")
-        process_group_episode_ids = episode_sequences[self.seed_offset]
-
-        rotated_group_episode_ids = []
-        if bucket_id is not None:
-            cursors = self._bucket_cursors.setdefault(
-                bucket_id, [0 for _ in range(self.num_group)]
-            )
-            for group_id, episode_ids in enumerate(process_group_episode_ids):
-                cursor = cursors[group_id] % len(episode_ids)
-                rotated_group_episode_ids.append(
-                    list(episode_ids[cursor:]) + list(episode_ids[:cursor])
-                )
+        if group_episode_ids is not None:
+            process_group_episode_ids = [
+                [str(episode_id)] for episode_id in group_episode_ids
+            ]
         else:
-            rotated_group_episode_ids = process_group_episode_ids
+            process_group_episode_ids = episode_sequences[self.seed_offset]
 
         for env_id in range(self.num_envs):
             group_id = env_id // self.group_size
-            assigned_ids = list(rotated_group_episode_ids[group_id])
+            assigned_ids = list(process_group_episode_ids[group_id])
 
             env_fn_params.append(
                 {

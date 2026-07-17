@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -73,6 +74,48 @@ def test_regular_checkpoint_is_independent_from_best_checkpoint(tmp_path):
     runner.actor.save_checkpoint.assert_called_once()
     save_path = runner.actor.save_checkpoint.call_args.args[0]
     assert save_path.endswith("checkpoints/global_step_3/actor")
+
+
+def test_curriculum_checkpoint_saves_one_verified_global_cursor_state(tmp_path):
+    runner = _make_runner(tmp_path)
+    state = {
+        "bucket_cursors": {"short": 4, "long": 2},
+        "plan_signature": "signature",
+    }
+    runner.curriculum_enabled = True
+    runner.env = MagicMock()
+    runner.env.get_curriculum_state.return_value = _ImmediateHandle([state, state])
+
+    runner._save_checkpoint()
+
+    state_path = (
+        tmp_path
+        / "save_policy"
+        / "checkpoints"
+        / "global_step_3"
+        / "curriculum_state.json"
+    )
+    with state_path.open(encoding="utf-8") as file_obj:
+        assert json.load(file_obj) == state
+
+
+def test_curriculum_checkpoint_rejects_diverged_rank_cursors(tmp_path):
+    runner = _make_runner(tmp_path)
+    runner.curriculum_enabled = True
+    runner.env = MagicMock()
+    runner.env.get_curriculum_state.return_value = _ImmediateHandle(
+        [
+            {"bucket_cursors": {"short": 1}, "plan_signature": "signature"},
+            {"bucket_cursors": {"short": 2}, "plan_signature": "signature"},
+        ]
+    )
+
+    try:
+        runner._save_checkpoint()
+    except RuntimeError as exc:
+        assert "diverged across EnvWorker ranks" in str(exc)
+    else:
+        raise AssertionError("Diverged curriculum cursors must fail checkpointing")
 
 
 def test_save_best_checkpoint_when_metric_improves(tmp_path):

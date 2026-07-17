@@ -14,188 +14,320 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from numbers import Integral
 from typing import Mapping, Sequence
 
 
-@dataclass(frozen=True)
-class CurriculumStage:
-    active_bucket_count: int
-    weights: tuple[float, ...]
-
-    @classmethod
-    def from_config(cls, config) -> "CurriculumStage":
-        return cls(
-            active_bucket_count=int(config.active_bucket_count),
-            weights=tuple(float(weight) for weight in config.weights),
-        )
+def _require_integer(value, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{field} must be an integer.")
+    return int(value)
 
 
-def validate_curriculum_stages(
-    stages: Sequence[CurriculumStage], *, rollout_epoch: int
+def _ordered_items(config, *, field: str) -> list[tuple[str, object]]:
+    if config is None or not hasattr(config, "items"):
+        raise ValueError(f"{field} must be a map.")
+    items = [(str(key), value) for key, value in config.items()]
+    if not items:
+        raise ValueError(f"{field} must contain at least one entry.")
+    names = [name for name, _ in items]
+    if any(not name for name in names):
+        raise ValueError(f"{field} names must be non-empty.")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{field} names must be unique.")
+    return items
+
+
+def _validate_non_overlapping_ranges(
+    bucket_ranges: Sequence[tuple[int, int]],
+    bucket_ids: Sequence[str],
 ) -> None:
-    if not stages:
-        raise ValueError("curriculum_stages must contain at least one stage.")
-    previous_bucket_count = 0
-    for stage_index, stage in enumerate(stages):
-        if stage.active_bucket_count <= previous_bucket_count:
+    # GT action lengths are integers. Every bucket except the last is [lo, hi),
+    # while the last declared bucket is [lo, hi].
+    integer_bounds = [
+        (lower, upper if index == len(bucket_ranges) - 1 else upper - 1)
+        for index, (lower, upper) in enumerate(bucket_ranges)
+    ]
+    for left in range(len(integer_bounds)):
+        for right in range(left + 1, len(integer_bounds)):
+            overlap_lower = max(integer_bounds[left][0], integer_bounds[right][0])
+            overlap_upper = min(integer_bounds[left][1], integer_bounds[right][1])
+            if overlap_lower <= overlap_upper:
+                raise ValueError(
+                    "bucket_step_range_map contains overlapping buckets "
+                    f"{bucket_ids[left]!r} and {bucket_ids[right]!r}."
+                )
+
+
+def normalize_bucket_curriculum_plan(
+    *,
+    bucket_step_range_map,
+    bucket_max_steps,
+    curriculum_stages_map,
+    rollout_epoch: int,
+    curriculum_interval: int,
+    effective_num_action_chunks: int,
+    bucket_schedule_seed: int,
+) -> dict:
+    """Validate and serialize the declaration-ordered curriculum contract."""
+    rollout_epoch = _require_integer(rollout_epoch, field="rollout_epoch")
+    if rollout_epoch <= 0:
+        raise ValueError("rollout_epoch must be positive.")
+    curriculum_interval = _require_integer(
+        curriculum_interval, field="curriculum_interval"
+    )
+    if curriculum_interval <= 0:
+        raise ValueError("curriculum_interval must be positive.")
+    effective_num_action_chunks = _require_integer(
+        effective_num_action_chunks, field="effective_num_action_chunks"
+    )
+    if effective_num_action_chunks <= 0:
+        raise ValueError("effective_num_action_chunks must be positive.")
+    bucket_schedule_seed = _require_integer(
+        bucket_schedule_seed, field="bucket_schedule_seed"
+    )
+
+    range_items = _ordered_items(
+        bucket_step_range_map, field="bucket_step_range_map"
+    )
+    bucket_ids = [bucket_id for bucket_id, _ in range_items]
+    bucket_ranges = []
+    for bucket_id, configured_range in range_items:
+        if not isinstance(configured_range, Sequence) or isinstance(
+            configured_range, (str, bytes)
+        ):
+            raise ValueError(f"Bucket {bucket_id!r} range must contain two integers.")
+        if len(configured_range) != 2:
+            raise ValueError(f"Bucket {bucket_id!r} range must contain two integers.")
+        lower = _require_integer(
+            configured_range[0], field=f"Bucket {bucket_id!r} lower bound"
+        )
+        upper = _require_integer(
+            configured_range[1], field=f"Bucket {bucket_id!r} upper bound"
+        )
+        if lower >= upper:
+            raise ValueError(f"Bucket {bucket_id!r} must satisfy lower < upper.")
+        bucket_ranges.append((lower, upper))
+    _validate_non_overlapping_ranges(bucket_ranges, bucket_ids)
+
+    if not isinstance(bucket_max_steps, Sequence) or isinstance(
+        bucket_max_steps, (str, bytes)
+    ):
+        raise ValueError("bucket_max_steps must be a sequence.")
+    if len(bucket_max_steps) != len(bucket_ids):
+        raise ValueError("bucket_max_steps length must match the bucket count.")
+    normalized_max_steps = []
+    for bucket_id, configured_steps in zip(bucket_ids, bucket_max_steps):
+        max_steps = _require_integer(
+            configured_steps, field=f"bucket_max_steps for {bucket_id!r}"
+        )
+        if max_steps <= 0:
+            raise ValueError(f"bucket_max_steps for {bucket_id!r} must be positive.")
+        if max_steps % effective_num_action_chunks != 0:
             raise ValueError(
-                "curriculum_stages active_bucket_count must increase strictly."
+                f"Bucket {bucket_id!r} max steps {max_steps} is not divisible by "
+                f"the effective action chunk count {effective_num_action_chunks}."
             )
-        if stage.active_bucket_count > rollout_epoch:
+        normalized_max_steps.append(max_steps)
+
+    stage_items = _ordered_items(
+        curriculum_stages_map, field="curriculum_stages_map"
+    )
+    stages = []
+    for stage_name, configured_quotas in stage_items:
+        if not isinstance(configured_quotas, Sequence) or isinstance(
+            configured_quotas, (str, bytes)
+        ):
+            raise ValueError(f"Stage {stage_name!r} quotas must be a sequence.")
+        if len(configured_quotas) != len(bucket_ids):
             raise ValueError(
-                f"Curriculum stage {stage_index} activates "
-                f"{stage.active_bucket_count} buckets, exceeding rollout_epoch="
+                f"Stage {stage_name!r} quota length must match the bucket count."
+            )
+        quotas = tuple(
+            _require_integer(value, field=f"Stage {stage_name!r} quota")
+            for value in configured_quotas
+        )
+        if any(quota < 0 for quota in quotas):
+            raise ValueError(f"Stage {stage_name!r} quotas must be non-negative.")
+        if sum(quotas) != rollout_epoch:
+            raise ValueError(
+                f"Stage {stage_name!r} quotas must sum to rollout_epoch="
                 f"{rollout_epoch}."
             )
-        if len(stage.weights) != stage.active_bucket_count:
-            raise ValueError(
-                f"Curriculum stage {stage_index} weights must match "
-                "active_bucket_count."
-            )
-        if any(weight <= 0.0 for weight in stage.weights):
-            raise ValueError("Curriculum weights must be strictly positive.")
-        if abs(sum(stage.weights) - 1.0) > 1e-8:
-            raise ValueError("Curriculum weights must sum to 1.")
-        previous_bucket_count = stage.active_bucket_count
+        stages.append(
+            {
+                "stage_name": stage_name,
+                "quotas": list(quotas),
+                "target_weights": [quota / rollout_epoch for quota in quotas],
+            }
+        )
+
+    bucket_plans = {}
+    for index, (bucket_id, (lower, upper), max_steps) in enumerate(
+        zip(bucket_ids, bucket_ranges, normalized_max_steps)
+    ):
+        bucket_plans[bucket_id] = {
+            "bucket_id": bucket_id,
+            "bucket_index": index,
+            "lower_bound": lower,
+            "upper_bound": upper,
+            "upper_inclusive": index == len(bucket_ids) - 1,
+            "horizon_steps": max_steps,
+            "n_chunk_steps": max_steps // effective_num_action_chunks,
+        }
+
+    return {
+        "bucket_ids": bucket_ids,
+        "bucket_plans": bucket_plans,
+        "stages": stages,
+        "rollout_epoch": rollout_epoch,
+        "curriculum_interval": curriculum_interval,
+        "effective_num_action_chunks": effective_num_action_chunks,
+        "bucket_schedule_seed": bucket_schedule_seed,
+    }
+
+
+def build_round_robin_bucket_order(
+    bucket_ids: Sequence[str], quotas: Sequence[int]
+) -> list[str]:
+    if len(bucket_ids) != len(quotas):
+        raise ValueError("Bucket IDs and quotas must have matching lengths.")
+    remaining = [int(quota) for quota in quotas]
+    if any(quota < 0 for quota in remaining):
+        raise ValueError("Bucket quotas must be non-negative.")
+    order = []
+    while any(remaining):
+        for index, bucket_id in enumerate(bucket_ids):
+            if remaining[index] > 0:
+                order.append(str(bucket_id))
+                remaining[index] -= 1
+    return order
+
+
+def curriculum_plan_signature(plan: Mapping) -> str:
+    signature_payload = {
+        "bucket_ids": list(plan["bucket_ids"]),
+        "bucket_schedule_seed": int(plan["bucket_schedule_seed"]),
+        "buckets": [
+            {
+                "bucket_id": bucket_id,
+                "lower_bound": int(plan["bucket_plans"][bucket_id]["lower_bound"]),
+                "upper_bound": int(plan["bucket_plans"][bucket_id]["upper_bound"]),
+                "upper_inclusive": bool(
+                    plan["bucket_plans"][bucket_id]["upper_inclusive"]
+                ),
+                "episode_ids": list(plan["bucket_plans"][bucket_id]["episode_ids"]),
+            }
+            for bucket_id in plan["bucket_ids"]
+        ],
+    }
+    encoded = json.dumps(
+        signature_payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class BucketCurriculumScheduler:
-    """Stateful, deterministic rollout-epoch quota scheduler."""
+    """Global-step stage selection and deterministic global episode cursors."""
 
-    def __init__(
-        self,
-        *,
-        bucket_ids: Sequence[str],
-        stages: Sequence[CurriculumStage],
-        rollout_epoch: int,
-        curriculum_interval: int,
-        success_threshold: float | None = None,
-        seed: int = 0,
-    ):
-        validate_curriculum_stages(stages, rollout_epoch=rollout_epoch)
-        if len(bucket_ids) < stages[-1].active_bucket_count:
-            raise ValueError("Not enough buckets for the configured curriculum stages.")
-        if curriculum_interval <= 0:
-            raise ValueError("curriculum_interval must be positive.")
-        self.bucket_ids = tuple(str(bucket_id) for bucket_id in bucket_ids)
-        self.stages = tuple(stages)
-        self.rollout_epoch = int(rollout_epoch)
-        self.curriculum_interval = int(curriculum_interval)
-        self.success_threshold = (
-            None if success_threshold is None else float(success_threshold)
+    def __init__(self, *, plan: Mapping, total_group_streams: int):
+        self.plan = plan
+        self.bucket_ids = tuple(str(value) for value in plan["bucket_ids"])
+        self.stages = tuple(plan["stages"])
+        self.rollout_epoch = int(plan["rollout_epoch"])
+        self.curriculum_interval = int(plan["curriculum_interval"])
+        self.total_group_streams = _require_integer(
+            total_group_streams, field="total_group_streams"
         )
-        self.seed = int(seed)
-        self.stage_index = 0
-        self.iteration = 0
-        self._deficit = [0.0] * self.stages[0].active_bucket_count
-        self._success = {}
-        self._timeout = {}
+        if self.total_group_streams <= 0:
+            raise ValueError("total_group_streams must be positive.")
+        self._bucket_cursors = dict.fromkeys(self.bucket_ids, 0)
+        self._plan_signature = curriculum_plan_signature(plan)
 
-    @property
-    def stage(self) -> CurriculumStage:
-        return self.stages[self.stage_index]
+    def stage_index(self, global_step: int) -> int:
+        global_step = _require_integer(global_step, field="global_step")
+        if global_step < 0:
+            raise ValueError("global_step must be non-negative.")
+        return min(global_step // self.curriculum_interval, len(self.stages) - 1)
 
-    @property
-    def active_bucket_ids(self) -> tuple[str, ...]:
-        return self.bucket_ids[: self.stage.active_bucket_count]
+    def stage(self, global_step: int) -> Mapping:
+        return self.stages[self.stage_index(global_step)]
 
-    def _resize_deficit(self) -> None:
-        active_count = self.stage.active_bucket_count
-        if len(self._deficit) < active_count:
-            self._deficit.extend([0.0] * (active_count - len(self._deficit)))
-        else:
-            self._deficit = self._deficit[:active_count]
+    def active_bucket_ids(self, global_step: int) -> tuple[str, ...]:
+        quotas = self.stage(global_step)["quotas"]
+        return tuple(
+            bucket_id
+            for bucket_id, quota in zip(self.bucket_ids, quotas)
+            if int(quota) > 0
+        )
 
-    def allocate_epoch_quotas(self) -> dict[str, int]:
-        """Allocate every active bucket once, then distribute remaining slots."""
-        stage = self.stage
-        self._resize_deficit()
-        quotas = [1] * stage.active_bucket_count
-        for index, weight in enumerate(stage.weights):
-            self._deficit[index] += self.rollout_epoch * weight - 1.0
-
-        for _ in range(self.rollout_epoch - stage.active_bucket_count):
-            selected = max(
-                range(stage.active_bucket_count),
-                key=lambda index: (self._deficit[index], -index),
-            )
-            quotas[selected] += 1
-            self._deficit[selected] -= 1.0
-
-        return dict(zip(self.active_bucket_ids, quotas))
-
-    def build_epoch_bucket_order(self) -> list[str]:
-        quotas = self.allocate_epoch_quotas()
-        order = []
-        while quotas:
-            for bucket_id in self.active_bucket_ids:
-                remaining = quotas.get(bucket_id, 0)
-                if remaining > 0:
-                    order.append(bucket_id)
-                    if remaining == 1:
-                        del quotas[bucket_id]
-                    else:
-                        quotas[bucket_id] = remaining - 1
+    def build_epoch_bucket_order(self, global_step: int) -> list[str]:
+        order = build_round_robin_bucket_order(
+            self.bucket_ids, self.stage(global_step)["quotas"]
+        )
         if len(order) != self.rollout_epoch:
-            raise RuntimeError("Curriculum quota allocation produced an invalid total.")
+            raise RuntimeError("Curriculum stage produced an invalid rollout total.")
         return order
 
-    def record_bucket_metrics(
-        self,
-        *,
-        success_rates: Mapping[str, float] | None = None,
-        timeout_rates: Mapping[str, float] | None = None,
-    ) -> None:
-        if success_rates is not None:
-            self._success.update(
-                {str(key): float(value) for key, value in success_rates.items()}
-            )
-        if timeout_rates is not None:
-            self._timeout.update(
-                {str(key): float(value) for key, value in timeout_rates.items()}
-            )
+    def target_weights(self, global_step: int) -> dict[str, float]:
+        weights = self.stage(global_step)["target_weights"]
+        return {
+            bucket_id: float(weight)
+            for bucket_id, weight in zip(self.bucket_ids, weights)
+        }
 
-    def advance(self) -> bool:
-        self.iteration += 1
-        if self.stage_index == len(self.stages) - 1:
-            return False
-        interval_ready = self.iteration % self.curriculum_interval == 0
-        success_ready = False
-        if self.success_threshold is not None:
-            hardest = self.active_bucket_ids[-1]
-            success_ready = (
-                self._success.get(hardest, float("-inf")) >= self.success_threshold
+    def allocate_episode_ids(self, bucket_id: str) -> tuple[str, ...]:
+        if bucket_id not in self._bucket_cursors:
+            raise KeyError(f"Unknown curriculum bucket: {bucket_id}")
+        episode_ids = tuple(self.plan["bucket_plans"][bucket_id]["episode_ids"])
+        if len(episode_ids) < self.total_group_streams:
+            raise ValueError(
+                f"Bucket {bucket_id!r} has {len(episode_ids)} episodes, but "
+                f"{self.total_group_streams} global group streams are required."
             )
-        if not interval_ready and not success_ready:
-            return False
-        self.stage_index += 1
-        self._resize_deficit()
-        return True
+        cursor = self._bucket_cursors[bucket_id]
+        assigned = tuple(
+            episode_ids[(cursor + index) % len(episode_ids)]
+            for index in range(self.total_group_streams)
+        )
+        self._bucket_cursors[bucket_id] = (
+            cursor + self.total_group_streams
+        ) % len(episode_ids)
+        return assigned
+
+    @property
+    def bucket_cursors(self) -> dict[str, int]:
+        return dict(self._bucket_cursors)
 
     def state_dict(self) -> dict:
         return {
-            "stage_index": self.stage_index,
-            "iteration": self.iteration,
-            "deficit": list(self._deficit),
-            "success": dict(self._success),
-            "timeout": dict(self._timeout),
-            "seed": self.seed,
+            "bucket_cursors": self.bucket_cursors,
+            "plan_signature": self._plan_signature,
         }
 
     def load_state_dict(self, state: Mapping) -> None:
-        stage_index = int(state["stage_index"])
-        if not 0 <= stage_index < len(self.stages):
-            raise ValueError("Invalid curriculum stage_index in checkpoint.")
-        if int(state.get("seed", self.seed)) != self.seed:
-            raise ValueError("Curriculum checkpoint seed does not match config.")
-        self.stage_index = stage_index
-        self.iteration = int(state["iteration"])
-        self._deficit = [float(value) for value in state["deficit"]]
-        self._resize_deficit()
-        self._success = {
-            str(key): float(value) for key, value in state.get("success", {}).items()
-        }
-        self._timeout = {
-            str(key): float(value) for key, value in state.get("timeout", {}).items()
-        }
+        if state.get("plan_signature") != self._plan_signature:
+            raise ValueError(
+                "Curriculum checkpoint does not match the configured bucket plan "
+                "or deterministic episode order."
+            )
+        cursors = state.get("bucket_cursors")
+        if not isinstance(cursors, Mapping) or tuple(cursors) != self.bucket_ids:
+            raise ValueError(
+                "Curriculum checkpoint bucket IDs or declaration order do not match."
+            )
+        restored = {}
+        for bucket_id in self.bucket_ids:
+            cursor = _require_integer(
+                cursors[bucket_id], field=f"Cursor for bucket {bucket_id!r}"
+            )
+            episode_count = len(self.plan["bucket_plans"][bucket_id]["episode_ids"])
+            if not 0 <= cursor < episode_count:
+                raise ValueError(
+                    f"Cursor {cursor} for bucket {bucket_id!r} is outside the "
+                    f"episode list of length {episode_count}."
+                )
+            restored[bucket_id] = cursor
+        self._bucket_cursors = restored

@@ -17,13 +17,15 @@ from types import SimpleNamespace
 import pytest
 
 from rlinf.envs.habitat.extensions.allocator import (
-    ActionLengthBucket,
     EpisodeRecord,
     build_action_length_buckets,
     filter_episodes_by_gt_action_length,
     get_trimmed_episode_count,
     trim_episode_ids,
     trim_episode_records,
+)
+from rlinf.envs.habitat.extensions.bucket_scheduler import (
+    normalize_bucket_curriculum_plan,
 )
 
 
@@ -99,17 +101,20 @@ def test_filter_episodes_by_gt_action_length_supports_dict_and_object_episodes()
         "3": {"actions": [0, 1, 2, 3]},
     }
 
-    kept, dropped = filter_episodes_by_gt_action_length(
+    result = filter_episodes_by_gt_action_length(
         episodes,
         gt_data,
+        min_action_length=3,
         max_action_length=3,
     )
 
     kept_ids = [
-        str(ep["episode_id"]) if isinstance(ep, dict) else ep.episode_id for ep in kept
+        str(ep["episode_id"]) if isinstance(ep, dict) else ep.episode_id
+        for ep in result.episodes
     ]
-    assert kept_ids == ["1", "2"]
-    assert dropped == ["3"]
+    assert kept_ids == ["2"]
+    assert result.dropped_below_ids == ("1",)
+    assert result.dropped_above_ids == ("3",)
 
 
 def test_filter_episodes_by_gt_action_length_requires_matching_gt():
@@ -117,6 +122,7 @@ def test_filter_episodes_by_gt_action_length_requires_matching_gt():
         filter_episodes_by_gt_action_length(
             [{"episode_id": "1"}],
             {},
+            min_action_length=0,
             max_action_length=3,
         )
 
@@ -126,58 +132,81 @@ def test_filter_episodes_by_gt_action_length_requires_actions_field():
         filter_episodes_by_gt_action_length(
             [{"episode_id": "1"}],
             {"1": {}},
+            min_action_length=0,
             max_action_length=3,
         )
 
 
-def test_filter_episodes_by_gt_action_length_rejects_negative_threshold():
-    with pytest.raises(ValueError, match="max_action_length must be non-negative"):
+def test_filter_episodes_by_gt_action_length_rejects_invalid_bounds():
+    with pytest.raises(ValueError, match="GT action length bounds"):
         filter_episodes_by_gt_action_length(
             [{"episode_id": "1"}],
             {"1": {"actions": []}},
+            min_action_length=4,
             max_action_length=-1,
         )
 
 
-def test_action_length_buckets_merge_small_neighbors_and_align_horizon():
-    lengths = [1, 2, 32, 40, 50, 64, 70, 80, 90, 96]
+def _bucket_plan():
+    return normalize_bucket_curriculum_plan(
+        bucket_step_range_map={
+            "bucket_1": [20, 40],
+            "bucket_2": [40, 60],
+            "bucket_3": [60, 80],
+            "bucket_4": [80, 100],
+        },
+        bucket_max_steps=[40, 80, 120, 160],
+        curriculum_stages_map={"stage": [1, 1, 1, 1]},
+        rollout_epoch=4,
+        curriculum_interval=50,
+        effective_num_action_chunks=4,
+        bucket_schedule_seed=42,
+    )
+
+
+def test_explicit_action_length_bucket_boundaries_and_gap_diagnostics():
+    lengths = [20, 39, 40, 59, 60, 79, 80, 100]
     episodes = [_episode(index) for index in range(len(lengths))]
     gt_data = {
         str(index): {"actions": [0] * length} for index, length in enumerate(lengths)
     }
 
-    buckets = build_action_length_buckets(
+    plan = _bucket_plan()
+    buckets, gaps = build_action_length_buckets(
         episodes,
         gt_data,
-        bin_size=32,
-        max_action_length=96,
-        max_steps_ratio=1.3,
-        num_action_chunks=4,
-        minimum_bucket_size=4,
+        bucket_ids=plan["bucket_ids"],
+        bucket_plans=plan["bucket_plans"],
+        bucket_schedule_seed=42,
+        minimum_bucket_size=2,
     )
 
-    assert buckets == [
-        ActionLengthBucket(
-            bucket_id="B0",
-            lower_bound=0,
-            upper_bound=64,
-            episode_ids=("0", "1", "2", "3", "4"),
-            horizon_steps=84,
-            n_chunk_steps=21,
-        ),
-        ActionLengthBucket(
-            bucket_id="B1",
-            lower_bound=64,
-            upper_bound=96,
-            episode_ids=("5", "6", "7", "8", "9"),
-            horizon_steps=128,
-            n_chunk_steps=32,
-        ),
+    assert gaps == ()
+    assert [set(bucket.episode_ids) for bucket in buckets] == [
+        {"0", "1"},
+        {"2", "3"},
+        {"4", "5"},
+        {"6", "7"},
+    ]
+    assert [(bucket.horizon_steps, bucket.n_chunk_steps) for bucket in buckets] == [
+        (40, 10),
+        (80, 20),
+        (120, 30),
+        (160, 40),
     ]
 
 
 def test_action_length_bucket_rejects_too_few_episodes_without_duplication():
-    with pytest.raises(ValueError, match="minimum_bucket_size=4"):
+    plan = normalize_bucket_curriculum_plan(
+        bucket_step_range_map={"bucket": [0, 10]},
+        bucket_max_steps=[40],
+        curriculum_stages_map={"stage": [1]},
+        rollout_epoch=1,
+        curriculum_interval=1,
+        effective_num_action_chunks=4,
+        bucket_schedule_seed=42,
+    )
+    with pytest.raises(ValueError, match="4 global group streams"):
         build_action_length_buckets(
             [_episode(0), _episode(1), _episode(2)],
             {
@@ -185,9 +214,38 @@ def test_action_length_bucket_rejects_too_few_episodes_without_duplication():
                 "1": {"actions": [0, 1]},
                 "2": {"actions": [0, 1, 2]},
             },
-            bin_size=32,
-            max_action_length=96,
-            max_steps_ratio=1.0,
-            num_action_chunks=4,
+            bucket_ids=plan["bucket_ids"],
+            bucket_plans=plan["bucket_plans"],
+            bucket_schedule_seed=42,
             minimum_bucket_size=4,
         )
+
+
+def test_action_length_bucket_reports_gap_and_rejects_empty_bucket():
+    plan = normalize_bucket_curriculum_plan(
+        bucket_step_range_map={"low": [0, 2], "high": [4, 6]},
+        bucket_max_steps=[4, 8],
+        curriculum_stages_map={"stage": [1, 0]},
+        rollout_epoch=1,
+        curriculum_interval=1,
+        effective_num_action_chunks=4,
+        bucket_schedule_seed=42,
+    )
+    episodes = [_episode(index) for index in range(3)]
+    gt_data = {
+        "0": {"actions": [0]},
+        "1": {"actions": [0, 0, 0]},
+        "2": {"actions": [0, 0, 0, 0]},
+    }
+
+    buckets, gaps = build_action_length_buckets(
+        episodes,
+        gt_data,
+        bucket_ids=plan["bucket_ids"],
+        bucket_plans=plan["bucket_plans"],
+        bucket_schedule_seed=42,
+        minimum_bucket_size=1,
+    )
+
+    assert [bucket.bucket_id for bucket in buckets] == ["low", "high"]
+    assert gaps == (("1", 3),)

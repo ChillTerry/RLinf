@@ -800,9 +800,9 @@ def validate_habitat_uninavid_curriculum_cfg(cfg, model_type) -> None:
         return
 
     from rlinf.envs.habitat.extensions.bucket_scheduler import (
-        CurriculumStage,
-        validate_curriculum_stages,
+        normalize_bucket_curriculum_plan,
     )
+    from rlinf.utils.action_chunks import get_effective_num_action_chunks
 
     env_type = SupportedEnvType(cfg.env.train.env_type)
     if env_type != SupportedEnvType.HABITAT or model_type != SupportedModel.UNINAVID:
@@ -810,16 +810,20 @@ def validate_habitat_uninavid_curriculum_cfg(cfg, model_type) -> None:
             "action_length_bucketing is supported only for Habitat + UniNaVid."
         )
     with open_dict(cfg.env.train):
-        cfg.env.train.num_action_chunks = int(cfg.actor.model.num_action_chunks)
+        cfg.env.train.effective_num_action_chunks = get_effective_num_action_chunks(
+            cfg.actor.model, "train"
+        )
         cfg.env.train.bucket_schedule_seed = int(
             cfg.env.train.get("bucket_schedule_seed", cfg.actor.seed)
         )
-    if int(cfg.env.train.action_length_bin_size) <= 0:
-        raise ValueError("action_length_bin_size must be positive.")
-    if int(cfg.env.train.max_gt_action_length) <= 0:
-        raise ValueError("max_gt_action_length must be positive.")
-    if float(cfg.env.train.max_steps_ratio) <= 0.0:
-        raise ValueError("max_steps_ratio must be positive.")
+        cfg.env.train.rollout_epoch = int(cfg.algorithm.rollout_epoch)
+    min_gt_action_length = int(cfg.env.train.min_gt_action_length)
+    max_gt_action_length = int(cfg.env.train.max_gt_action_length)
+    if min_gt_action_length < 0 or max_gt_action_length < min_gt_action_length:
+        raise ValueError(
+            "GT action length bounds must satisfy 0 <= min_gt_action_length "
+            "<= max_gt_action_length."
+        )
     if not cfg.env.train.get("gt_path", None):
         raise ValueError("Habitat action-length bucketing requires gt_path.")
     if cfg.actor.training_backend != "fsdp":
@@ -832,14 +836,22 @@ def validate_habitat_uninavid_curriculum_cfg(cfg, model_type) -> None:
         )
     if cfg.algorithm.adv_type not in ("gae", "grpo"):
         raise ValueError("Habitat UniNaVid curriculum supports only GAE and GRPO.")
-    if bool(cfg.env.train.get("bucket_curriculum_enabled", False)):
-        stages = tuple(
-            CurriculumStage.from_config(stage)
-            for stage in cfg.env.train.curriculum_stages
-        )
-        validate_curriculum_stages(
-            stages, rollout_epoch=int(cfg.algorithm.rollout_epoch)
-        )
+    normalize_bucket_curriculum_plan(
+        bucket_step_range_map=cfg.env.train.bucket_step_range_map,
+        bucket_max_steps=cfg.env.train.bucket_max_steps,
+        curriculum_stages_map=cfg.env.train.curriculum_stages_map,
+        rollout_epoch=int(cfg.algorithm.rollout_epoch),
+        curriculum_interval=cfg.env.train.curriculum_interval,
+        effective_num_action_chunks=cfg.env.train.effective_num_action_chunks,
+        bucket_schedule_seed=cfg.env.train.bucket_schedule_seed,
+    )
+    # The generic EnvWorker constructor still reads these fixed-horizon fields.
+    # In this three-part opt-in branch they are compatibility values only; every
+    # selected bucket still supplies its exact runtime horizon through its spec.
+    compatibility_horizon = max(int(value) for value in cfg.env.train.bucket_max_steps)
+    with open_dict(cfg.env.train):
+        cfg.env.train.max_episode_steps = compatibility_horizon
+        cfg.env.train.max_steps_per_rollout_epoch = compatibility_horizon
 
 
 def validate_embodied_cfg(cfg):
