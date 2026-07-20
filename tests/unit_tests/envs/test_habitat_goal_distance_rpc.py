@@ -15,8 +15,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
+from rlinf.envs.habitat.venv import (
+    HabitatRLEnv,
+    ReconfigureSubprocEnv,
+    ReconfigureSubprocEnvWorker,
+)
 
 
 class SimStub:
@@ -64,6 +69,41 @@ def test_habitat_rl_env_returns_current_episode_goal_distances():
     assert metadata["agent_position"] == [1.0, 0.0, 1.0]
     assert metadata["goals"] == [[1.0, 0.0, 3.0], [4.0, 0.0, 1.0]]
     assert metadata["distances_to_goals"] == [2.0, 3.0]
+
+
+def test_habitat_rl_env_activates_cached_episodes_without_reconstruction():
+    episodes = {
+        "7": SimpleNamespace(episode_id="7"),
+        "19": SimpleNamespace(episode_id="19"),
+    }
+    env = object.__new__(HabitatRLEnv)
+    env._episode_registry = episodes
+    env._env = SimpleNamespace(episodes=[episodes["7"]])
+
+    env.activate_episode_ids([19, "7"])
+
+    assert env._env.episodes == [episodes["19"], episodes["7"]]
+
+
+def test_habitat_rl_env_rejects_invalid_cached_episode_activation():
+    env = object.__new__(HabitatRLEnv)
+    env._episode_registry = {"7": SimpleNamespace(episode_id="7")}
+    env._env = SimpleNamespace(episodes=[])
+
+    with pytest.raises(ValueError, match="at least one ID"):
+        env.activate_episode_ids([])
+    with pytest.raises(KeyError, match="Unknown Habitat episode IDs"):
+        env.activate_episode_ids(["missing"])
+
+
+def test_reconfigure_subproc_worker_sends_lightweight_episode_activation():
+    remote = WorkerStub(None)
+    worker = object.__new__(ReconfigureSubprocEnvWorker)
+    worker.parent_remote = remote
+
+    worker.activate_episode_ids(["7", "19"])
+
+    assert remote.sent == [["activate_episode_ids", ["7", "19"]]]
 
 
 def test_reconfigure_subproc_env_aggregates_goal_distance_metadata():

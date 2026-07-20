@@ -45,7 +45,7 @@ from rlinf.envs.habitat.extensions.subgoal import (
     SubgoalRewardConfig,
     SubgoalRewardTracker,
 )
-from rlinf.envs.habitat.venv import HabitatRLEnv, ReconfigureSubprocEnv
+from rlinf.envs.habitat.venv import ReconfigureSubprocEnv, make_habitat_env
 from rlinf.envs.utils import (
     list_of_dict_to_dict_of_list,
     to_tensor,
@@ -412,12 +412,11 @@ class HabitatEnv(gym.Env):
             )
         self._active_bucket_id = bucket_id
         self.max_episode_steps = int(horizon_steps)
-        self.env.reconfigure_env_fns(
-            self._get_env_fn_params(
-                bucket_id=bucket_id,
-                horizon_steps=horizon_steps,
-                group_episode_ids=group_episode_ids,
-            )
+        process_group_episode_ids = [
+            [str(episode_id)] for episode_id in group_episode_ids
+        ]
+        self.env.activate_episode_ids(
+            self._expand_group_episode_ids(process_group_episode_ids)
         )
         self._elapsed_steps.fill(0)
         self.first_done_cached_mask.fill(False)
@@ -955,39 +954,13 @@ class HabitatEnv(gym.Env):
         for param in env_fn_params:
 
             def env_fn(p=param):
-                config_path = p["config_path"]
-                overrides = p["overrides"]
-                episode_ids = p["episode_ids"]
-                seed = p["seed"]
-
-                config = get_config(config_path, overrides=overrides)
-
-                dataset = habitat.datasets.make_dataset(
-                    config.habitat.dataset.type,
-                    config=config.habitat.dataset,
-                )
-
-                episodes_by_id = {
-                    episode.episode_id: episode for episode in dataset.episodes
-                }
-                dataset.episodes = [
-                    episodes_by_id[episode_id] for episode_id in episode_ids
-                ]
-
-                env = HabitatRLEnv(config=config, dataset=dataset)
-                env.seed(seed)
-                return env
+                return make_habitat_env(p)
 
             env_fns.append(env_fn)
 
         return env_fns
 
-    def _get_env_fn_params(
-        self,
-        bucket_id=None,
-        horizon_steps=None,
-        group_episode_ids=None,
-    ):
+    def _get_env_fn_params(self):
         env_fn_params = []
         global_plan = getattr(self.cfg, "global_plan", None)
         if global_plan is None:
@@ -1001,28 +974,23 @@ class HabitatEnv(gym.Env):
         config_path = global_plan["config_path"]
         overrides = list(global_plan["overrides"])
         episode_sequences = global_plan["episode_sequences"]
-        if horizon_steps is not None:
-            prefix = "habitat.environment.max_episode_steps="
-            overrides = [value for value in overrides if not value.startswith(prefix)]
-            overrides.append(f"{prefix}{int(horizon_steps)}")
-        if group_episode_ids is not None:
-            process_group_episode_ids = [
-                [str(episode_id)] for episode_id in group_episode_ids
-            ]
-        else:
-            process_group_episode_ids = episode_sequences[self.seed_offset]
+        process_group_episode_ids = episode_sequences[self.seed_offset]
+        env_episode_ids = self._expand_group_episode_ids(process_group_episode_ids)
 
-        for env_id in range(self.num_envs):
-            group_id = env_id // self.group_size
-            assigned_ids = list(process_group_episode_ids[group_id])
-
+        for env_id, assigned_ids in enumerate(env_episode_ids):
             env_fn_params.append(
                 {
                     "config_path": config_path,
                     "overrides": overrides,
-                    "episode_ids": assigned_ids,
+                    "episode_ids": list(assigned_ids),
                     "seed": self.seed + env_id,
                 }
             )
 
         return env_fn_params
+
+    def _expand_group_episode_ids(self, process_group_episode_ids):
+        return [
+            list(process_group_episode_ids[env_id // self.group_size])
+            for env_id in range(self.num_envs)
+        ]

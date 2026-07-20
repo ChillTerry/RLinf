@@ -41,12 +41,36 @@ warnings.simplefilter("once", DeprecationWarning)
 
 
 class HabitatRLEnv(RLEnv):
-    def __init__(self, config, dataset):
+    def __init__(self, config, dataset, episode_registry=None):
         # Import the Habitat env module in the spawned process so custom task
         # actions such as NoOpAction are registered before task construction.
         from rlinf.envs.habitat.habitat_env import NoOpAction  # noqa: F401
 
+        if episode_registry is None:
+            episode_registry = {
+                str(episode.episode_id): episode for episode in dataset.episodes
+            }
+        self._episode_registry = {
+            str(episode_id): episode
+            for episode_id, episode in episode_registry.items()
+        }
         super().__init__(config, dataset)
+
+    def activate_episode_ids(self, episode_ids) -> None:
+        """Replace the episode iterator without rebuilding the Habitat environment."""
+        normalized_ids = [str(episode_id) for episode_id in episode_ids]
+        if not normalized_ids:
+            raise ValueError("Habitat episode activation requires at least one ID.")
+        unknown_ids = [
+            episode_id
+            for episode_id in normalized_ids
+            if episode_id not in self._episode_registry
+        ]
+        if unknown_ids:
+            raise KeyError(f"Unknown Habitat episode IDs: {unknown_ids[:10]}")
+        self.episodes = [
+            self._episode_registry[episode_id] for episode_id in normalized_ids
+        ]
 
     def reset(self):
         observations = super().reset()
@@ -117,17 +141,23 @@ class HabitatRLEnv(RLEnv):
         return info
 
 
-def _make_habitat_env(params):
+def make_habitat_env(params):
     config = get_config(params["config_path"], overrides=params["overrides"])
     dataset = habitat.datasets.make_dataset(
         config.habitat.dataset.type,
         config=config.habitat.dataset,
     )
-    episodes_by_id = {str(episode.episode_id): episode for episode in dataset.episodes}
+    episode_registry = {
+        str(episode.episode_id): episode for episode in dataset.episodes
+    }
     dataset.episodes = [
-        episodes_by_id[str(episode_id)] for episode_id in params["episode_ids"]
+        episode_registry[str(episode_id)] for episode_id in params["episode_ids"]
     ]
-    env = HabitatRLEnv(config=config, dataset=dataset)
+    env = HabitatRLEnv(
+        config=config,
+        dataset=dataset,
+        episode_registry=episode_registry,
+    )
     env.seed(params["seed"])
     return env
 
@@ -225,9 +255,10 @@ def _worker(
                     p.send(env.get_current_episode_goal_distances())
                 else:
                     p.send({})
-            elif cmd == "reconfigure":
-                env.close()
-                env = _make_habitat_env(data)
+            elif cmd == "activate_episode_ids":
+                # The next reset lets Habitat reconfigure only the simulator scene.
+                # Config, dataset metadata, task, and sensors stay alive.
+                env.activate_episode_ids(data)
                 p.send(None)
             else:
                 p.close()
@@ -259,8 +290,8 @@ class ReconfigureSubprocEnvWorker(SubprocEnvWorker):
         self.child_remote.close()
         EnvWorker.__init__(self, env_fn)
 
-    def reconfigure_env_fn(self, env_fn_param):
-        self.parent_remote.send(["reconfigure", env_fn_param])
+    def activate_episode_ids(self, episode_ids):
+        self.parent_remote.send(["activate_episode_ids", episode_ids])
         return self.parent_remote.recv()
 
 
@@ -271,14 +302,14 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         BaseVectorEnv.__init__(self, env_fns, worker_fn, **kwargs)
 
-    def reconfigure_env_fns(self, env_fns, id=None):
+    def activate_episode_ids(self, episode_ids, id=None):
         self._assert_is_not_closed()
         id = self._wrap_id(id)
         if self.is_async:
             self._assert_id(id)
 
         for j, i in enumerate(id):
-            self.workers[i].reconfigure_env_fn(env_fns[j])
+            self.workers[i].activate_episode_ids(episode_ids[j])
 
     def get_current_episode_metadata(self, id=None):
         self._assert_is_not_closed()
