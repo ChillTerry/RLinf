@@ -1225,6 +1225,10 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                 target=active_targets.unsqueeze(1),
             ).squeeze(1)
             token_logprobs[mask] = active_logprobs.unsqueeze(-1)
+        elif logits.requires_grad:
+            # Alignment-only curriculum microbatches must still traverse the
+            # LM graph so FSDP can finalize gradients accumulated under no_sync().
+            token_logprobs = token_logprobs + logits.sum(dtype=torch.float32) * 0.0
         return token_logprobs
 
     def _embed_response_ids(self, response_ids: torch.Tensor) -> torch.Tensor:

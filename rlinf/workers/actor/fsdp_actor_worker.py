@@ -2155,6 +2155,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         from rlinf.models.embodiment.uninavid.rl_loss import (
             aggregate_uninavid_weighted_ppo_losses,
             compute_uninavid_per_chunk_ppo_losses,
+            mean_uninavid_training_metrics,
             prepare_uninavid_chunk_level_loss_inputs,
             prepare_uninavid_token_level_loss_inputs,
         )
@@ -2320,8 +2321,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.optimizer.zero_grad()
         self.curriculum_compacted_batch = None
         self.curriculum_epoch_batches = []
+        mean_metrics = mean_uninavid_training_metrics(metrics)
         clear_memory()
-        mean_metrics = {key: np.mean(value) for key, value in metrics.items()}
         return all_reduce_dict(
             mean_metrics,
             op=torch.distributed.ReduceOp.AVG,

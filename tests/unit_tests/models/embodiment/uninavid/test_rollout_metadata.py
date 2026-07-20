@@ -220,6 +220,29 @@ def test_uninavid_masked_logprob_gather_skips_negative_infinity_pad_logits():
     assert logits.grad[0, 1].eq(0).all()
 
 
+def test_uninavid_masked_logprob_gather_anchors_all_padding_backward():
+    policy = UniNaVidForActionPrediction(
+        tokenizer=_Tokenizer(),
+        model=_GenerateModel(outputs=None),
+        image_processor=None,
+    )
+    logits = torch.randn(2, 3, 5, dtype=torch.float32, requires_grad=True)
+    target = torch.zeros(2, 3, dtype=torch.long)
+    mask = torch.zeros(2, 3, dtype=torch.bool)
+
+    token_logprobs = policy._gather_masked_token_logprobs(
+        logits=logits,
+        target=target,
+        mask=mask,
+    )
+
+    assert token_logprobs.requires_grad
+    assert token_logprobs.eq(0).all()
+    token_logprobs.sum().backward()
+    assert logits.grad is not None
+    assert logits.grad.eq(0).all()
+
+
 def test_uninavid_generate_batch_outputs_can_return_scores(monkeypatch):
     score_step_1 = torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float32)
     score_step_2 = torch.tensor([[3.0, 4.0, 5.0]], dtype=torch.float32)

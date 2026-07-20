@@ -4,6 +4,7 @@ from rlinf.models.embodiment.uninavid.rl_loss import (
     aggregate_uninavid_weighted_ppo_losses,
     compute_uninavid_actor_critic_loss,
     compute_uninavid_per_chunk_ppo_losses,
+    mean_uninavid_training_metrics,
     prepare_uninavid_token_level_loss_inputs,
 )
 from rlinf.utils.utils import masked_mean
@@ -124,3 +125,19 @@ def test_weighted_microbatch_sums_match_full_global_batch_loss_and_gradients():
     torch.testing.assert_close(split_loss, full_loss)
     torch.testing.assert_close(split_logprobs.grad, full_logprobs.grad)
     torch.testing.assert_close(split_values.grad, full_values.grad)
+
+
+def test_mean_uninavid_training_metrics_handles_tensor_and_scalar_metrics():
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    metrics = {
+        "actor/policy_loss": [
+            torch.tensor(1.0, device=device),
+            torch.tensor(3.0, device=device),
+        ],
+        "actor/lr": [2.0, 4.0],
+    }
+
+    means = mean_uninavid_training_metrics(metrics)
+
+    assert means == {"actor/policy_loss": 2.0, "actor/lr": 3.0}
+    assert all(isinstance(value, float) for value in means.values())

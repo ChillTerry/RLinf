@@ -220,9 +220,7 @@ class EnvWorker(Worker):
         for stage_id in range(self.stage_num):
             process_index = self._rank * self.stage_num + stage_id
             start = process_index * groups_per_stage
-            stage_assignments.append(
-                tuple(assigned[start : start + groups_per_stage])
-            )
+            stage_assignments.append(tuple(assigned[start : start + groups_per_stage]))
         return stage_assignments
 
     def set_global_step(self, global_step: int) -> None:
@@ -239,22 +237,6 @@ class EnvWorker(Worker):
         if isinstance(state, list):
             state = state[self._rank]
         self._curriculum_scheduler.load_state_dict(state)
-
-    @staticmethod
-    def _mean_curriculum_rates(
-        gathered_rates: list[dict[str, dict[str, float]]],
-    ) -> tuple[dict[str, float], dict[str, float]]:
-        def mean_field(field: str) -> dict[str, float]:
-            values_by_bucket = defaultdict(list)
-            for rates in gathered_rates:
-                for bucket_id, value in rates[field].items():
-                    values_by_bucket[bucket_id].append(float(value))
-            return {
-                bucket_id: sum(values) / len(values)
-                for bucket_id, values in values_by_bucket.items()
-            }
-
-        return mean_field("success"), mean_field("timeout")
 
     def update_env_cfg(self):
         if not self.only_eval:
@@ -1353,10 +1335,8 @@ class EnvWorker(Worker):
         for epoch in range(self.rollout_epoch):
             epoch_spec = epoch_specs[epoch]
             if curriculum_enabled:
-                stage_group_episode_ids = (
-                    self._allocate_curriculum_group_episode_ids(
-                        epoch_spec.bucket_id
-                    )
+                stage_group_episode_ids = self._allocate_curriculum_group_episode_ids(
+                    epoch_spec.bucket_id
                 )
                 for stage_id in range(self.stage_num):
                     self.env_list[stage_id].activate_bucket(
@@ -1557,12 +1537,8 @@ class EnvWorker(Worker):
                 bucket_id: sum(values) / len(values)
                 for bucket_id, values in bucket_timeout.items()
             }
-            gathered_rates = [None] * self._world_size
-            torch.distributed.all_gather_object(
-                gathered_rates,
-                {"success": success_rates, "timeout": timeout_rates},
-            )
-            success_rates, timeout_rates = self._mean_curriculum_rates(gathered_rates)
+            # EnvWorkers do not own a torch.distributed process group. Keep these
+            # Habitat UniNaVid metrics local; EmbodiedRunner aggregates all ranks.
             quota_counts = defaultdict(int)
             for spec in epoch_specs:
                 quota_counts[spec.bucket_id] += 1
@@ -1578,9 +1554,7 @@ class EnvWorker(Worker):
                 f"stage={stage['stage_name']} quotas={stage['quotas']} "
                 f"cursors={self._curriculum_scheduler.bucket_cursors}."
             )
-            env_metrics["curriculum/stage_index"].append(
-                torch.tensor([stage_index])
-            )
+            env_metrics["curriculum/stage_index"].append(torch.tensor([stage_index]))
             env_metrics[f"curriculum/stage_name/{stage['stage_name']}"].append(
                 torch.tensor([1.0])
             )
@@ -1596,9 +1570,7 @@ class EnvWorker(Worker):
                     torch.tensor([target_weights[bucket_id]], dtype=torch.float32)
                 )
                 env_metrics[f"curriculum/episode_cursor/{bucket_id}"].append(
-                    torch.tensor(
-                        [self._curriculum_scheduler.bucket_cursors[bucket_id]]
-                    )
+                    torch.tensor([self._curriculum_scheduler.bucket_cursors[bucket_id]])
                 )
                 env_metrics[f"curriculum/episode_count/{bucket_id}"].append(
                     torch.tensor([bucket_plan["episode_count"]])

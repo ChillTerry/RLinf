@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 from types import MethodType, SimpleNamespace
 
@@ -5,6 +19,7 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.data.embodied_io_struct import EpochTrajectoryBatch, RolloutEpochSpec
+from rlinf.utils.metric_utils import compute_evaluate_metrics
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -179,16 +194,25 @@ def test_actor_curriculum_advantage_compacts_without_fixed_t_reshape(monkeypatch
     assert metrics["curriculum/compaction_keep_ratio"] == 1.0
 
 
-def test_env_curriculum_rates_are_identical_global_rank_means():
-    success, timeout = EnvWorker._mean_curriculum_rates(
+def test_runner_aggregates_env_curriculum_rates_across_ranks():
+    metrics = compute_evaluate_metrics(
         [
-            {"success": {"B0": 0.25, "B1": 0.5}, "timeout": {"B0": 0.5}},
-            {"success": {"B0": 0.75, "B1": 0.0}, "timeout": {"B0": 0.0}},
+            {
+                "curriculum/success_rate/B0": torch.tensor([0.25]),
+                "curriculum/success_rate/B1": torch.tensor([0.5]),
+                "curriculum/timeout_ratio/B0": torch.tensor([0.5]),
+            },
+            {
+                "curriculum/success_rate/B0": torch.tensor([0.75]),
+                "curriculum/success_rate/B1": torch.tensor([0.0]),
+                "curriculum/timeout_ratio/B0": torch.tensor([0.0]),
+            },
         ]
     )
 
-    assert success == {"B0": 0.5, "B1": 0.25}
-    assert timeout == {"B0": 0.25}
+    assert metrics["curriculum/success_rate/B0"] == 0.5
+    assert metrics["curriculum/success_rate/B1"] == 0.25
+    assert metrics["curriculum/timeout_ratio/B0"] == 0.25
 
 
 def test_env_worker_maps_global_stream_assignment_by_rank_stage_and_group():

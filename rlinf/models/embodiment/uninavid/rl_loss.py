@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 import torch
 
@@ -390,6 +390,29 @@ def aggregate_uninavid_weighted_ppo_losses(
         "curriculum/train_weight_mass": weights.sum().detach(),
     }
     return total_loss, metrics
+
+
+def mean_uninavid_training_metrics(
+    metrics: Mapping[str, Sequence[torch.Tensor | float]],
+) -> dict[str, float]:
+    """Average scalar training metrics without passing CUDA tensors to NumPy."""
+    means = {}
+    for key, values in metrics.items():
+        if not values:
+            raise ValueError(f"Metric {key!r} has no values to aggregate.")
+        if isinstance(values[0], torch.Tensor):
+            if not all(isinstance(value, torch.Tensor) for value in values):
+                raise TypeError(f"Metric {key!r} mixes tensor and scalar values.")
+            if not all(value.numel() == 1 for value in values):
+                raise ValueError(f"Metric {key!r} must contain scalar tensors.")
+            means[key] = torch.stack(
+                [value.detach().reshape(()) for value in values]
+            ).float().mean().item()
+        else:
+            if any(isinstance(value, torch.Tensor) for value in values):
+                raise TypeError(f"Metric {key!r} mixes tensor and scalar values.")
+            means[key] = sum(float(value) for value in values) / len(values)
+    return means
 
 
 def _zero_actor_diagnostics() -> dict[str, float]:
