@@ -50,7 +50,30 @@ class WorkerStub:
         return self.payload
 
 
-def test_habitat_rl_env_returns_current_episode_goal_distances():
+def test_habitat_rl_env_returns_separate_subgoal_and_final_distances():
+    env = object.__new__(HabitatRLEnv)
+    env._env = SimpleNamespace(
+        current_episode=SimpleNamespace(
+            episode_id="episode-7",
+            goals=[
+                SimpleNamespace(position=[4.0, 0.0, 1.0]),
+            ],
+            info={"subgoals": [{"position": [1.0, 0.0, 3.0]}]},
+        ),
+        sim=SimStub(),
+    )
+
+    metadata = env.get_current_episode_subgoal_distances()
+
+    assert metadata["episode_id"] == "episode-7"
+    assert metadata["agent_position"] == [1.0, 0.0, 1.0]
+    assert metadata["subgoals"] == [[1.0, 0.0, 3.0]]
+    assert metadata["final_goal"] == [4.0, 0.0, 1.0]
+    assert metadata["distances_to_subgoals"] == [2.0]
+    assert metadata["distance_to_final_goal"] == 3.0
+
+
+def test_habitat_rl_env_rejects_native_multi_goal_episode():
     env = object.__new__(HabitatRLEnv)
     env._env = SimpleNamespace(
         current_episode=SimpleNamespace(
@@ -59,16 +82,13 @@ def test_habitat_rl_env_returns_current_episode_goal_distances():
                 SimpleNamespace(position=[1.0, 0.0, 3.0]),
                 SimpleNamespace(position=[4.0, 0.0, 1.0]),
             ],
+            info={},
         ),
         sim=SimStub(),
     )
 
-    metadata = env.get_current_episode_goal_distances()
-
-    assert metadata["episode_id"] == "episode-7"
-    assert metadata["agent_position"] == [1.0, 0.0, 1.0]
-    assert metadata["goals"] == [[1.0, 0.0, 3.0], [4.0, 0.0, 1.0]]
-    assert metadata["distances_to_goals"] == [2.0, 3.0]
+    with pytest.raises(ValueError, match="exactly one native final goal"):
+        env.get_current_episode_subgoal_distances()
 
 
 def test_habitat_rl_env_activates_cached_episodes_without_reconstruction():
@@ -106,7 +126,7 @@ def test_reconfigure_subproc_worker_sends_lightweight_episode_activation():
     assert remote.sent == [["activate_episode_ids", ["7", "19"]]]
 
 
-def test_reconfigure_subproc_env_aggregates_goal_distance_metadata():
+def test_reconfigure_subproc_env_aggregates_subgoal_distance_metadata():
     env = object.__new__(ReconfigureSubprocEnv)
     env.is_async = False
     env.closed = False
@@ -114,16 +134,20 @@ def test_reconfigure_subproc_env_aggregates_goal_distance_metadata():
         WorkerStub(
             {
                 "episode_id": "1",
-                "goals": [[0.0, 0.0, 0.0]],
-                "distances_to_goals": [1.0],
+                "subgoals": [],
+                "final_goal": [0.0, 0.0, 0.0],
+                "distances_to_subgoals": [],
+                "distance_to_final_goal": 1.0,
                 "agent_position": [1.0, 0.0, 0.0],
             }
         ),
         WorkerStub(
             {
                 "episode_id": "2",
-                "goals": [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-                "distances_to_goals": [2.0, 0.5],
+                "subgoals": [[0.0, 0.0, 0.0]],
+                "final_goal": [2.0, 0.0, 0.0],
+                "distances_to_subgoals": [2.0],
+                "distance_to_final_goal": 0.5,
                 "agent_position": [2.0, 0.0, 0.0],
             }
         ),
@@ -132,9 +156,10 @@ def test_reconfigure_subproc_env_aggregates_goal_distance_metadata():
     env._assert_id = lambda ids: None
     env._wrap_id = lambda ids=None: list(range(len(env.workers))) if ids is None else ids
 
-    metadata = env.get_current_episode_goal_distances()
+    metadata = env.get_current_episode_subgoal_distances()
 
     assert metadata["episode_id"] == ["1", "2"]
-    assert metadata["distances_to_goals"] == [[1.0], [2.0, 0.5]]
-    assert env.workers[0].sent == [["get_current_episode_goal_distances", None]]
-    assert env.workers[1].sent == [["get_current_episode_goal_distances", None]]
+    assert metadata["distances_to_subgoals"] == [[], [2.0]]
+    assert metadata["distance_to_final_goal"] == [1.0, 0.5]
+    assert env.workers[0].sent == [["get_current_episode_subgoal_distances", None]]
+    assert env.workers[1].sent == [["get_current_episode_subgoal_distances", None]]

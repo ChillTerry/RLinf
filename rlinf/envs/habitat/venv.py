@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import multiprocessing
 import warnings
 from multiprocessing import connection
@@ -86,24 +87,58 @@ class HabitatRLEnv(RLEnv):
     def get_current_metrics(self):
         return self.habitat_env.get_metrics()
 
-    def get_current_episode_goal_distances(self):
+    def get_current_episode_subgoal_distances(self):
         episode = self.habitat_env.current_episode
         sim = self.habitat_env.sim
         agent_position = sim.get_agent_state().position
         agent_position_list = np.asarray(agent_position, dtype=np.float32).tolist()
-        goals = [
-            np.asarray(goal.position, dtype=np.float32).tolist()
-            for goal in episode.goals
-        ]
-        distances_to_goals = [
-            float(sim.geodesic_distance(agent_position, goal_position))
-            for goal_position in goals
-        ]
+        if len(episode.goals) != 1:
+            raise ValueError(
+                "Habitat VLN episodes must contain exactly one native final goal; "
+                f"episode {getattr(episode, 'episode_id', None)} has "
+                f"{len(episode.goals)}."
+            )
+        final_goal = np.asarray(episode.goals[0].position, dtype=np.float32).tolist()
+        info = getattr(episode, "info", None) or {}
+        subgoals = info.get("subgoals", [])
+        if not isinstance(subgoals, list):
+            raise ValueError(
+                "episode.info['subgoals'] must be a list of position dictionaries."
+            )
+
+        subgoal_positions = []
+        for index, subgoal in enumerate(subgoals):
+            if not isinstance(subgoal, dict) or "position" not in subgoal:
+                raise ValueError(
+                    "episode.info['subgoals'] entries must contain a position; "
+                    f"invalid entry at index {index}."
+                )
+            position = np.asarray(subgoal["position"], dtype=np.float32)
+            if position.shape != (3,) or not np.isfinite(position).all():
+                raise ValueError(
+                    "episode.info['subgoals'] positions must be finite 3D vectors; "
+                    f"invalid entry at index {index}."
+                )
+            subgoal_positions.append(position.tolist())
+
+        def geodesic_distance(position):
+            distance = float(sim.geodesic_distance(agent_position, position))
+            if not math.isfinite(distance) or distance < 0.0:
+                raise ValueError(
+                    "Habitat returned an invalid geodesic distance for episode "
+                    f"{getattr(episode, 'episode_id', None)}: {distance}."
+                )
+            return distance
+
         return {
             "episode_id": getattr(episode, "episode_id", None),
             "agent_position": agent_position_list,
-            "goals": goals,
-            "distances_to_goals": distances_to_goals,
+            "subgoals": subgoal_positions,
+            "final_goal": final_goal,
+            "distances_to_subgoals": [
+                geodesic_distance(position) for position in subgoal_positions
+            ],
+            "distance_to_final_goal": geodesic_distance(final_goal),
         }
 
     def get_reward_range(self):
@@ -250,9 +285,9 @@ def _worker(
                     p.send(env.get_current_metrics())
                 else:
                     p.send({})
-            elif cmd == "get_current_episode_goal_distances":
-                if hasattr(env, "get_current_episode_goal_distances"):
-                    p.send(env.get_current_episode_goal_distances())
+            elif cmd == "get_current_episode_subgoal_distances":
+                if hasattr(env, "get_current_episode_subgoal_distances"):
+                    p.send(env.get_current_episode_subgoal_distances())
                 else:
                     p.send({})
             elif cmd == "activate_episode_ids":
@@ -345,7 +380,7 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
 
         return metrics
 
-    def get_current_episode_goal_distances(self, id=None):
+    def get_current_episode_subgoal_distances(self, id=None):
         self._assert_is_not_closed()
         id = self._wrap_id(id)
         if self.is_async:
@@ -354,7 +389,7 @@ class ReconfigureSubprocEnv(SubprocVectorEnv):
         goal_metadata: dict[str, list[Any]] = {}
         for i in id:
             self.workers[i].parent_remote.send(
-                ["get_current_episode_goal_distances", None]
+                ["get_current_episode_subgoal_distances", None]
             )
             worker_metadata = self.workers[i].parent_remote.recv()
             for key, value in worker_metadata.items():
