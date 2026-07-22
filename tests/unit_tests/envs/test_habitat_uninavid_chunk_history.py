@@ -908,8 +908,9 @@ def test_habitat_subgoal_reward_reset_initializes_tracker():
         ),
     )
     env.env = SimpleNamespace(
-        get_current_episode_goal_distances=lambda id=None: {
-            "distances_to_goals": [[4.0, 8.0], [3.0]]
+        get_current_episode_subgoal_distances=lambda id=None: {
+            "distances_to_subgoals": [[4.0], []],
+            "distance_to_final_goal": [8.0, 3.0],
         }
     )
 
@@ -942,10 +943,15 @@ def test_habitat_subgoal_reward_dispatch_uses_dense_reward_and_attaches_metrics(
             stall_observation_patience=2,
         ),
     )
-    env.subgoal_reward.reset([0], [[4.0, 8.0]])
+    env.subgoal_reward.reset(
+        [0],
+        distances_to_subgoals=[[4.0]],
+        distances_to_final_goal=[8.0],
+    )
     env.env = SimpleNamespace(
-        get_current_episode_goal_distances=lambda id=None: {
-            "distances_to_goals": [[3.0, 7.0]]
+        get_current_episode_subgoal_distances=lambda id=None: {
+            "distances_to_subgoals": [[3.0]],
+            "distance_to_final_goal": [7.0],
         }
     )
     infos = {"episode": {}}
@@ -985,10 +991,15 @@ def test_habitat_subgoal_reward_penalizes_truncation_without_stop():
             stall_observation_patience=2,
         ),
     )
-    env.subgoal_reward.reset([0], [[2.0]])
+    env.subgoal_reward.reset(
+        [0],
+        distances_to_subgoals=[[]],
+        distances_to_final_goal=[2.0],
+    )
     env.env = SimpleNamespace(
-        get_current_episode_goal_distances=lambda id=None: {
-            "distances_to_goals": [[3.5]]
+        get_current_episode_subgoal_distances=lambda id=None: {
+            "distances_to_subgoals": [[]],
+            "distance_to_final_goal": [3.5],
         }
     )
     infos = {"episode": {}}
@@ -1088,7 +1099,11 @@ def test_habitat_step_writes_subgoal_reward_metrics_after_current_step(tmp_path)
             stall_observation_patience=2,
         ),
     )
-    env.subgoal_reward.reset([0], [[4.0]])
+    env.subgoal_reward.reset(
+        [0],
+        distances_to_subgoals=[[]],
+        distances_to_final_goal=[4.0],
+    )
     env._normalize_depth = lambda actions, raw_obs: None
     env._wrap_obs = lambda raw_obs, info_lists=None: {}
     env.env = SimpleNamespace(
@@ -1106,8 +1121,9 @@ def test_habitat_step_writes_subgoal_reward_metrics_after_current_step(tmp_path)
                 }
             ],
         ),
-        get_current_episode_goal_distances=lambda id=None: {
-            "distances_to_goals": [[3.0]]
+        get_current_episode_subgoal_distances=lambda id=None: {
+            "distances_to_subgoals": [[]],
+            "distance_to_final_goal": [3.0],
         },
         get_current_episode_metadata=lambda: {"episode_id": ["episode-1"]},
     )

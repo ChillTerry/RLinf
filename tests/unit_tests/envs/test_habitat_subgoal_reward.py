@@ -42,12 +42,36 @@ def _tracker(num_envs=1, **kwargs):
     return SubgoalRewardTracker(num_envs=num_envs, config=config)
 
 
+def _split_targets(distances):
+    return [list(targets[:-1]) for targets in distances], [
+        float(targets[-1]) for targets in distances
+    ]
+
+
+def _reset(tracker, env_indices, distances):
+    subgoals, finals = _split_targets(distances)
+    tracker.reset(
+        env_indices,
+        distances_to_subgoals=subgoals,
+        distances_to_final_goal=finals,
+    )
+
+
+def _compute_step(tracker, distances_to_targets, **kwargs):
+    subgoals, finals = _split_targets(distances_to_targets)
+    return tracker.compute_step(
+        distances_to_subgoals=subgoals,
+        distances_to_final_goal=finals,
+        **kwargs,
+    )
+
+
 def test_progress_is_normalized_by_active_subgoal_initial_distance():
     tracker = _tracker()
-    tracker.reset([0], [[4.0, 8.0]])
+    _reset(tracker, [0], [[4.0, 8.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[3.0, 7.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[3.0, 7.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -60,10 +84,10 @@ def test_progress_is_normalized_by_active_subgoal_initial_distance():
 
 def test_progress_reward_is_normalized_by_episode_subgoal_count():
     tracker = _tracker(progress_reward_coef=1.0)
-    tracker.reset([0], [[4.0, 8.0, 12.0]])
+    _reset(tracker, [0], [[4.0, 8.0, 12.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[3.0, 7.0, 11.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[3.0, 7.0, 11.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -77,16 +101,16 @@ def test_reset_rejects_zero_initial_active_target_distance():
     tracker = _tracker()
 
     with pytest.raises(ValueError, match="reference distance.*positive"):
-        tracker.reset([0], [[0.0, 4.0]])
+        _reset(tracker, [0], [[0.0, 4.0]])
 
 
 def test_switch_to_final_goal_rejects_zero_reference_distance():
     tracker = _tracker()
-    tracker.reset([0], [[3.0, 5.0]])
+    _reset(tracker, [0], [[3.0, 5.0]])
 
     with pytest.raises(ValueError, match="reference distance.*positive"):
-        tracker.compute_step(
-            distances_to_goals=[[0.5, 0.0]],
+        _compute_step(tracker,
+            distances_to_targets=[[0.5, 0.0]],
             is_stop=np.array([False]),
             valid_mask=np.array([True]),
         )
@@ -94,11 +118,11 @@ def test_switch_to_final_goal_rejects_zero_reference_distance():
 
 def test_switch_to_next_subgoal_rejects_zero_reference_distance():
     tracker = _tracker()
-    tracker.reset([0], [[3.0, 5.0, 7.0]])
+    _reset(tracker, [0], [[3.0, 5.0, 7.0]])
 
     with pytest.raises(ValueError, match="reference distance.*positive"):
-        tracker.compute_step(
-            distances_to_goals=[[0.5, 0.0, 4.0]],
+        _compute_step(tracker,
+            distances_to_targets=[[0.5, 0.0, 4.0]],
             is_stop=np.array([False]),
             valid_mask=np.array([True]),
         )
@@ -106,10 +130,10 @@ def test_switch_to_next_subgoal_rejects_zero_reference_distance():
 
 def test_progress_is_clipped_to_unit_scale():
     tracker = _tracker()
-    tracker.reset([0], [[2.0]])
+    _reset(tracker, [0], [[2.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[0.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[0.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -122,10 +146,10 @@ def test_progress_is_clipped_to_unit_scale():
 
 def test_negative_progress_produces_negative_progress_reward():
     tracker = _tracker(progress_reward_coef=1.0, stall_patience=3)
-    tracker.reset([0], [[4.0]])
+    _reset(tracker, [0], [[4.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[5.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[5.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -138,10 +162,10 @@ def test_negative_progress_produces_negative_progress_reward():
 
 def test_subgoal_success_bonus_is_normalized_by_subgoal_count():
     tracker = _tracker(subgoal_success_reward_coef=6.0)
-    tracker.reset([0], [[3.0, 4.0, 5.0]])
+    _reset(tracker, [0], [[3.0, 4.0, 5.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[0.4, 2.0, 4.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[0.4, 2.0, 4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -158,10 +182,10 @@ def test_subgoal_success_bonus_is_normalized_by_subgoal_count():
 
 def test_switch_without_precision_bonus_permanently_loses_that_bonus():
     tracker = _tracker(subgoal_success_reward_coef=6.0)
-    tracker.reset([0], [[3.0, 4.0, 5.0]])
+    _reset(tracker, [0], [[3.0, 4.0, 5.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[0.75, 2.0, 4.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[0.75, 2.0, 4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -174,8 +198,8 @@ def test_switch_without_precision_bonus_permanently_loses_that_bonus():
     assert math.isclose(components["r_progress"][0], 0.25, rel_tol=1e-6)
     assert math.isclose(reward[0], 0.25, rel_tol=1e-6)
 
-    _, second_components = tracker.compute_step(
-        distances_to_goals=[[0.2, 0.4, 3.0]],
+    _, second_components = _compute_step(tracker,
+        distances_to_targets=[[0.2, 0.4, 3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -186,15 +210,15 @@ def test_switch_without_precision_bonus_permanently_loses_that_bonus():
 
 def test_stall_penalty_starts_after_patience_threshold():
     tracker = _tracker(stall_patience=2, stall_penalty_coeff=1.5)
-    tracker.reset([0], [[4.0]])
+    _reset(tracker, [0], [[4.0]])
 
-    first_reward, first_components = tracker.compute_step(
-        distances_to_goals=[[4.0]],
+    first_reward, first_components = _compute_step(tracker,
+        distances_to_targets=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    second_reward, second_components = tracker.compute_step(
-        distances_to_goals=[[4.5]],
+    second_reward, second_components = _compute_step(tracker,
+        distances_to_targets=[[4.5]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -213,30 +237,30 @@ def test_stalled_state_requires_consecutive_positive_progress_to_recover():
         stall_recovery_patience=2,
         stall_observation_patience=1,
     )
-    tracker.reset([0], [[4.0]])
+    _reset(tracker, [0], [[4.0]])
 
-    _, first_components = tracker.compute_step(
-        distances_to_goals=[[4.0]],
+    _, first_components = _compute_step(tracker,
+        distances_to_targets=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, second_components = tracker.compute_step(
-        distances_to_goals=[[4.5]],
+    _, second_components = _compute_step(tracker,
+        distances_to_targets=[[4.5]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, recovery_components = tracker.compute_step(
-        distances_to_goals=[[4.0]],
+    _, recovery_components = _compute_step(tracker,
+        distances_to_targets=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, observation_components = tracker.compute_step(
-        distances_to_goals=[[4.0]],
+    _, observation_components = _compute_step(tracker,
+        distances_to_targets=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, stalled_components = tracker.compute_step(
-        distances_to_goals=[[4.0]],
+    _, stalled_components = _compute_step(tracker,
+        distances_to_targets=[[4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -255,20 +279,20 @@ def test_stalled_state_requires_consecutive_positive_progress_to_recover():
 
 def test_subgoal_reward_tensorboard_diagnostics_track_episode_state():
     tracker = _tracker(stall_patience=2, stall_penalty_coeff=1.5)
-    tracker.reset([0], [[4.0, 2.0, 3.0]])
+    _reset(tracker, [0], [[4.0, 2.0, 3.0]])
 
-    _, first_components = tracker.compute_step(
-        distances_to_goals=[[4.0, 2.0, 3.0]],
+    _, first_components = _compute_step(tracker,
+        distances_to_targets=[[4.0, 2.0, 3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, second_components = tracker.compute_step(
-        distances_to_goals=[[4.2, 2.0, 3.0]],
+    _, second_components = _compute_step(tracker,
+        distances_to_targets=[[4.2, 2.0, 3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, third_components = tracker.compute_step(
-        distances_to_goals=[[0.4, 1.5, 2.5]],
+    _, third_components = _compute_step(tracker,
+        distances_to_targets=[[0.4, 1.5, 2.5]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -320,20 +344,20 @@ def test_subgoal_reward_tensorboard_diagnostics_track_episode_state():
 
 def test_stall_then_goal_success_diagnostic_uses_stall_denominator():
     tracker = _tracker(stall_patience=1, stop_success_reward_coef=10.0)
-    tracker.reset([0], [[2.0]])
+    _reset(tracker, [0], [[2.0]])
 
-    _, first_components = tracker.compute_step(
-        distances_to_goals=[[2.0]],
+    _, first_components = _compute_step(tracker,
+        distances_to_targets=[[2.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, second_components = tracker.compute_step(
-        distances_to_goals=[[0.4]],
+    _, second_components = _compute_step(tracker,
+        distances_to_targets=[[0.4]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    _, final_components = tracker.compute_step(
-        distances_to_goals=[[0.75]],
+    _, final_components = _compute_step(tracker,
+        distances_to_targets=[[0.75]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
@@ -351,10 +375,10 @@ def test_stall_then_goal_success_diagnostic_uses_stall_denominator():
 
 def test_premature_stop_is_penalized_before_all_subgoals_finish():
     tracker = _tracker(premature_stop_coeff=4.0)
-    tracker.reset([0], [[3.0, 5.0]])
+    _reset(tracker, [0], [[3.0, 5.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[2.5, 4.5]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[2.5, 4.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
@@ -368,10 +392,10 @@ def test_premature_stop_is_penalized_before_all_subgoals_finish():
 
 def test_single_goal_stop_success_does_not_require_subgoal_switch():
     tracker = _tracker(stop_success_reward_coef=10.0, final_success_distance=3.0)
-    tracker.reset([0], [[2.0]])
+    _reset(tracker, [0], [[2.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[1.5]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[1.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
@@ -386,15 +410,15 @@ def test_single_goal_stop_success_does_not_require_subgoal_switch():
 
 def test_finalgoal_progress_continues_after_all_subgoals_finish():
     tracker = _tracker(progress_reward_coef=1.0)
-    tracker.reset([0], [[3.0, 5.0]])
+    _reset(tracker, [0], [[3.0, 5.0]])
 
-    _, first_components = tracker.compute_step(
-        distances_to_goals=[[0.75, 4.0]],
+    _, first_components = _compute_step(tracker,
+        distances_to_targets=[[0.75, 4.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
-    second_reward, second_components = tracker.compute_step(
-        distances_to_goals=[[0.5, 3.0]],
+    second_reward, second_components = _compute_step(tracker,
+        distances_to_targets=[[0.5, 3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -409,10 +433,10 @@ def test_finalgoal_progress_continues_after_all_subgoals_finish():
 
 def test_step_cost_coeff_breaks_ties_without_dominating_progress():
     tracker = _tracker(progress_reward_coef=1.0, step_cost_coeff=0.01)
-    tracker.reset([0], [[4.0]])
+    _reset(tracker, [0], [[4.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[3.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[3.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([True]),
     )
@@ -428,10 +452,10 @@ def test_final_stop_failure_is_penalized_when_finalgoal_is_too_far():
         final_success_distance=3.0,
         stop_success_reward_coef=10.0,
     )
-    tracker.reset([0], [[2.0]])
+    _reset(tracker, [0], [[2.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[3.5]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[3.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
@@ -449,10 +473,10 @@ def test_truncation_failure_is_penalized_without_stop():
         final_success_distance=3.0,
         stop_success_reward_coef=10.0,
     )
-    tracker.reset([0], [[2.0]])
+    _reset(tracker, [0], [[2.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[3.5]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[3.5]],
         is_stop=np.array([False]),
         is_truncated=np.array([True]),
         valid_mask=np.array([True]),
@@ -470,10 +494,10 @@ def test_stop_on_same_step_as_last_subgoal_switch_can_succeed_at_finalgoal():
         stop_success_reward_coef=10.0,
         final_success_distance=3.0,
     )
-    tracker.reset([0], [[2.0, 1.5]])
+    _reset(tracker, [0], [[2.0, 1.5]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[0.4, 1.5]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[0.4, 1.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
@@ -487,10 +511,10 @@ def test_stop_on_same_step_as_last_subgoal_switch_can_succeed_at_finalgoal():
 
 def test_invalid_mask_keeps_reward_and_state_unchanged():
     tracker = _tracker()
-    tracker.reset([0], [[4.0, 5.0]])
+    _reset(tracker, [0], [[4.0, 5.0]])
 
-    reward, components = tracker.compute_step(
-        distances_to_goals=[[0.2, 1.0]],
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[0.2, 1.0]],
         is_stop=np.array([False]),
         valid_mask=np.array([False]),
     )

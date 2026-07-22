@@ -66,10 +66,27 @@ class SubgoalRewardTracker:
         self.stall_penalty_given = [[False] for _ in range(self.num_envs)]
         self.all_subgoals_finished = np.zeros(self.num_envs, dtype=bool)
 
-    def reset(self, env_indices, distances_to_goals):
-        for env_idx, distances in zip(env_indices, distances_to_goals):
+    def reset(
+        self,
+        env_indices,
+        distances_to_subgoals,
+        distances_to_final_goal,
+    ):
+        self._validate_batch_lengths(
+            env_indices,
+            distances_to_subgoals,
+            distances_to_final_goal,
+        )
+        for env_idx, subgoal_distances, final_distance in zip(
+            env_indices,
+            distances_to_subgoals,
+            distances_to_final_goal,
+        ):
             env_idx = int(env_idx)
-            distances = self._validate_distances(distances)
+            distances = self._ordered_target_distances(
+                subgoal_distances,
+                final_distance,
+            )
             num_goals = len(distances)
             num_subgoals = max(num_goals - 1, 0)
             self.active_subgoal_index[env_idx] = 0
@@ -98,7 +115,19 @@ class SubgoalRewardTracker:
             self.stall_penalty_given[env_idx] = [False] * num_goals
             self.all_subgoals_finished[env_idx] = num_subgoals == 0
 
-    def compute_step(self, distances_to_goals, is_stop, valid_mask, is_truncated=None):
+    def compute_step(
+        self,
+        distances_to_subgoals,
+        distances_to_final_goal,
+        is_stop,
+        valid_mask,
+        is_truncated=None,
+    ):
+        self._validate_batch_lengths(
+            range(self.num_envs),
+            distances_to_subgoals,
+            distances_to_final_goal,
+        )
         is_stop = np.asarray(is_stop, dtype=bool)
         valid_mask = np.asarray(valid_mask, dtype=bool)
         if is_truncated is None:
@@ -108,11 +137,16 @@ class SubgoalRewardTracker:
         reward = np.zeros(self.num_envs, dtype=np.float32)
         components = self._empty_components()
 
-        for env_idx, distances in enumerate(distances_to_goals):
+        for env_idx, (subgoal_distances, final_distance) in enumerate(
+            zip(distances_to_subgoals, distances_to_final_goal)
+        ):
             if not valid_mask[env_idx]:
                 continue
 
-            distances = self._validate_distances(distances)
+            distances = self._ordered_target_distances(
+                subgoal_distances,
+                final_distance,
+            )
             finalgoal_idx = len(distances) - 1
             if self.all_subgoals_finished[env_idx]:
                 active_idx = finalgoal_idx
@@ -408,9 +442,34 @@ class SubgoalRewardTracker:
     def _validate_distances(distances):
         distances = np.asarray(distances, dtype=np.float32)
         if distances.ndim != 1 or len(distances) == 0:
-            raise ValueError("Goal distances must be a non-empty 1D sequence.")
+            raise ValueError("Target distances must be a non-empty 1D sequence.")
         if not np.all(np.isfinite(distances)):
-            raise ValueError("Goal distances must be finite.")
+            raise ValueError("Target distances must be finite.")
         if np.any(distances < 0.0):
-            raise ValueError("Goal distances must be non-negative.")
+            raise ValueError("Target distances must be non-negative.")
         return distances
+
+    @classmethod
+    def _ordered_target_distances(cls, subgoal_distances, final_distance):
+        subgoal_distances = np.asarray(subgoal_distances, dtype=np.float32)
+        if subgoal_distances.ndim != 1:
+            raise ValueError("Subgoal distances must be a 1D sequence.")
+        return cls._validate_distances(
+            [*subgoal_distances.tolist(), float(final_distance)]
+        )
+
+    @staticmethod
+    def _validate_batch_lengths(
+        env_indices,
+        distances_to_subgoals,
+        distances_to_final_goal,
+    ):
+        expected = len(env_indices)
+        if len(distances_to_subgoals) != expected:
+            raise ValueError(
+                "Subgoal distance batch must match the environment batch size."
+            )
+        if len(distances_to_final_goal) != expected:
+            raise ValueError(
+                "Final-goal distance batch must match the environment batch size."
+            )

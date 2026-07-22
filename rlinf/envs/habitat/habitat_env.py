@@ -610,10 +610,11 @@ class HabitatEnv(gym.Env):
     def _reset_subgoal_reward_state(self, env_idx):
         if getattr(self, "subgoal_reward", None) is None:
             return
-        metadata = self.env.get_current_episode_goal_distances(id=env_idx)
+        metadata = self.env.get_current_episode_subgoal_distances(id=env_idx)
         self.subgoal_reward.reset(
             env_idx,
-            metadata["distances_to_goals"],
+            distances_to_subgoals=metadata["distances_to_subgoals"],
+            distances_to_final_goal=metadata["distance_to_final_goal"],
         )
 
     def _format_habitat_actions(self, actions):
@@ -830,9 +831,10 @@ class HabitatEnv(gym.Env):
                 "subgoal_progress reward mode requires valid_reward_mask."
             )
 
-        metadata = self.env.get_current_episode_goal_distances()
+        metadata = self.env.get_current_episode_subgoal_distances()
         reward, components = self.subgoal_reward.compute_step(
-            distances_to_goals=metadata["distances_to_goals"],
+            distances_to_subgoals=metadata["distances_to_subgoals"],
+            distances_to_final_goal=metadata["distance_to_final_goal"],
             is_stop=is_stop,
             is_truncated=truncations,
             valid_mask=valid_reward_mask,
