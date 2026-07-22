@@ -345,7 +345,7 @@ class HabitatEnv(gym.Env):
         self.initial_distance_to_goal = np.full(self.num_envs, np.nan, dtype=np.float32)
         self.reward_mode = getattr(self.cfg, "reward_mode", "weighted_success_ndtw")
         self.subgoal_reward = None
-        if self.reward_mode == "subgoal_progress":
+        if self.reward_mode in {"subgoal_progress", "simple_subgoal"}:
             self.subgoal_reward = SubgoalRewardTracker(
                 num_envs=self.num_envs,
                 config=SubgoalRewardConfig(
@@ -364,6 +364,7 @@ class HabitatEnv(gym.Env):
                     stall_recovery_patience=int(self.cfg.stall_recovery_patience),
                     stall_observation_patience=int(self.cfg.stall_observation_patience),
                     step_cost_coeff=float(getattr(self.cfg, "step_cost_coeff", 0.0)),
+                    reward_mode=self.reward_mode,
                 ),
             )
 
@@ -772,7 +773,7 @@ class HabitatEnv(gym.Env):
         valid_reward_mask=None,
         infos=None,
     ):
-        if self.reward_mode == "subgoal_progress":
+        if self.reward_mode in {"subgoal_progress", "simple_subgoal"}:
             return self._calc_subgoal_progress_reward(
                 is_stop=is_stop,
                 truncations=truncations,
@@ -823,13 +824,11 @@ class HabitatEnv(gym.Env):
         infos,
     ):
         if self.subgoal_reward is None:
-            raise RuntimeError("subgoal_progress reward mode requires subgoal_reward.")
+            raise RuntimeError("Subgoal reward mode requires subgoal_reward.")
         if is_stop is None:
-            raise RuntimeError("subgoal_progress reward mode requires is_stop.")
+            raise RuntimeError("Subgoal reward mode requires is_stop.")
         if valid_reward_mask is None:
-            raise RuntimeError(
-                "subgoal_progress reward mode requires valid_reward_mask."
-            )
+            raise RuntimeError("Subgoal reward mode requires valid_reward_mask.")
 
         metadata = self.env.get_current_episode_subgoal_distances()
         reward, components = self.subgoal_reward.compute_step(

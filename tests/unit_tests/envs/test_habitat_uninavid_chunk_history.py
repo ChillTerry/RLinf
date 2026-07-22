@@ -969,6 +969,56 @@ def test_habitat_subgoal_reward_dispatch_uses_dense_reward_and_attaches_metrics(
     assert infos["episode"]["active_subgoal_index"].tolist() == [0.0]
 
 
+def test_habitat_simple_subgoal_reward_mode_dispatches_to_tracker():
+    env = object.__new__(HabitatEnv)
+    env.num_envs = 1
+    env.reward_mode = "simple_subgoal"
+    env.episode_info = {}
+    env.subgoal_reward = SubgoalRewardTracker(
+        num_envs=1,
+        config=SubgoalRewardConfig(
+            progress_reward_coef=1.0,
+            subgoal_success_reward_coef=6.0,
+            subgoal_switch_distance=1.0,
+            subgoal_success_distance=0.5,
+            stop_success_reward_coef=10.0,
+            final_success_distance=3.0,
+            premature_stop_coeff=4.0,
+            failure_stop_coeff=5.0,
+            stall_patience=3,
+            stall_penalty_coeff=1.0,
+            stall_recovery_patience=2,
+            stall_observation_patience=2,
+            reward_mode="simple_subgoal",
+        ),
+    )
+    env.subgoal_reward.reset(
+        [0],
+        distances_to_subgoals=[[5.0, 5.0]],
+        distances_to_final_goal=[10.0],
+    )
+    env.env = SimpleNamespace(
+        get_current_episode_subgoal_distances=lambda id=None: {
+            "distances_to_subgoals": [[4.0, 0.4]],
+            "distance_to_final_goal": [8.0],
+        }
+    )
+    infos = {"episode": {}}
+
+    reward = env._calc_step_reward(
+        episode={},
+        first_done_reward_mask=np.array([False]),
+        is_stop=np.array([False]),
+        valid_reward_mask=np.array([True]),
+        infos=infos,
+    )
+
+    np.testing.assert_allclose(reward.numpy(), [3.2])
+    np.testing.assert_allclose(infos["episode"]["r_progress"].numpy(), [0.2])
+    assert infos["episode"]["r_subgoal_success"].tolist() == [3.0]
+    assert infos["episode"]["completed_subgoal_count"].tolist() == [1.0]
+
+
 def test_habitat_subgoal_reward_penalizes_truncation_without_stop():
     env = object.__new__(HabitatEnv)
     env.num_envs = 1

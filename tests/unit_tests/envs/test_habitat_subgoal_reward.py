@@ -38,6 +38,7 @@ def _tracker(num_envs=1, **kwargs):
         stall_penalty_coeff=kwargs.get("stall_penalty_coeff", 1.0),
         stall_recovery_patience=kwargs.get("stall_recovery_patience", 2),
         stall_observation_patience=kwargs.get("stall_observation_patience", 2),
+        reward_mode=kwargs.get("reward_mode", "subgoal_progress"),
     )
     return SubgoalRewardTracker(num_envs=num_envs, config=config)
 
@@ -95,6 +96,74 @@ def test_progress_reward_is_normalized_by_episode_subgoal_count():
     assert components["normalized_progress"][0] == 0.25
     assert math.isclose(components["r_progress"][0], 0.25 / 3.0, rel_tol=1e-6)
     assert math.isclose(reward[0], 0.25 / 3.0, rel_tol=1e-6)
+
+
+def test_simple_progress_uses_only_final_goal_distance():
+    tracker = _tracker(reward_mode="simple_subgoal", progress_reward_coef=2.0)
+    _reset(tracker, [0], [[4.0, 2.0, 10.0]])
+
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[3.0, 3.0, 8.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert math.isclose(components["normalized_progress"][0], 0.2, rel_tol=1e-6)
+    assert math.isclose(components["r_progress"][0], 0.4, rel_tol=1e-6)
+    assert math.isclose(reward[0], 0.4, rel_tol=1e-6)
+
+
+def test_simple_subgoals_reward_unordered_targets_only_once():
+    tracker = _tracker(reward_mode="simple_subgoal", progress_reward_coef=0.0)
+    _reset(tracker, [0], [[5.0, 5.0, 10.0]])
+
+    first_reward, first_components = _compute_step(tracker,
+        distances_to_targets=[[4.0, 0.4, 9.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    repeated_reward, repeated_components = _compute_step(tracker,
+        distances_to_targets=[[3.0, 0.2, 8.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+    final_reward, final_components = _compute_step(tracker,
+        distances_to_targets=[[0.4, 1.0, 7.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert first_reward[0] == 3.0
+    assert first_components["r_subgoal_success"][0] == 3.0
+    assert first_components["completed_subgoal_count"][0] == 1.0
+    assert repeated_reward[0] == 0.0
+    assert repeated_components["r_subgoal_success"][0] == 0.0
+    assert final_reward[0] == 3.0
+    assert final_components["r_subgoal_success"][0] == 3.0
+    assert tracker.subgoal_success_given[0] == [True, True]
+    assert tracker.cumulative_subgoal_success[0] == 6.0
+    assert tracker.completed_subgoal_count.tolist() == [2]
+    assert tracker.all_subgoals_finished.tolist() == [True]
+
+
+def test_simple_stall_uses_final_goal_progress():
+    tracker = _tracker(
+        reward_mode="simple_subgoal",
+        progress_reward_coef=0.0,
+        stall_patience=1,
+        stall_penalty_coeff=1.5,
+    )
+    _reset(tracker, [0], [[4.0, 10.0]])
+
+    reward, components = _compute_step(tracker,
+        distances_to_targets=[[3.0, 10.0]],
+        is_stop=np.array([False]),
+        valid_mask=np.array([True]),
+    )
+
+    assert components["normalized_progress"][0] == 0.0
+    assert components["r_penalty"][0] == -1.5
+    assert reward[0] == -1.5
 
 
 def test_reset_rejects_zero_initial_active_target_distance():
@@ -373,21 +442,22 @@ def test_stall_then_goal_success_diagnostic_uses_stall_denominator():
     assert final_components["premature_stop_ratio"][0] == 0.0
 
 
-def test_premature_stop_is_penalized_before_all_subgoals_finish():
-    tracker = _tracker(premature_stop_coeff=4.0)
+def test_stop_before_subgoals_finish_uses_final_goal_distance():
+    tracker = _tracker(premature_stop_coeff=4.0, stop_success_reward_coef=10.0)
     _reset(tracker, [0], [[3.0, 5.0]])
 
     reward, components = _compute_step(tracker,
-        distances_to_targets=[[2.5, 4.5]],
+        distances_to_targets=[[2.5, 2.5]],
         is_stop=np.array([True]),
         valid_mask=np.array([True]),
     )
 
-    assert components["r_stop"][0] == -4.0
+    assert components["r_stop"][0] == 10.0
     assert math.isclose(components["normalized_progress"][0], 1.0 / 6.0, rel_tol=1e-6)
     assert math.isclose(components["r_progress"][0], 1.0 / 12.0, rel_tol=1e-6)
-    assert math.isclose(reward[0], -3.9166666667, rel_tol=1e-6)
+    assert math.isclose(reward[0], 10.0833333333, rel_tol=1e-6)
     assert tracker.active_subgoal_index.tolist() == [0]
+    assert components["premature_stop_ratio"][0] == 1.0
 
 
 def test_single_goal_stop_success_does_not_require_subgoal_switch():
