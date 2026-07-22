@@ -5,6 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .artifacts import subgoals_to_info
 from .common import load_json, write_json
 
 
@@ -140,7 +141,10 @@ def regularize_all(args: argparse.Namespace) -> None:
         if payload is None:
             missing_payload += 1
             continue
-        episode["goals"] = goals_from_payload(payload, radius=float(args.subgoal_radius))
+        episode["info"] = subgoals_to_info(
+            subgoals=list(payload.get("subgoals") or []),
+            original_episode=episode,
+        )
         changed_episodes += 1
 
     meta = deepcopy(dataset.get("_subgoal_generation") or {})
@@ -357,16 +361,6 @@ def insert_far_from_start(
         inserted_count += 1
         subgoals = renumber(subgoals)
     return subgoals, inserted_count, skipped_count
-
-
-def goals_from_payload(payload: dict, radius: float) -> List[dict]:
-    return [
-        {
-            "position": [float(v) for v in item["subgoal_position"]],
-            "radius": float(radius),
-        }
-        for item in sorted(payload.get("subgoals", []) or [], key=lambda x: int(x["subgoal_id"]))
-    ]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

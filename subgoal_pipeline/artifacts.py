@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 from typing import List, Optional
 
@@ -99,21 +100,15 @@ def validate_subgoal_payload(payload: dict) -> None:
         raise ValueError("the last subgoal must be marked as final goal.")
 
 
-def subgoals_to_goals(subgoals: List[dict], original_episode: dict, radius: float) -> List[dict]:
-    goals = [
-        {
-            "position": [float(v) for v in item["subgoal_position"]],
-            "radius": float(radius),
-        }
+def subgoals_to_info(subgoals: List[dict], original_episode: dict) -> dict:
+    """Return episode info with intermediate subgoals, preserving native goals."""
+    info = deepcopy(original_episode.get("info") or {})
+    info["subgoals"] = [
+        {"position": [float(v) for v in item["subgoal_position"]]}
         for item in sorted(subgoals, key=lambda x: int(x["subgoal_id"]))
+        if not bool(item.get("is_final_goal"))
     ]
-    original_goals = original_episode.get("goals") or []
-    if not goals:
-        return goals
-    if not original_goals or not isinstance(original_goals[0], dict) or not original_goals[0].get("position"):
-        raise RuntimeError(f"episode_id={original_episode.get('episode_id')} has no original goal position.")
-    goals[-1]["position"] = [float(v) for v in original_goals[0]["position"]]
-    return goals
+    return info
 
 
 def write_source_episode_artifact(

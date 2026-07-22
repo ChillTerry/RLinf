@@ -4,8 +4,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List
 
+from .artifacts import subgoals_to_info
 from .common import load_json, write_json
-from .regularize_spacing import goals_from_payload, original_goal_by_episode_id
+from .regularize_spacing import original_goal_by_episode_id
 
 
 def backup_once(path: Path, suffix: str) -> Path:
@@ -102,7 +103,10 @@ def shift_all(args: argparse.Namespace) -> None:
         if payload is None:
             missing_payload += 1
             continue
-        episode["goals"] = goals_from_payload(payload, radius=float(args.subgoal_radius))
+        episode["info"] = subgoals_to_info(
+            subgoals=list(payload.get("subgoals") or []),
+            original_episode=episode,
+        )
         changed_episodes += 1
 
     meta = deepcopy(dataset.get("_subgoal_generation") or {})

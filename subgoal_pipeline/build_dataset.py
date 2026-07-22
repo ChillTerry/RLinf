@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -9,7 +8,7 @@ from typing import Dict, List
 from .artifacts import (
     build_episode_meta,
     enrich_subgoals_from_memory,
-    subgoals_to_goals,
+    subgoals_to_info,
     validate_subgoal_payload,
     write_source_episode_artifact,
 )
@@ -391,10 +390,9 @@ def build_dataset_online(args: argparse.Namespace) -> None:
             continue
 
         new_episode = deepcopy(episode)
-        new_episode["goals"] = subgoals_to_goals(
+        new_episode["info"] = subgoals_to_info(
             subgoals=list(payload["subgoals"]),
             original_episode=episode,
-            radius=float(args.subgoal_radius),
         )
         output_episodes.append(new_episode)
         modified += 1

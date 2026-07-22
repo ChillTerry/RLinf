@@ -57,6 +57,32 @@ def test_iterative_double_tail_removal():
     assert selected == []
 
 
+def test_final_goal_exclusion_distance_is_independent_from_sampling_interval():
+    steps = [_step(i, [float(i), 0.0, 0.0]) for i in range(9)]
+    selected = build_dataset_geodesic.select_geodesic_subgoal_steps(
+        steps,
+        FakeSim(),
+        subgoal_distance=4.0,
+        final_goal_position=[7.5, 0.0, 0.0],
+        final_goal_exclusion_distance=3.0,
+    )
+
+    assert selected == [4]
+
+
+def test_subgoal_exactly_three_meters_from_final_goal_is_kept():
+    steps = [_step(i, [float(i), 0.0, 0.0]) for i in range(8)]
+    selected = build_dataset_geodesic.select_geodesic_subgoal_steps(
+        steps,
+        FakeSim(),
+        subgoal_distance=4.0,
+        final_goal_position=[7.0, 0.0, 0.0],
+        final_goal_exclusion_distance=3.0,
+    )
+
+    assert selected == [4]
+
+
 def test_path_shorter_than_distance_yields_no_intermediates():
     steps = [_step(0, [0.0, 0.0, 0.0]), _step(1, [0.5, 0.0, 0.0]), _step(2, [1.0, 0.0, 0.0])]
     selected = build_dataset_geodesic.select_geodesic_subgoal_steps(
@@ -126,3 +152,4 @@ def test_subgoal_distance_parsed():
     parser = build_dataset_geodesic.build_arg_parser()
     args = parser.parse_args(["--subgoal_distance", "3.5"])
     assert args.subgoal_distance == 3.5
+    assert args.final_goal_exclusion_distance == 3.0

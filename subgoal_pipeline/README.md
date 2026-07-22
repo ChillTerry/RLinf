@@ -1,16 +1,21 @@
 # R2R Landmark Sub-goal Pipeline
 
-This package builds a compact R2R train split whose `goals` field is replaced
-by ordered landmark sub-goals:
+This package builds a compact R2R train split that preserves Habitat's native
+final `goals` field and stores ordered intermediate landmark sub-goals in
+`info.subgoals`:
 
 ```json
-"goals": [
-  {"position": [x, y, z], "radius": 3.0},
-  {"position": [x, y, z], "radius": 3.0}
-]
+"goals": [{"position": [final_x, final_y, final_z], "radius": 3.0}],
+"info": {
+  "subgoals": [
+    {"position": [x, y, z]},
+    {"position": [x, y, z]}
+  ]
+}
 ```
 
-The final sub-goal is always forced to the original `train.json.gz` goal position.
+The final goal remains the original `train.json.gz` goal position and is never
+duplicated in `info.subgoals`.
 
 ## Pipeline
 
@@ -62,10 +67,11 @@ python3 -m subgoal_pipeline.build_dataset \
 ## Geodesic variant (no GPT)
 
 `build_dataset_geodesic.py` selects sub-goals deterministically every `--subgoal_distance`
-meters of `sim.geodesic_distance` along the replayed GT trajectory, drops a trailing
-sub-goal that is closer than `D` to the final goal, and keeps the original episode final
-goal. No OpenAI call, no frame sampling, no token usage. Spacing is regular by
-construction, so `shift_subgoals.py` / `regularize_spacing.py` are not needed.
+meters of `sim.geodesic_distance` along the replayed GT trajectory, drops all trailing
+sub-goals closer than `--final_goal_exclusion_distance` to the final goal, and keeps the
+original episode final goal. No OpenAI call, no frame sampling, no token usage. Spacing
+is regular by construction, so `shift_subgoals.py` / `regularize_spacing.py` are not
+needed.
 
 ```bash
 python3 -m subgoal_pipeline.build_dataset_geodesic \
@@ -77,7 +83,7 @@ python3 -m subgoal_pipeline.build_dataset_geodesic \
   --target_episodes 2000 --max_gt_actions 200 --min_gt_actions 150 \
   --out_dir results/rxr_subgoal_geodesic_train2000 \
   --output_json VLN-CE/datasets/rxr/train/train_guide_subgoals_geodesic.json.gz \
-  --subgoal_distance 3.0 --overwrite
+  --subgoal_distance 3.0 --final_goal_exclusion_distance 3.0 --overwrite
 ```
 
 For multi-process parallel rendering across GPUs, add `--num_processes` and `--gpus`:
@@ -96,7 +102,8 @@ python3 -m subgoal_pipeline.build_dataset_geodesic \
   --target_episodes 2000 --max_gt_actions 200 --min_gt_actions 150 \
   --out_dir results/rxr_subgoal_geodesic_train2000 \
   --output_json VLN-CE/datasets/rxr/train/train_guide_subgoals_geodesic.json.gz \
-  --subgoal_distance 3.0 --num_processes 8 --gpus 0,1,2,3 --overwrite
+  --subgoal_distance 3.0 --final_goal_exclusion_distance 3.0 \
+  --num_processes 8 --gpus 0,1,2,3 --overwrite
 ```
 
 Shift non-final sub-goals by two replay steps:

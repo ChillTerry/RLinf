@@ -9,7 +9,7 @@ from pathlib import Path
 from .artifacts import (
     build_episode_meta,
     enrich_subgoals_from_memory,
-    subgoals_to_goals,
+    subgoals_to_info,
     validate_subgoal_payload,
     write_source_episode_artifact,
 )
@@ -54,6 +54,7 @@ def select_geodesic_subgoal_steps(
     sim,
     subgoal_distance: float,
     final_goal_position: list[float],
+    final_goal_exclusion_distance: float = 3.0,
     *,
     episode_label: str = "",
 ) -> list[int]:
@@ -76,7 +77,7 @@ def select_geodesic_subgoal_steps(
             sim, last_step.agent_position, final_goal_position,
             episode_label=episode_label, step_idx=last_step.step,
         )
-        if d < float(subgoal_distance):
+        if d < float(final_goal_exclusion_distance):
             selected.pop()
         else:
             break
@@ -228,6 +229,7 @@ def process_group(
     habitat_data_path: str,
     train_json_path: str,
     subgoal_distance: float,
+    final_goal_exclusion_distance: float,
     subgoal_radius: float,
     max_steps: int,
     no_video: bool,
@@ -277,6 +279,7 @@ def process_group(
             sim=env.sim,
             subgoal_distance=subgoal_distance,
             final_goal_position=list(final_goal_position),
+            final_goal_exclusion_distance=final_goal_exclusion_distance,
             episode_label=episode_label,
         )
         raw_subgoals = _build_geodesic_subgoal_dicts(steps, selected)
@@ -304,6 +307,7 @@ def process_group(
             "trajectory_episode_ids": [int(v) for v in episode_ids],
             "subgoal_selection_method": "geodesic_distance",
             "subgoal_distance": subgoal_distance,
+            "final_goal_exclusion_distance": final_goal_exclusion_distance,
             "sampled_frame_steps": [int(item["best_step"]) for item in enriched],
             "goal_position": list(final_goal_position),
             "goal_position_source": "original_train.goals[0].position",
@@ -420,6 +424,7 @@ def process_scene(
     source_subset: dict,
     out_dir: str,
     subgoal_distance: float,
+    final_goal_exclusion_distance: float,
     subgoal_radius: float,
     no_video: bool,
     video_fps: int,
@@ -471,6 +476,7 @@ def process_scene(
                 habitat_data_path=habitat_data_path,
                 train_json_path=train_json_path,
                 subgoal_distance=subgoal_distance,
+                final_goal_exclusion_distance=final_goal_exclusion_distance,
                 subgoal_radius=subgoal_radius,
                 max_steps=max_steps,
                 no_video=no_video,
@@ -704,6 +710,7 @@ def build_dataset_geodesic(args: argparse.Namespace) -> None:
         "habitat_data_path": habitat_data_path,
         "out_dir": str(out_root),
         "subgoal_distance": float(args.subgoal_distance),
+        "final_goal_exclusion_distance": float(args.final_goal_exclusion_distance),
         "subgoal_radius": float(args.subgoal_radius),
         "no_video": bool(args.no_video),
         "video_fps": int(args.video_fps),
@@ -748,10 +755,9 @@ def build_dataset_geodesic(args: argparse.Namespace) -> None:
             continue
 
         new_episode = deepcopy(episode)
-        new_episode["goals"] = subgoals_to_goals(
+        new_episode["info"] = subgoals_to_info(
             subgoals=list(payload["subgoals"]),
             original_episode=episode,
-            radius=float(args.subgoal_radius),
         )
         output_episodes.append(new_episode)
         modified += 1
@@ -774,6 +780,7 @@ def build_dataset_geodesic(args: argparse.Namespace) -> None:
         "min_gt_actions": int(args.min_gt_actions),
         "subgoal_radius": float(args.subgoal_radius),
         "subgoal_distance": float(args.subgoal_distance),
+        "final_goal_exclusion_distance": float(args.final_goal_exclusion_distance),
         "subgoal_selection_method": "geodesic_distance",
         "parallel_mode": True,
         "num_processes": num_processes,
@@ -825,6 +832,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=4.0,
         help="Geodesic distance interval D (meters) between consecutive sub-goals.",
+    )
+    parser.add_argument(
+        "--final_goal_exclusion_distance",
+        type=float,
+        default=3.0,
+        help="Drop trailing intermediate sub-goals geodesically closer than this distance to the final goal.",
     )
     parser.add_argument(
         "--num_processes",
