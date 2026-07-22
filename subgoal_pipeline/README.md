@@ -60,6 +60,7 @@ python3 -m subgoal_pipeline.build_dataset \
   --max_gt_actions 80 \
   --out_dir results/r2r_subgoal_online_train2000 \
   --output_json VLN-CE/datasets/r2r/train/r2r_train_with_subgoals.json.gz \
+  --final_goal_exclusion_distance 3.0 \
   --model gpt-5.4 \
   --overwrite
 ```

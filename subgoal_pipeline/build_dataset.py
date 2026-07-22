@@ -7,6 +7,7 @@ from typing import Dict, List
 
 from .artifacts import (
     build_episode_meta,
+    drop_trailing_subgoals_near_final_goal,
     enrich_subgoals_from_memory,
     subgoals_to_info,
     validate_subgoal_payload,
@@ -15,6 +16,7 @@ from .artifacts import (
 from .common import (
     append_jsonl,
     detect_dataset_type,
+    extract_goal_payload,
     instruction_text,
     is_english_instruction,
     load_json,
@@ -259,6 +261,21 @@ def build_dataset_online(args: argparse.Namespace) -> None:
                     frame_steps=[int(step.step) for step in sampled_steps],
                 )
                 enriched = enrich_subgoals_from_memory(subgoals=sanitized, steps=steps)
+                final_goal_position, _ = extract_goal_payload(env_episode)
+                if final_goal_position is None:
+                    raise RuntimeError(
+                        f"episode {representative_id} has no final goal position."
+                    )
+                enriched = drop_trailing_subgoals_near_final_goal(
+                    subgoals=enriched,
+                    sim=env.sim,
+                    final_goal_position=final_goal_position,
+                    exclusion_distance=float(args.final_goal_exclusion_distance),
+                )
+                final = enriched[-1]
+                final["subgoal_position"] = list(final_goal_position)
+                final["subgoal_position_source"] = "original_train.goals[0].position"
+                final["agent_position_at_keyframe"] = list(final_goal_position)
 
                 meta = build_episode_meta(
                     episode=env_episode,
@@ -278,6 +295,9 @@ def build_dataset_online(args: argparse.Namespace) -> None:
                     "model": str(args.model),
                     "reasoning_effort": str(args.reasoning_effort),
                     "min_step_gap": int(args.min_step_gap),
+                    "final_goal_exclusion_distance": float(
+                        args.final_goal_exclusion_distance
+                    ),
                     "sampled_frame_steps": [int(step.step) for step in sampled_steps],
                     "goal_position": list(enriched[-1]["subgoal_position"]),
                     "goal_position_source": "final_subgoal_agent_position",
@@ -414,6 +434,9 @@ def build_dataset_online(args: argparse.Namespace) -> None:
         "max_gt_actions": int(args.max_gt_actions),
         "min_gt_actions": int(args.min_gt_actions),
         "subgoal_radius": float(args.subgoal_radius),
+        "final_goal_exclusion_distance": float(
+            args.final_goal_exclusion_distance
+        ),
         "model": str(args.model),
         "reasoning_effort": str(args.reasoning_effort),
         "resumed_trajectories": len(done_trajectory_ids),
@@ -450,6 +473,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_gt_actions", type=int, default=200)
     parser.add_argument("--min_gt_actions", type=int, default=150)
     parser.add_argument("--subgoal_radius", type=float, default=2.0)
+    parser.add_argument(
+        "--final_goal_exclusion_distance",
+        type=float,
+        default=3.0,
+        help="Drop trailing intermediate sub-goals geodesically closer than this distance to the final goal.",
+    )
     parser.add_argument(
         "--include_unselected",
         action="store_true",

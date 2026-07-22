@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import List, Optional
@@ -109,6 +110,45 @@ def subgoals_to_info(subgoals: List[dict], original_episode: dict) -> dict:
         if not bool(item.get("is_final_goal"))
     ]
     return info
+
+
+def drop_trailing_subgoals_near_final_goal(
+    subgoals: List[dict],
+    sim,
+    final_goal_position: List[float],
+    exclusion_distance: float,
+) -> List[dict]:
+    """Drop trailing intermediates inside the final goal's geodesic region."""
+    filtered = [
+        deepcopy(item)
+        for item in sorted(subgoals, key=lambda x: int(x["subgoal_id"]))
+    ]
+    if not filtered or not bool(filtered[-1].get("is_final_goal")):
+        raise ValueError("Generated subgoals must end with the final goal.")
+    if float(exclusion_distance) <= 0.0:
+        raise ValueError("Final-goal exclusion distance must be positive.")
+
+    while len(filtered) > 1:
+        trailing = filtered[-2]
+        distance = float(
+            sim.geodesic_distance(
+                trailing["subgoal_position"],
+                final_goal_position,
+            )
+        )
+        if not math.isfinite(distance) or distance < 0.0:
+            raise ValueError(
+                "Habitat returned an invalid subgoal-to-final geodesic distance: "
+                f"{distance}."
+            )
+        if distance >= float(exclusion_distance):
+            break
+        filtered.pop(-2)
+
+    for index, item in enumerate(filtered):
+        item["subgoal_id"] = index
+        item["is_final_goal"] = index == len(filtered) - 1
+    return filtered
 
 
 def write_source_episode_artifact(
