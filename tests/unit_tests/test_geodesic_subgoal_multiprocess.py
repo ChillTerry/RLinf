@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from subgoal_pipeline import build_dataset_geodesic as bdg
@@ -40,6 +42,36 @@ def test_content_scene_key_uses_habitat_scene_basename():
     assert bdg.content_scene_key("mp3d/uNb9QFRL6hY/uNb9QFRL6hY.glb") == "uNb9QFRL6hY"
     assert bdg.content_scene_key("VLN-CE/scene_dataset/mp3d/r1Q1Z4BcV1o/r1Q1Z4BcV1o.glb") == "r1Q1Z4BcV1o"
     assert bdg.content_scene_key("plain_scene") == "plain_scene"
+
+
+def _motion_cfg(dataset_type, forward_step_size, turn_angle):
+    return SimpleNamespace(
+        habitat=SimpleNamespace(
+            dataset=SimpleNamespace(type=dataset_type),
+            simulator=SimpleNamespace(
+                forward_step_size=forward_step_size,
+                turn_angle=turn_angle,
+            ),
+        )
+    )
+
+
+def test_r2r_gt_replay_motion_settings_are_overridden():
+    cfg = _motion_cfg("R2RVLN-v1", forward_step_size=1.0, turn_angle=30)
+
+    bdg._override_r2r_gt_replay_motion_settings(cfg)
+
+    assert cfg.habitat.simulator.forward_step_size == 0.25
+    assert cfg.habitat.simulator.turn_angle == 15
+
+
+def test_non_r2r_motion_settings_are_unchanged():
+    cfg = _motion_cfg("RxR-VLN-CE-v1", forward_step_size=0.25, turn_angle=30)
+
+    bdg._override_r2r_gt_replay_motion_settings(cfg)
+
+    assert cfg.habitat.simulator.forward_step_size == 0.25
+    assert cfg.habitat.simulator.turn_angle == 30
 
 
 def test_assign_scenes_to_gpus_round_robin():

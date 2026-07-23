@@ -156,6 +156,14 @@ def content_scene_key(scene_id: str) -> str:
     return Path(str(scene_id)).stem
 
 
+def _override_r2r_gt_replay_motion_settings(cfg) -> None:
+    if str(cfg.habitat.dataset.type) != "R2RVLN-v1":
+        return
+    # R2R train_gt actions were generated with Habitat's 0.25 m / 15 degree controls.
+    cfg.habitat.simulator.forward_step_size = 0.25
+    cfg.habitat.simulator.turn_angle = 15
+
+
 def assign_scenes_to_gpus(scene_list: list[str], gpu_ids: list[int]) -> dict[int, list[str]]:
     if not gpu_ids:
         raise RuntimeError("gpu_ids must be non-empty.")
@@ -401,6 +409,7 @@ def _build_scene_env_config(
 
     cfg = get_habitat_config(str(config_path))
     with read_write(cfg):
+        _override_r2r_gt_replay_motion_settings(cfg)
         cfg.habitat.dataset.split = str(split)
         cfg.habitat.dataset.data_path = habitat_data_path
         cfg.habitat.dataset.scenes_dir = str(scenes_dir)
