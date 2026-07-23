@@ -189,6 +189,15 @@ class EmbodiedRunner:
         actor_handle.wait()
         rollout_handle.wait()
 
+    def _set_worker_global_step(self, global_step: int) -> None:
+        actor_handle: Handle = self.actor.set_global_step(global_step)
+        rollout_handle: Handle = self.rollout.set_global_step(global_step)
+        if bool(getattr(self, "curriculum_enabled", False)):
+            # Curriculum epoch specs carry the policy version. Complete both
+            # updates before weight sync or environment rollout can observe it.
+            actor_handle.wait()
+            rollout_handle.wait()
+
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
@@ -310,9 +319,7 @@ class EmbodiedRunner:
         if start_step == 0:
             self._evaluate_at_start()
         for _step in range(start_step, self.max_steps):
-            # set global step
-            self.actor.set_global_step(self.global_step)
-            self.rollout.set_global_step(self.global_step)
+            self._set_worker_global_step(self.global_step)
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
@@ -362,6 +369,10 @@ class EmbodiedRunner:
                     env_bootstrap_handle.wait()
 
                 self.global_step += 1
+                if bool(getattr(self, "curriculum_enabled", False)):
+                    # Evaluation may sync the newly trained weights immediately.
+                    # Tag them with the new version before that sync starts.
+                    self._set_worker_global_step(self.global_step)
 
                 run_val, save_model, is_train_end = check_progress(
                     self.global_step,
