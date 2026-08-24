@@ -178,6 +178,18 @@ def tensor_to_rgb_numpy(frame: torch.Tensor | np.ndarray) -> np.ndarray:
 
 
 def select_slot_rgb_frames(env_obs: dict[str, Any], slot_id: int) -> list[np.ndarray]:
+    if "rgb_frame_history" not in env_obs:
+        if "main_images" not in env_obs:
+            raise KeyError(
+                "UniNaVid observations require either rgb_frame_history or "
+                "main_images."
+            )
+        return [tensor_to_rgb_numpy(env_obs["main_images"][slot_id])]
+
+    if "rgb_frame_history_lengths" not in env_obs:
+        raise KeyError(
+            "rgb_frame_history_lengths is required with rgb_frame_history."
+        )
     slot_images = env_obs["rgb_frame_history"][slot_id]
     history_length = env_obs["rgb_frame_history_lengths"][slot_id]
     if isinstance(history_length, torch.Tensor):

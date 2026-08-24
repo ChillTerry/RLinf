@@ -1,0 +1,28 @@
+uint8 STOP=0
+uint8 FORWARD=1
+uint8 LEFT=2
+uint8 RIGHT=3
+uint8 NO_OP=4
+
+uint64 episode_id
+uint64 sequence_id
+uint8 action
+---
+uint8 SUCCEEDED=0
+uint8 OBSTACLE=1
+uint8 TIMEOUT=2
+uint8 ESTOP=3
+uint8 CONTROL_ERROR=4
+uint8 STALE_STATE=5
+uint8 REJECTED=6
+
+uint8 status
+string message
+float32 distance_m
+float32 yaw_rad
+---
+float32 distance_m
+float32 yaw_rad
+float32 nearest_obstacle_m
+string state
+

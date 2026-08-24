@@ -1651,6 +1651,7 @@ class EnvWorker(Worker):
                     )
 
             for eval_step in range(self.n_eval_chunk_steps):
+                episode_finished = False
                 for stage_id in range(self.stage_num):
                     raw_chunk_actions = self.recv_chunk_actions(
                         input_channel, mode="eval"
@@ -1674,6 +1675,31 @@ class EnvWorker(Worker):
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
 
+                    episode_finished = bool(done_mask.numel()) and bool(
+                        done_mask.all().item()
+                    )
+
+                    # A fixed-length rollout otherwise keeps asking the model
+                    # for actions after a real-world STOP. Send one terminal
+                    # sentinel so the rollout worker exits this epoch in lockstep.
+                    if episode_finished and eval_step < self.n_eval_chunk_steps - 1:
+                        env_batch = env_output.to_dict()
+                        terminal_obs = dict(env_batch["obs"])
+                        terminal_obs["_eval_episode_done"] = torch.ones(
+                            self.eval_num_envs_per_stage, dtype=torch.bool
+                        )
+                        self.send_env_batch(
+                            rollout_channel,
+                            {"obs": terminal_obs, "final_obs": env_batch["final_obs"]},
+                            mode="eval",
+                        )
+                        print(
+                            "[GO2 EPISODE] terminal_observation_sent=true "
+                            f"eval_step={eval_step} stage={stage_id}",
+                            flush=True,
+                        )
+                        break
+
                     if self.cfg.env.eval.auto_reset:
                         if (
                             eval_rollout_epoch
@@ -1693,6 +1719,8 @@ class EnvWorker(Worker):
                         },
                         mode="eval",
                     )
+                if episode_finished:
+                    break
 
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):

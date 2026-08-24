@@ -1,0 +1,17 @@
+go2_vln_realsense_publisher:
+  ros__parameters:
+    width: 640
+    height: 480
+    fps: 30
+    enable_color: true
+    enable_depth: false
+    align_depth_to_color: true
+    serial_no: ""
+    reconnect_interval_sec: 2.0
+    frame_timeout_ms: 1000
+    color_topic: "/camera/camera/color/image_raw"
+    color_info_topic: "/camera/camera/color/camera_info"
+    depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    depth_info_topic: "/camera/camera/aligned_depth_to_color/camera_info"
+    color_frame_id: "camera_color_optical_frame"
+    depth_frame_id: "camera_color_optical_frame"

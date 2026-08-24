@@ -404,12 +404,27 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
             num_action_chunks=num_action_chunks,
         )
         action_chunks = []
-        for output_text in output_texts:
+        cfg = getattr(self, "cfg", None)
+        log_eval_responses = bool(
+            self._cfg_get(cfg, "log_eval_responses", default=False)
+        )
+        for slot_id, output_text in enumerate(output_texts):
             normalized_output_text = output_text.strip()
             parsed_actions = parse_uninavid_actions(
                 normalized_output_text,
                 num_action_chunks,
             )
+            if log_eval_responses:
+                parsed_names = parse_uninavid_action_names(
+                    normalized_output_text,
+                    num_action_chunks,
+                )
+                print(
+                    f"[UNINAVID RESPONSE] slot={slot_id} "
+                    f"parsed_actions={parsed_names!r} "
+                    f"raw={normalized_output_text!r}",
+                    flush=True,
+                )
             action_chunks.append(parsed_actions)
         actions = torch.stack(action_chunks, dim=0)
         return actions, empty_rollout_metadata()
@@ -685,7 +700,6 @@ class UniNaVidForActionPrediction(nn.Module, BasePolicy):
                         current_tokens,
                     )
                 )
-
             inputs_embeds, attention_mask = self._pad_navigation_embeds(embeds)
             self.model.update_prompt([[prompt] for prompt in prompts])
             generate_kwargs = dict(generation_kwargs)

@@ -1,0 +1,53 @@
+env_type: realworld
+
+total_num_envs: 1
+auto_reset: false
+ignore_terminations: false
+reward_mode: raw
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 300
+max_episode_steps: 300
+main_image_key: front_rgb
+model_type: uninavid
+
+video_cfg:
+  save_video: false
+  info_on_video: false
+  video_base_dir: ${runner.logger.log_path}/video/eval
+
+init_params:
+  id: "Go2VLNEnv-v1"
+  num_envs: null
+
+override_cfg:
+  task_description: "Walk forward and stop at the end of the hallway."
+  socket_host: "192.168.3.15"
+  socket_tcp_port: 8765
+  socket_udp_heartbeat_port: 8766
+  socket_connect_timeout_sec: 5.0
+  socket_heartbeat_interval_sec: 0.2
+  socket_auth_token_env: "GO2_VLN_TOKEN"
+  socket_require_auth: true
+  image_width: 640
+  image_height: 480
+  image_timeout_sec: 5.0
+  action_result_timeout_sec: 15.0
+  # The executor always sends StopMove on timeout. Keep the episode alive so
+  # Uni-NaVid can observe the stopped pose and replan; transport failures still truncate.
+  truncate_on_action_timeout: false
+  post_action_settle_sec: 0.0
+  post_action_image_timeout_sec: 5.0
+  max_num_steps: ${env.eval.max_episode_steps}
+  is_dummy: false
+  dummy_frame_value: 0
+  dry_run_no_motion: false
+  episode_output_dir: null
+  # Set by interactive_model_test.py. Each JSONL record supplies a new
+  # instruction and output directory while the Uni-NaVid worker stays loaded.
+  instruction_queue_path: null
+  instruction_queue_poll_sec: 0.1
+  # null uses time.time_ns() so IDs remain unique when the interactive driver
+  # launches a fresh RLinf process for each episode.
+  episode_id_base: null

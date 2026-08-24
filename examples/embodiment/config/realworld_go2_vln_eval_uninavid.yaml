@@ -1,0 +1,109 @@
+defaults:
+  - env/realworld_go2_vln@env.train
+  - env/realworld_go2_vln@env.eval
+  - model/uninavid@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "realworld_go2_vln_eval_uninavid"
+    logger_backends: ["tensorboard"]
+  max_epochs: 1
+  max_steps: -1
+  only_eval: true
+  val_check_interval: -1
+  save_interval: -1
+  save_best_ckpt: false
+  # RLinf-trained state dict loaded after the Hugging Face base model.
+  ckpt_path: /home/qyx/realworldvln/checkpoints/20260626-03:43:15-habitat_rxr_grpo_uninavid-87/habitat_rxr_grpo_uninavid/checkpoints/best_model/actor/model_state_dict/full_weights.pt
+
+algorithm:
+  group_size: 1
+  eval_rollout_epoch: 1
+  adv_type: gae
+  loss_type: actor
+  loss_agg_func: "token-mean"
+  sampling_params:
+    do_sample: false
+    temperature_train: 0.0
+    temperature_eval: 0.0
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+  length_params:
+    max_new_token: 128
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+  enable_offload: false
+  train:
+    total_num_envs: ${env.eval.total_num_envs}
+    max_steps_per_rollout_epoch: ${env.eval.max_steps_per_rollout_epoch}
+    max_episode_steps: ${env.eval.max_episode_steps}
+    model_type: ${actor.model.model_type}
+  eval:
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+    model_type: ${actor.model.model_type}
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  collect_prev_infos: false
+  recompute_logprobs: false
+  enable_offload: false
+  pipeline_stage_num: 1
+  model:
+    # Must be a Hugging Face model directory containing config.json and tokenizer files.
+    model_path: "/home/qyx/realworldvln/models/uninavid_weights/uninavid-7b-full-224-video-fps-1-grid-2"
+    vision_tower: "/home/qyx/realworldvln/models/uninavid_weights/eva_vit_g.pth"
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 1
+  seed: 42
+  enable_offload: false
+  model:
+    # Uni-NaVid is prompted to predict four actions. Match the official
+    # VLN-CE evaluator by executing only the first two before re-inference.
+    num_action_chunks: 2
+    eval_num_action_chunks: 2
+    log_eval_responses: true
+    log_response_token_stats: true
+    response_token_stats_path: ${runner.logger.log_path}/model_responses.jsonl
+    action_dim: 1
+    model_path: ${rollout.model.model_path}
+    vision_tower: ${rollout.model.vision_tower}
+    # Ray workers may not inherit the repository working directory.
+    image_processor: "/home/qyx/realworldvln/RLinf/rlinf/models/embodiment/uninavid/processor/clip-patch14-224"
+
+critic:
+  use_critic_model: false
+
+reward:
+  use_reward_model: false

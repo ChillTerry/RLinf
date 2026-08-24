@@ -16,6 +16,8 @@ from .dosw1 import DOSW1Config, DOSW1Env
 from .dosw1 import tasks as dosw1_tasks
 from .franka import FrankaEnv, FrankaRobotConfig, FrankaRobotState
 from .franka import tasks as franka_tasks
+from .go2 import Go2VLNConfig, Go2VLNEnv
+from .go2 import tasks as go2_tasks
 from .franka.dual_franka_env import DualFrankaEnv, DualFrankaRobotConfig
 from .gim_arm import GimArmEnv, GimArmRobotConfig, GimArmRobotState
 from .gim_arm import tasks as gim_arm_tasks
@@ -39,6 +41,9 @@ __all__ = [
     "GimArmRobotConfig",
     "GimArmRobotState",
     "gim_arm_tasks",
+    "Go2VLNConfig",
+    "Go2VLNEnv",
+    "go2_tasks",
     "Turtle2Env",
     "Turtle2RobotConfig",
     "Turtle2RobotState",

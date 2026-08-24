@@ -1,0 +1,22 @@
+go2_vln_socket_gateway:
+  ros__parameters:
+    bind_host: "0.0.0.0"
+    tcp_port: 8765
+    udp_heartbeat_port: 8766
+    # RealSense color stream. Override image_topic at launch if the installed
+    # publisher node uses /camera/camera/color/image_raw.
+    image_source: "ros_topic"
+    camera_socket_path: "/tmp/go2_vln_camera.sock"
+    camera_request_timeout_sec: 4.0
+    image_topic: "/camera/camera/color/image_raw"
+    image_message_type: "sensor_msgs_image"
+    go2_video_resolution: "720p"
+    output_image_width: 640
+    output_image_height: 480
+    action_name: "/go2_vln/execute_nav_primitive"
+    heartbeat_topic: "/go2_vln/heartbeat"
+    auth_token_env: "GO2_VLN_TOKEN"
+    require_auth: true
+    action_server_timeout_sec: 5.0
+    max_action_result_timeout_sec: 20.0
+    udp_heartbeat_timeout_sec: 1.0

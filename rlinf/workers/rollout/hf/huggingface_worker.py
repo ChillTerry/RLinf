@@ -110,7 +110,22 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
-            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            checkpoint_load_kwargs = {}
+            if (
+                SupportedModel(self.cfg.actor.model.model_type)
+                == SupportedModel.UNINAVID
+            ):
+                # Uni-NaVid full checkpoints are large enough that eagerly
+                # materializing the complete CPU state dict can trip Ray's
+                # node-memory monitor before the tensors are copied to CUDA.
+                checkpoint_load_kwargs = {
+                    "map_location": "cpu",
+                    "mmap": True,
+                    "weights_only": True,
+                }
+            model_dict = torch.load(
+                self.cfg.runner.ckpt_path, **checkpoint_load_kwargs
+            )
             self.hf_model.load_state_dict(model_dict)
 
         if self.cfg.rollout.get("expert_model", None):
@@ -533,11 +548,26 @@ class MultiStepRolloutWorker(Worker):
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            for _ in range(self.n_eval_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
+            for eval_step in range(self.n_eval_chunk_steps):
+                for stage_id in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
+                    episode_done = env_output["obs"].pop(
+                        "_eval_episode_done", None
+                    )
+                    if episode_done is not None and bool(
+                        torch.as_tensor(episode_done).all().item()
+                    ):
+                        print(
+                            "[GO2 EPISODE] rollout_terminal_received=true "
+                            f"eval_step={eval_step} stage={stage_id}",
+                            flush=True,
+                        )
+                        break
                     actions, _ = self.predict(env_output["obs"], mode="eval")
                     self.send_chunk_actions(output_channel, actions, mode="eval")
+                else:
+                    continue
+                break
 
         if self.enable_offload:
             self.offload_model()

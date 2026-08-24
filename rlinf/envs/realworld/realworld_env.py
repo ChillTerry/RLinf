@@ -198,6 +198,13 @@ class RealWorldEnv(gym.Env):
         # TODO: handle partial reset
         raw_obs, infos = self.env.reset(seed=seed, options=options)
 
+        # Go2's interactive instruction queue updates task_description during
+        # reset. Refresh it before wrapping the first observation so the model
+        # receives the new episode's instruction without rebuilding workers.
+        self.task_descriptions = list(
+            self.env.call("get_wrapper_attr", "task_description")
+        )
+
         extracted_obs = self._wrap_obs(raw_obs)
         if env_idx is not None:
             self._reset_metrics(env_idx)
@@ -314,6 +321,8 @@ class RealWorldEnv(gym.Env):
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
 
+        self._attach_rgb_frame_history(obs_list)
+
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
             raw_chunk_terminations, dim=1
@@ -354,6 +363,23 @@ class RealWorldEnv(gym.Env):
             chunk_terminations,
             chunk_truncations,
             infos_list,
+        )
+
+    def _attach_rgb_frame_history(self, obs_list):
+        """Expose every post-action RGB frame in a Uni-NaVid action chunk."""
+        if getattr(self.cfg, "model_type", None) != "uninavid" or not obs_list:
+            return
+
+        frame_history = torch.stack(
+            [obs["main_images"] for obs in obs_list],
+            dim=1,
+        )
+        obs_list[-1]["rgb_frame_history"] = frame_history
+        obs_list[-1]["rgb_frame_history_lengths"] = torch.full(
+            (frame_history.shape[0],),
+            frame_history.shape[1],
+            dtype=torch.long,
+            device=frame_history.device,
         )
 
     def _handle_auto_reset(self, dones, _final_obs, infos):

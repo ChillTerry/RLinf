@@ -57,7 +57,12 @@ def main(cfg) -> None:
     )
 
     runner.init_workers()
-    runner.run()
+    try:
+        runner.run()
+    except KeyboardInterrupt:
+        # The interactive Go2 driver terminates the persistent session with
+        # SIGINT after the user quits. Treat that as an orderly shutdown.
+        print("[GO2 EPISODE] persistent_session_shutdown=true", flush=True)
 
 
 if __name__ == "__main__":

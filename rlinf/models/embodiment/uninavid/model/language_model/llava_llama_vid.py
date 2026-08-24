@@ -198,5 +198,10 @@ class LlavaLlamaAttForCausalLM(LlamaForCausalLM, UniNaVIDMetaForCausalLM):
         return model_inputs
 
 
+# Recent Transformers releases provide their own ``llava`` config. Uni-NaVid
+# still needs this custom config/model pair for its checkpoint, so explicitly
+# replace the auto mappings when that built-in registration is present.
 AutoConfig.register("llava", LlavaConfig)
-AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaAttForCausalLM)
+AutoModelForCausalLM.register(
+    LlavaConfig, LlavaLlamaAttForCausalLM
+)
